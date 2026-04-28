@@ -17,6 +17,8 @@ service/*.so
 service/*.dylib
 service/*.test
 service/*.out
+proxystation-*.exe
+*.exe~
 
 # Runtime data / secrets
 data/

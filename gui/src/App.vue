@@ -170,12 +170,20 @@
       </div>
 
       <div class="navbar-right">
+        <button class="btn btn-primary btn-sm navbar-import-btn" @click="showImport = true">导入</button>
         <router-link to="/" class="nav-btn" active-class="nav-btn-active">节点</router-link>
         <router-link to="/rules" class="nav-btn" active-class="nav-btn-active">分流规则</router-link>
         <router-link to="/settings" class="nav-btn" active-class="nav-btn-active">设置</router-link>
-        <span class="auth-user">{{ authUsername }}</span>
-        <button class="btn btn-light btn-sm" @click="handleLogout">退出</button>
-        <button class="btn btn-primary btn-sm" style="margin-left:8px" @click="showImport = true">导入</button>
+        <div class="user-menu" @mouseleave="showUserMenu = false">
+          <button class="user-menu-trigger" @click="showUserMenu = !showUserMenu">
+            <span class="auth-user">{{ authUsername }}</span>
+            <span class="caret">▾</span>
+          </button>
+          <div v-if="showUserMenu" class="user-dropdown-menu">
+            <button class="user-dropdown-item" @click="openAccountModal">账号设置</button>
+            <button class="user-dropdown-item user-dropdown-danger" @click="handleLogoutFromMenu">退出登录</button>
+          </div>
+        </div>
       </div>
     </nav>
 
@@ -237,6 +245,55 @@
 
     <!-- 全局导入弹窗 -->
     <ImportModal v-if="showImport" @close="showImport = false" @done="onImportDone" />
+
+    <div class="modal-overlay" v-if="showAccountModal" @click.self="closeAccountModal">
+      <div class="modal-box" style="width:480px">
+        <div class="modal-header">
+          <span class="modal-title">账号设置</span>
+          <span class="modal-close" @click="closeAccountModal">✕</span>
+        </div>
+        <div class="modal-body">
+          <div class="form-group">
+            <label class="form-label">用户名</label>
+            <input class="input" v-model="accountForm.webUsername" placeholder="admin" />
+          </div>
+          <div class="form-group">
+            <button class="btn btn-primary" :disabled="accountSaving" @click="saveAccountProfile">
+              {{ accountSaving ? '保存中...' : '保存用户名' }}
+            </button>
+          </div>
+          <div v-if="accountMsg" :class="['account-msg', accountMsg.error ? 'account-msg-error' : 'account-msg-success']">
+            {{ accountMsg.text }}
+          </div>
+
+          <div class="account-divider"></div>
+
+          <div class="form-group">
+            <label class="form-label">旧密码</label>
+            <input type="password" class="input" v-model="passwordForm.oldPassword" placeholder="当前密码" />
+          </div>
+          <div class="form-group">
+            <label class="form-label">新密码</label>
+            <input type="password" class="input" v-model="passwordForm.newPassword" placeholder="新密码" />
+          </div>
+          <div class="form-group">
+            <label class="form-label">确认新密码</label>
+            <input type="password" class="input" v-model="passwordForm.confirmPassword" placeholder="再次输入新密码" />
+          </div>
+          <div class="form-group">
+            <button class="btn btn-light" :disabled="passwordSaving" @click="changePassword">
+              {{ passwordSaving ? '修改中...' : '修改密码' }}
+            </button>
+          </div>
+          <div v-if="passwordMsg" :class="['account-msg', passwordMsg.error ? 'account-msg-error' : 'account-msg-success']">
+            {{ passwordMsg.text }}
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-light" @click="closeAccountModal">关闭</button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -255,7 +312,9 @@ const loginLoading = ref(false)
 const loginForm = ref({ username: 'admin', password: 'admin' })
 const appInitialized = ref(false)
 const showOutboundMenu = ref(false)
+const showUserMenu = ref(false)
 const showImport = ref(false)
+const showAccountModal = ref(false)
 const currentOutbound = ref('proxy')
 const startError = ref('')
 const showCreateOutbound = ref(false)
@@ -267,6 +326,16 @@ const kernels = ref({})
 const editGroups = ref([])
 const editServers = ref([])
 const editSubscriptions = ref([])
+const accountSaving = ref(false)
+const accountMsg = ref(null)
+const passwordSaving = ref(false)
+const passwordMsg = ref(null)
+const accountForm = ref({ webUsername: '' })
+const passwordForm = ref({
+  oldPassword: '',
+  newPassword: '',
+  confirmPassword: '',
+})
 
 // 日志相关
 const showLogs = ref(true)  // 默认展开
@@ -378,6 +447,33 @@ function onImportDone() {
   store.fetchAll()
 }
 
+function resetAccountMessages() {
+  accountMsg.value = null
+  passwordMsg.value = null
+}
+
+function resetPasswordForm() {
+  passwordForm.value = {
+    oldPassword: '',
+    newPassword: '',
+    confirmPassword: '',
+  }
+}
+
+function openAccountModal() {
+  accountForm.value.webUsername = authUsername.value || 'admin'
+  resetPasswordForm()
+  resetAccountMessages()
+  showUserMenu.value = false
+  showAccountModal.value = true
+}
+
+function closeAccountModal() {
+  showAccountModal.value = false
+  resetPasswordForm()
+  resetAccountMessages()
+}
+
 async function checkAuth() {
   authChecking.value = true
   try {
@@ -419,6 +515,11 @@ async function handleLogout() {
   authError.value = ''
 }
 
+async function handleLogoutFromMenu() {
+  showUserMenu.value = false
+  await handleLogout()
+}
+
 async function initAuthenticatedApp() {
   if (!appInitialized.value) {
     restoreLogsPanelState()
@@ -438,6 +539,50 @@ async function initAuthenticatedApp() {
       logsPanel.value.style.height = logsPanelHeight.value + 'px'
     }
   }, 0)
+}
+
+async function saveAccountProfile() {
+  const username = String(accountForm.value.webUsername || '').trim()
+  if (!username) {
+    accountMsg.value = { error: true, text: '用户名不能为空' }
+    return
+  }
+  accountSaving.value = true
+  accountMsg.value = null
+  try {
+    const { data } = await api.getSetting()
+    const setting = data.setting || {}
+    await api.setSetting({ ...setting, webUsername: username })
+    authUsername.value = username
+    accountMsg.value = { error: false, text: '用户名已更新' }
+  } catch (e) {
+    accountMsg.value = { error: true, text: e?.response?.data?.error || '保存失败' }
+  } finally {
+    accountSaving.value = false
+  }
+}
+
+async function changePassword() {
+  passwordSaving.value = true
+  passwordMsg.value = null
+  if (!passwordForm.value.oldPassword || !passwordForm.value.newPassword || !passwordForm.value.confirmPassword) {
+    passwordMsg.value = { error: true, text: '请完整填写密码字段' }
+    passwordSaving.value = false
+    return
+  }
+  try {
+    await api.changePassword({ ...passwordForm.value })
+    passwordMsg.value = { error: false, text: '密码已修改，请重新登录' }
+    resetPasswordForm()
+    setTimeout(async () => {
+      closeAccountModal()
+      await handleLogout()
+    }, 800)
+  } catch (e) {
+    passwordMsg.value = { error: true, text: e?.response?.data?.error || '修改失败' }
+  } finally {
+    passwordSaving.value = false
+  }
 }
 
 async function handleToggleProxy() {
@@ -669,6 +814,7 @@ body {
 }
 .navbar-left { display: flex; align-items: center; gap: 10px; }
 .navbar-right { display: flex; align-items: center; gap: 4px; }
+.navbar-import-btn { margin-right: 8px; }
 
 .brand { display: flex; align-items: center; gap: 6px; margin-right: 4px; }
 .brand-icon { font-size: 20px; }
@@ -767,10 +913,48 @@ body {
 }
 .nav-btn:hover { background: #f5f5f5; }
 .nav-btn-active { color: #3273dc; background: #ebf3ff; }
+.user-menu { position: relative; margin-left: 8px; }
+.user-menu-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border: 1px solid #dbdbdb;
+  border-radius: 999px;
+  background: #fff;
+  cursor: pointer;
+  transition: background .15s, border-color .15s;
+}
+.user-menu-trigger:hover { background: #f5f5f5; border-color: #bfbfbf; }
+.user-dropdown-menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  min-width: 148px;
+  background: #fff;
+  border: 1px solid #dbdbdb;
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0,0,0,.12);
+  overflow: hidden;
+  z-index: 120;
+}
+.user-dropdown-item {
+  display: block;
+  width: 100%;
+  padding: 10px 12px;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  font-size: 13px;
+  color: #363636;
+  cursor: pointer;
+}
+.user-dropdown-item:hover { background: #f5f5f5; }
+.user-dropdown-danger { color: #f14668; }
 .auth-user {
   font-size: 12px;
   color: #6b7280;
-  margin-left: 8px;
+  margin-left: 0;
 }
 
 /* ===== Main ===== */
@@ -885,6 +1069,27 @@ body {
   display: flex; justify-content: flex-end; gap: 8px;
   padding: 14px 20px;
   border-top: 1px solid #dbdbdb;
+}
+.account-divider {
+  height: 1px;
+  background: #f0f0f0;
+  margin: 18px 0;
+}
+.account-msg {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+}
+.account-msg-success {
+  background: #f6ffed;
+  border: 1px solid #b7eb8f;
+  color: #389e0d;
+}
+.account-msg-error {
+  background: #fff2f0;
+  border: 1px solid #ffccc7;
+  color: #cf1322;
 }
 
 .form-group { margin-bottom: 14px; }

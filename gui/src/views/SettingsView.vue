@@ -75,45 +75,6 @@
 
     <div class="settings-block">
       <div class="block-header">
-        <span class="block-title">管理端认证</span>
-      </div>
-      <div class="field-row">
-        <label class="field-label">用户名</label>
-        <input class="input field-input" v-model="form.webUsername" placeholder="admin" />
-      </div>
-    </div>
-
-    <div class="settings-block">
-      <div class="block-header">
-        <span class="block-title">修改密码</span>
-      </div>
-      <div class="field-row">
-        <label class="field-label">旧密码</label>
-        <input type="password" class="input field-input" v-model="passwordForm.oldPassword" placeholder="当前密码" />
-      </div>
-      <div class="field-row">
-        <label class="field-label">新密码</label>
-        <input type="password" class="input field-input" v-model="passwordForm.newPassword" placeholder="新密码" />
-      </div>
-      <div class="field-row">
-        <label class="field-label">确认新密码</label>
-        <input type="password" class="input field-input" v-model="passwordForm.confirmPassword" placeholder="再次输入新密码" />
-      </div>
-      <div class="field-row">
-        <label class="field-label"></label>
-        <div class="password-actions">
-          <button class="action-btn" :disabled="passwordSaving" @click="changePassword">
-            {{ passwordSaving ? '修改中...' : '修改密码' }}
-          </button>
-          <span v-if="passwordMsg" :class="['save-msg', passwordMsg.error ? 'msg-error' : 'msg-success']">
-            {{ passwordMsg.text }}
-          </span>
-        </div>
-      </div>
-    </div>
-
-    <div class="settings-block">
-      <div class="block-header">
         <span class="block-title">订阅更新</span>
       </div>
       <div class="field-row">
@@ -200,8 +161,6 @@ import { api } from '../api'
 
 const saving = ref(false)
 const saveMsg = ref(null)
-const passwordSaving = ref(false)
-const passwordMsg = ref(null)
 const showKernelModal = ref(false)
 
 const form = reactive({
@@ -215,12 +174,6 @@ const form = reactive({
   maxLogLines: 500,
   maxLogFileSizeMB: 2,
   githubMirror: '',
-  webUsername: 'admin',
-})
-const passwordForm = reactive({
-  oldPassword: '',
-  newPassword: '',
-  confirmPassword: '',
 })
 
 const kernelFiles = ref([
@@ -249,7 +202,6 @@ onMounted(async () => {
       maxLogLines: s.maxLogLines || 500,
       maxLogFileSizeMB: (s.maxLogFileSize || 2097152) / (1024 * 1024),
       githubMirror: s.githubMirror || '',
-      webUsername: s.webUsername || 'admin',
     })
   } catch {}
   await refreshKernelStatus()
@@ -325,11 +277,6 @@ function kernelActionClass(k) {
 async function saveSettings() {
   saving.value = true
   saveMsg.value = null
-  if (!String(form.webUsername || '').trim()) {
-    saveMsg.value = { error: true, text: '用户名不能为空' }
-    saving.value = false
-    return
-  }
   try {
     await api.setSetting({
       ...fullSetting,
@@ -341,7 +288,6 @@ async function saveSettings() {
       maxLogLines: form.maxLogLines,
       maxLogFileSize: Math.round(form.maxLogFileSizeMB * 1024 * 1024),
       githubMirror: form.githubMirror,
-      webUsername: form.webUsername.trim(),
     })
     fullSetting = {
       ...fullSetting,
@@ -353,7 +299,6 @@ async function saveSettings() {
       maxLogLines: form.maxLogLines,
       maxLogFileSize: Math.round(form.maxLogFileSizeMB * 1024 * 1024),
       githubMirror: form.githubMirror,
-      webUsername: form.webUsername.trim(),
     }
     saveMsg.value = { error: false, text: '保存成功' }
     setTimeout(() => { saveMsg.value = null }, 3000)
@@ -361,28 +306,6 @@ async function saveSettings() {
     saveMsg.value = { error: true, text: e?.response?.data?.error || '保存失败' }
   } finally {
     saving.value = false
-  }
-}
-
-async function changePassword() {
-  passwordSaving.value = true
-  passwordMsg.value = null
-  if (!passwordForm.oldPassword || !passwordForm.newPassword || !passwordForm.confirmPassword) {
-    passwordMsg.value = { error: true, text: '请完整填写密码字段' }
-    passwordSaving.value = false
-    return
-  }
-  try {
-    await api.changePassword({ ...passwordForm })
-    passwordMsg.value = { error: false, text: '密码已修改，请重新登录' }
-    passwordForm.oldPassword = ''
-    passwordForm.newPassword = ''
-    passwordForm.confirmPassword = ''
-    setTimeout(() => { window.location.reload() }, 800)
-  } catch (e) {
-    passwordMsg.value = { error: true, text: e?.response?.data?.error || '修改失败' }
-  } finally {
-    passwordSaving.value = false
   }
 }
 </script>

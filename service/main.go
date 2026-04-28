@@ -48,6 +48,9 @@ func main() {
 	)
 	flag.Parse()
 
+	*dataDir = resolveDataDir(*dataDir)
+	*guiDir = resolveGUIDir(*guiDir)
+
 	// 重定向标准日志到 addLog
 	log.SetOutput(io.MultiWriter(os.Stdout, &logWriter{}))
 	log.SetFlags(log.Ltime)
@@ -118,6 +121,65 @@ func main() {
 	if err := r.Run(*addr); err != nil {
 		log.Fatalf("server error: %v", err)
 	}
+}
+
+func resolveDataDir(configured string) string {
+	if pathExists(configured) {
+		return configured
+	}
+
+	exeDir := executableDir()
+	candidates := []string{
+		filepath.Join(exeDir, "data"),
+		filepath.Join(exeDir, "..", "data"),
+	}
+	for _, candidate := range candidates {
+		if pathExists(candidate) {
+			return candidate
+		}
+	}
+	return configured
+}
+
+func resolveGUIDir(configured string) string {
+	if dirHasIndex(configured) {
+		return configured
+	}
+
+	exeDir := executableDir()
+	candidates := []string{
+		filepath.Join(exeDir, "gui", "dist"),
+		filepath.Join(exeDir, "..", "gui", "dist"),
+		filepath.Join(exeDir, "dist"),
+	}
+	for _, candidate := range candidates {
+		if dirHasIndex(candidate) {
+			return candidate
+		}
+	}
+	return configured
+}
+
+func executableDir() string {
+	exePath, err := os.Executable()
+	if err != nil {
+		return "."
+	}
+	return filepath.Dir(exePath)
+}
+
+func pathExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func dirHasIndex(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil || !info.IsDir() {
+		return false
+	}
+	_, err = os.Stat(filepath.Join(path, "index.html"))
+	return err == nil
 }
 
 func cleanup() {
