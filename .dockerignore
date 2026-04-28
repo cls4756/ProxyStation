@@ -1,0 +1,7 @@
+service/data/
+service/*.exe
+service/*.exe~
+gui/node_modules/
+gui/dist/
+**/.git/
+**/*.log

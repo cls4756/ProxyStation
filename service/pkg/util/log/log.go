@@ -1,0 +1,29 @@
+package log
+
+import (
+	"fmt"
+	"log"
+)
+
+func Info(format string, args ...interface{}) {
+	log.Printf("[INFO] "+format, args...)
+}
+
+func Warn(format string, args ...interface{}) {
+	log.Printf("[WARN] "+format, args...)
+}
+
+func Error(format string, args ...interface{}) {
+	log.Printf("[ERROR] "+format, args...)
+}
+
+func Debug(format string, args ...interface{}) {
+	log.Printf("[DEBUG] "+format, args...)
+}
+
+func Fatal(format string, args ...interface{}) {
+	log.Fatalf("[FATAL] "+format, args...)
+}
+
+// Sprintf 兼容
+var Sprintf = fmt.Sprintf
