@@ -1337,6 +1337,15 @@ func setSetting(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "webUsername 不能为空"})
 		return
 	}
+	switch s.KernelMode {
+	case "", "auto", "singbox", "xray", "v2ray":
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"error": "kernelMode 非法"})
+		return
+	}
+	if s.KernelMode == "" {
+		s.KernelMode = "auto"
+	}
 	current := configure.GetSettingNotNil()
 	if s.WebPassword == "" {
 		s.WebPassword = current.WebPassword

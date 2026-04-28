@@ -14,6 +14,7 @@ const (
 
 type Setting struct {
 	LogLevel                           string `json:"logLevel"`
+	KernelMode                         string `json:"kernelMode"`
 	SubscriptionAutoUpdateMode         string `json:"subscriptionAutoUpdateMode"`
 	SubscriptionAutoUpdateIntervalHour int    `json:"subscriptionAutoUpdateIntervalHour"`
 	TransparentMode                    string `json:"transparentMode"`
@@ -43,6 +44,7 @@ func NewSetting() *Setting {
 	}
 	return &Setting{
 		LogLevel:                           "info",
+		KernelMode:                         "auto",
 		SubscriptionAutoUpdateMode:         "off",
 		SubscriptionAutoUpdateIntervalHour: 12,
 		TransparentMode:                    "close",
@@ -63,6 +65,10 @@ func GetSettingNotNil() *Setting {
 	changed := false
 	if strings.TrimSpace(s.WebUsername) == "" {
 		s.WebUsername = DefaultWebUsername
+		changed = true
+	}
+	if s.KernelMode == "" {
+		s.KernelMode = "auto"
 		changed = true
 	}
 	if s.WebPassword == "" {

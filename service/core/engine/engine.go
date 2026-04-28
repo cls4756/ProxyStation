@@ -98,7 +98,7 @@ func (em *EngineManager) Start() error {
 	setting := configure.GetSettingNotNil()
 
 	// 确定需要哪个内核
-	kernel := em.selectKernel()
+	kernel := em.selectKernel(setting)
 	em.kernel = kernel
 
 	var configPath string
@@ -141,7 +141,12 @@ func (em *EngineManager) Start() error {
 			"/usr/local/bin/xray", "/usr/bin/xray",
 		})
 		if err != nil {
-			// fallback to v2ray
+			if setting.KernelMode == "xray" {
+				em.running = false
+				_ = configure.SetRunning(false)
+				return fmt.Errorf("xray not found: %w", err)
+			}
+			// auto mode fallback to v2ray
 			binPath, err = findBin([]string{"v2ray", "v2ray.exe"}, []string{
 				"/usr/local/bin/v2ray", "/usr/bin/v2ray",
 			})
@@ -169,6 +174,34 @@ func (em *EngineManager) Start() error {
 			em.running = false
 			_ = configure.SetRunning(false)
 			return fmt.Errorf("write xray config: %w", e)
+		}
+		args = []string{binPath, "run", "--config=" + configPath}
+
+	case KernelV2ray:
+		binPath, err = findBin([]string{"v2ray", "v2ray.exe"}, []string{
+			"/usr/local/bin/v2ray", "/usr/bin/v2ray",
+		})
+		if err != nil {
+			em.running = false
+			_ = configure.SetRunning(false)
+			return fmt.Errorf("v2ray not found: %w", err)
+		}
+		configPath = filepath.Join(em.dataDir, "config.json")
+		cfg, e := BuildXrayConfig(setting)
+		if e != nil {
+			em.running = false
+			_ = configure.SetRunning(false)
+			return fmt.Errorf("build v2ray config: %w", e)
+		}
+		if cfgJSON, err := json.MarshalIndent(cfg, "", "  "); err == nil {
+			if LogCallback != nil {
+				LogCallback(fmt.Sprintf("📋 V2Ray 配置:\n%s", string(cfgJSON)))
+			}
+		}
+		if e := writeJSON(cfg, configPath); e != nil {
+			em.running = false
+			_ = configure.SetRunning(false)
+			return fmt.Errorf("write v2ray config: %w", e)
 		}
 		args = []string{binPath, "run", "--config=" + configPath}
 
@@ -312,7 +345,16 @@ func (em *EngineManager) hasAnyOutbound() bool {
 }
 // 如果有任何节点需要 sing-box，就用 sing-box（它也支持 vmess/vless/ss/trojan）
 // 如果 sing-box 已安装，优先使用它（协议支持更广）；否则用 xray
-func (em *EngineManager) selectKernel() KernelType {
+func (em *EngineManager) selectKernel(setting *configure.Setting) KernelType {
+	switch setting.KernelMode {
+	case "singbox":
+		return KernelSingbox
+	case "xray":
+		return KernelXray
+	case "v2ray":
+		return KernelV2ray
+	}
+
 	outboundNames := configure.GetOutboundNames()
 	needSingbox := false
 	for _, name := range outboundNames {

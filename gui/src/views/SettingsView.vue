@@ -39,6 +39,21 @@
         <span class="block-title">代理</span>
       </div>
       <div class="field-row">
+        <label class="field-label">内核模式</label>
+        <select class="input field-input" v-model="form.kernelMode">
+          <option value="auto">自动选择</option>
+          <option value="singbox">强制 sing-box</option>
+          <option value="xray">强制 Xray</option>
+          <option value="v2ray">强制 V2Ray</option>
+        </select>
+      </div>
+      <div class="field-row field-row-tip">
+        <label class="field-label"></label>
+        <div class="field-tip">
+          自动模式下，支持高级协议时优先使用 sing-box；若未安装 sing-box，则回退到 Xray。手动模式会严格使用你选择的内核。
+        </div>
+      </div>
+      <div class="field-row">
         <label class="field-label">透明代理模式</label>
         <select class="input field-input" v-model="form.transparentMode">
           <option value="close">关闭</option>
@@ -165,6 +180,7 @@ const showKernelModal = ref(false)
 
 const form = reactive({
   logLevel: 'info',
+  kernelMode: 'auto',
   subscriptionAutoUpdateMode: 'off',
   subscriptionAutoUpdateIntervalHour: 12,
   transparentMode: 'close',
@@ -193,6 +209,7 @@ onMounted(async () => {
     fullSetting = { ...s }
     Object.assign(form, {
       logLevel: s.logLevel || 'info',
+      kernelMode: s.kernelMode || 'auto',
       subscriptionAutoUpdateMode: s.subscriptionAutoUpdateMode || 'off',
       subscriptionAutoUpdateIntervalHour: s.subscriptionAutoUpdateIntervalHour || 12,
       transparentMode: s.transparentMode || 'close',
@@ -281,6 +298,7 @@ async function saveSettings() {
     await api.setSetting({
       ...fullSetting,
       logLevel: form.logLevel,
+      kernelMode: form.kernelMode,
       subscriptionAutoUpdateMode: form.subscriptionAutoUpdateMode,
       subscriptionAutoUpdateIntervalHour: form.subscriptionAutoUpdateIntervalHour,
       transparentMode: form.transparentMode,
@@ -292,6 +310,7 @@ async function saveSettings() {
     fullSetting = {
       ...fullSetting,
       logLevel: form.logLevel,
+      kernelMode: form.kernelMode,
       subscriptionAutoUpdateMode: form.subscriptionAutoUpdateMode,
       subscriptionAutoUpdateIntervalHour: form.subscriptionAutoUpdateIntervalHour,
       transparentMode: form.transparentMode,
