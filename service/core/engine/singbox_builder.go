@@ -925,6 +925,7 @@ func buildSingboxDefaults(setting *configure.Setting) ([]SingboxDNSServer, []Sin
 			{Type: "udp", Tag: "local", Server: "223.5.5.5"},
 			{Type: "udp", Tag: "remote", Server: "1.1.1.1"},
 		}
+		defaultDomainResolver = "local"
 	}
 
 	dnsRules := []SingboxDNSRule{{RuleSet: []string{"geosite-cn"}, Server: "local"}}
