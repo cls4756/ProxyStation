@@ -77,7 +77,7 @@
       <div class="field-row field-row-tip">
         <label class="field-label"></label>
         <div class="field-tip">
-          轻量模式默认使用 UDP DNS，减少 DoH 和接口探测带来的等待。兼容模式保留原来的远端 DoH、bootstrap 和自动接口检测，更适合需要严格 DNS 接管的场景。
+          轻量模式使用更直接的 UDP DNS，首包更快，适合浏览器代理等常见场景。兼容模式保留远端 DoH、bootstrap 和自动接口检测，DNS 接管更完整，但启动和访问首包会更重，更适合透明代理或复杂分流环境。
         </div>
       </div>
       <div class="field-row">

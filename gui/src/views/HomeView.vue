@@ -437,6 +437,21 @@ function selectAll() {
 // 切换 tab 时清空选择
 watch(activeTab, () => { selectedRefs.value = []; showSelectAll.value = false })
 
+watch(
+	() => [currentOutbound?.value, manualGroups.value.map(g => g.id).join(','), store.outbounds],
+	() => {
+		const outboundName = currentOutbound?.value || 'proxy'
+		const outbound = store.outbounds.find(o => o.name === outboundName)
+		const groupID = outbound?.target?.targetType === 'group' ? outbound.target.groupId : ''
+		if (!groupID) return
+		const gi = manualGroups.value.findIndex(g => g.id === groupID)
+		if (gi >= 0) {
+			activeTab.value = 'group-' + gi
+		}
+	},
+	{ immediate: true }
+)
+
 // 当前 tab 是否可批量删除（只有手动分组可删）
 const canBulkRemove = computed(() => {
   return activeTab.value.startsWith('group-')
