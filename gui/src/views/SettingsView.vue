@@ -54,6 +54,33 @@
         </div>
       </div>
       <div class="field-row">
+        <label class="field-label">全局流量探测</label>
+        <label class="toggle-wrap">
+          <input type="checkbox" v-model="form.enableSniff" />
+          <span>{{ form.enableSniff ? '已开启，按需识别 SNI/Host' : '已关闭，减少首包处理开销' }}</span>
+        </label>
+      </div>
+      <div class="field-row">
+        <label class="field-label">DNS 劫持</label>
+        <label class="toggle-wrap">
+          <input type="checkbox" v-model="form.enableHijackDNS" />
+          <span>{{ form.enableHijackDNS ? '已开启，代理接管 DNS' : '已关闭，更多依赖系统/应用 DNS' }}</span>
+        </label>
+      </div>
+      <div class="field-row">
+        <label class="field-label">DNS 模式</label>
+        <select class="input field-input" v-model="form.dnsMode">
+          <option value="lightweight">轻量模式</option>
+          <option value="compatible">兼容模式</option>
+        </select>
+      </div>
+      <div class="field-row field-row-tip">
+        <label class="field-label"></label>
+        <div class="field-tip">
+          轻量模式默认使用 UDP DNS，减少 DoH 和接口探测带来的等待。兼容模式保留原来的远端 DoH、bootstrap 和自动接口检测，更适合需要严格 DNS 接管的场景。
+        </div>
+      </div>
+      <div class="field-row">
         <label class="field-label">透明代理模式</label>
         <select class="input field-input" v-model="form.transparentMode">
           <option value="close">关闭</option>
@@ -181,6 +208,9 @@ const showKernelModal = ref(false)
 const form = reactive({
   logLevel: 'info',
   kernelMode: 'auto',
+  enableSniff: false,
+  enableHijackDNS: false,
+  dnsMode: 'lightweight',
   subscriptionAutoUpdateMode: 'off',
   subscriptionAutoUpdateIntervalHour: 12,
   transparentMode: 'close',
@@ -210,6 +240,9 @@ onMounted(async () => {
     Object.assign(form, {
       logLevel: s.logLevel || 'info',
       kernelMode: s.kernelMode || 'auto',
+      enableSniff: !!s.enableSniff,
+      enableHijackDNS: !!s.enableHijackDNS,
+      dnsMode: s.dnsMode || 'lightweight',
       subscriptionAutoUpdateMode: s.subscriptionAutoUpdateMode || 'off',
       subscriptionAutoUpdateIntervalHour: s.subscriptionAutoUpdateIntervalHour || 12,
       transparentMode: s.transparentMode || 'close',
@@ -299,6 +332,9 @@ async function saveSettings() {
       ...fullSetting,
       logLevel: form.logLevel,
       kernelMode: form.kernelMode,
+      enableSniff: form.enableSniff,
+      enableHijackDNS: form.enableHijackDNS,
+      dnsMode: form.dnsMode,
       subscriptionAutoUpdateMode: form.subscriptionAutoUpdateMode,
       subscriptionAutoUpdateIntervalHour: form.subscriptionAutoUpdateIntervalHour,
       transparentMode: form.transparentMode,
@@ -311,6 +347,9 @@ async function saveSettings() {
       ...fullSetting,
       logLevel: form.logLevel,
       kernelMode: form.kernelMode,
+      enableSniff: form.enableSniff,
+      enableHijackDNS: form.enableHijackDNS,
+      dnsMode: form.dnsMode,
       subscriptionAutoUpdateMode: form.subscriptionAutoUpdateMode,
       subscriptionAutoUpdateIntervalHour: form.subscriptionAutoUpdateIntervalHour,
       transparentMode: form.transparentMode,

@@ -189,22 +189,14 @@ func BuildSingboxConfig(setting *configure.Setting) (*SingboxConfig, error) {
 		setting = configure.GetSettingNotNil()
 	}
 	listenAddr := configure.BuiltinProxyListenAddress(setting)
+	dnsServers, dnsRules, routeRules, autoDetectInterface, defaultDomainResolver := buildSingboxDefaults(setting)
 
 	cfg := &SingboxConfig{
 		Log: &SingboxLog{Level: singboxLogLevel(setting.LogLevel)},
 		DNS: &SingboxDNS{
-			Servers: []SingboxDNSServer{
-				// bootstrap：纯 UDP，无 detour，直接走系统网络
-				{Type: "udp", Tag: "bootstrap", Server: "223.5.5.5"},
-				// 国内 DNS，走直连（不设 detour，依赖 default_domain_resolver）
-				{Type: "https", Tag: "local", Server: "223.5.5.5", DomainResolver: "bootstrap"},
-				// 国外 DNS，走代理出站（稍后会更新 Detour）
-				{Type: "https", Tag: "remote", Server: "8.8.8.8", DomainResolver: "bootstrap"},
-			},
-			Rules: []SingboxDNSRule{
-				{RuleSet: []string{"geosite-cn"}, Server: "local"},
-			},
-			Final: "remote",
+			Servers: dnsServers,
+			Rules:   dnsRules,
+			Final:   "remote",
 		},
 		Inbounds: []SingboxInbound{
 			buildSingboxInbound("socks", "socks-in", listenAddr, setting.Socks5Port, setting.Socks5Username, setting.Socks5Password),
@@ -215,24 +207,14 @@ func BuildSingboxConfig(setting *configure.Setting) (*SingboxConfig, error) {
 			{Type: "block", Tag: "block"},
 		},
 		Route: &SingboxRoute{
-			Rules: []SingboxRouteRule{
-				// sniff 必须作为第一条规则（action 模式）
-				{Action: "sniff"},
-				// DNS 劫持
-				{Protocol: "dns", Action: "hijack-dns"},
-				// 私有 IP 直连
-				{IPIsPrivate: true, Outbound: "direct"},
-				// 国内直连
-				{RuleSet: []string{"geosite-cn"}, Outbound: "direct"},
-				{RuleSet: []string{"geoip-cn"}, Outbound: "direct"},
-			},
+			Rules: routeRules,
 			RuleSet: []SingboxRuleSet{
 				makeRuleSet("geosite-cn", "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/cn.srs"),
 				makeRuleSet("geoip-cn", "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/cn.srs"),
 			},
 			Final:                 "proxy",
-			AutoDetectInterface:   true,
-			DefaultDomainResolver: "bootstrap",
+			AutoDetectInterface:   autoDetectInterface,
+			DefaultDomainResolver: defaultDomainResolver,
 		},
 	}
 
@@ -917,6 +899,49 @@ func singboxLogLevel(level string) string {
 	default:
 		return "info"
 	}
+}
+
+func buildSingboxDefaults(setting *configure.Setting) ([]SingboxDNSServer, []SingboxDNSRule, []SingboxRouteRule, bool, string) {
+	dnsMode := strings.ToLower(setting.DNSMode)
+	if dnsMode == "" {
+		dnsMode = "lightweight"
+	}
+
+	var dnsServers []SingboxDNSServer
+	var defaultDomainResolver string
+	autoDetectInterface := false
+
+	switch dnsMode {
+	case "compatible":
+		dnsServers = []SingboxDNSServer{
+			{Type: "udp", Tag: "bootstrap", Server: "223.5.5.5"},
+			{Type: "https", Tag: "local", Server: "223.5.5.5", DomainResolver: "bootstrap"},
+			{Type: "https", Tag: "remote", Server: "8.8.8.8", DomainResolver: "bootstrap"},
+		}
+		defaultDomainResolver = "bootstrap"
+		autoDetectInterface = true
+	default:
+		dnsServers = []SingboxDNSServer{
+			{Type: "udp", Tag: "local", Server: "223.5.5.5"},
+			{Type: "udp", Tag: "remote", Server: "1.1.1.1"},
+		}
+	}
+
+	dnsRules := []SingboxDNSRule{{RuleSet: []string{"geosite-cn"}, Server: "local"}}
+	routeRules := []SingboxRouteRule{}
+	if setting.EnableSniff {
+		routeRules = append(routeRules, SingboxRouteRule{Action: "sniff"})
+	}
+	if setting.EnableHijackDNS {
+		routeRules = append(routeRules, SingboxRouteRule{Protocol: "dns", Action: "hijack-dns"})
+	}
+	routeRules = append(routeRules,
+		SingboxRouteRule{IPIsPrivate: true, Outbound: "direct"},
+		SingboxRouteRule{RuleSet: []string{"geosite-cn"}, Outbound: "direct"},
+		SingboxRouteRule{RuleSet: []string{"geoip-cn"}, Outbound: "direct"},
+	)
+
+	return dnsServers, dnsRules, routeRules, autoDetectInterface, defaultDomainResolver
 }
 
 // appendRuleSetIfAbsent 如果 rule-set 不存在则添加

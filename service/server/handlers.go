@@ -25,17 +25,32 @@ import (
 
 // 日志缓冲区和订阅者管理
 var (
-	logMutex       sync.RWMutex
-	logBuffer      []string
-	logSubscribers []chan LogEntry
-	maxLogLines    = 500
-	logFilePath    string
-	maxLogFileSize int64 = 2 * 1024 * 1024 // 2MB
+	logMutex        sync.RWMutex
+	logBuffer       []string
+	logSubscribers  []chan LogEntry
+	maxLogLines     = 500
+	logFilePath     string
+	maxLogFileSize  int64 = 2 * 1024 * 1024 // 2MB
+	logQueue              = make(chan queuedLogEntry, 1024)
+	logDroppedCount int
+	logWorkerOnce   sync.Once
 )
+
+type queuedLogEntry struct {
+	message string
+	level   string
+}
 
 // InitLogFile 初始化日志文件路径
 func InitLogFile(dataDir string) {
 	logFilePath = filepath.Join(dataDir, "proxystation.log")
+	ensureLogWorker()
+}
+
+func ensureLogWorker() {
+	logWorkerOnce.Do(func() {
+		go processLogQueue()
+	})
 }
 
 // SetMaxLogLines 设置最大日志行数
@@ -66,32 +81,56 @@ func AddLog(msg string) {
 
 // AddLogWithLevel 添加带级别的日志
 func AddLogWithLevel(msg string, level string) {
-	logMutex.Lock()
-	defer logMutex.Unlock()
-
-	now := time.Now().Format("15:04:05")
-	formattedMsg := fmt.Sprintf("[%s] %s", now, msg)
-	logBuffer = append(logBuffer, formattedMsg)
-
-	// 如果超过最大行数，写入文件并清空缓冲区
-	if len(logBuffer) > maxLogLines {
-		writeLogsToFile(logBuffer[:len(logBuffer)-maxLogLines])
-		logBuffer = logBuffer[len(logBuffer)-maxLogLines:]
+	ensureLogWorker()
+	entry := queuedLogEntry{message: msg, level: level}
+	select {
+	case logQueue <- entry:
+	default:
+		logMutex.Lock()
+		logDroppedCount++
+		dropped := logDroppedCount
+		logMutex.Unlock()
+		if dropped%100 == 1 {
+			fmt.Fprintf(os.Stderr, "log queue full, dropped %d messages\n", dropped)
+		}
 	}
+}
 
-	// 创建日志条目
-	entry := LogEntry{
-		Time:    now,
-		Message: msg,
-		Level:   level,
-	}
+func processLogQueue() {
+	for item := range logQueue {
+		now := time.Now().Format("15:04:05")
+		formattedMsg := fmt.Sprintf("[%s] %s", now, item.message)
+		entry := LogEntry{
+			Time:    now,
+			Message: item.message,
+			Level:   item.level,
+		}
 
-	// 广播给所有订阅者
-	for _, ch := range logSubscribers {
-		select {
-		case ch <- entry:
-		default:
-			// 如果通道满了，跳过
+		var (
+			logsToFlush []string
+			subscribers []chan LogEntry
+		)
+
+		logMutex.Lock()
+		logBuffer = append(logBuffer, formattedMsg)
+		if len(logBuffer) > maxLogLines {
+			logsToFlush = append(logsToFlush, logBuffer[:len(logBuffer)-maxLogLines]...)
+			logBuffer = logBuffer[len(logBuffer)-maxLogLines:]
+		}
+		if len(logSubscribers) > 0 {
+			subscribers = append(subscribers, logSubscribers...)
+		}
+		logMutex.Unlock()
+
+		if len(logsToFlush) > 0 {
+			writeLogsToFile(logsToFlush)
+		}
+
+		for _, ch := range subscribers {
+			select {
+			case ch <- entry:
+			default:
+			}
 		}
 	}
 }
@@ -1343,8 +1382,17 @@ func setSetting(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "kernelMode 非法"})
 		return
 	}
+	switch s.DNSMode {
+	case "", "lightweight", "compatible":
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"error": "dnsMode 非法"})
+		return
+	}
 	if s.KernelMode == "" {
 		s.KernelMode = "auto"
+	}
+	if s.DNSMode == "" {
+		s.DNSMode = "lightweight"
 	}
 	current := configure.GetSettingNotNil()
 	if s.WebPassword == "" {

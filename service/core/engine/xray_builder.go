@@ -17,6 +17,12 @@ func BuildXrayConfig(setting *configure.Setting) (*coreObj.Config, error) {
 		setting = configure.GetSettingNotNil()
 	}
 	listenAddr := configure.BuiltinProxyListenAddress(setting)
+	builtinSocksSniffing := coreObj.Sniffing{}
+	builtinHTTPSniffing := coreObj.Sniffing{}
+	if setting.EnableSniff {
+		builtinSocksSniffing = coreObj.Sniffing{Enabled: true, DestOverride: []string{"http", "tls", "quic"}}
+		builtinHTTPSniffing = coreObj.Sniffing{Enabled: true, DestOverride: []string{"http", "tls"}}
+	}
 	cfg := &coreObj.Config{
 		Log:     &coreObj.Log{Loglevel: setting.LogLevel, Error: "none"},
 		Routing: coreObj.Routing{DomainStrategy: "IPIfNonMatch"},
@@ -24,11 +30,11 @@ func BuildXrayConfig(setting *configure.Setting) (*coreObj.Config, error) {
 			{
 				Tag: "socks", Port: setting.Socks5Port, Listen: listenAddr, Protocol: "socks",
 				Settings: &coreObj.InboundSettings{UDP: true},
-				Sniffing: coreObj.Sniffing{Enabled: true, DestOverride: []string{"http", "tls", "quic"}},
+				Sniffing: builtinSocksSniffing,
 			},
 			{
 				Tag: "http", Port: setting.HttpPort, Listen: listenAddr, Protocol: "http",
-				Sniffing: coreObj.Sniffing{Enabled: true, DestOverride: []string{"http", "tls"}},
+				Sniffing: builtinHTTPSniffing,
 			},
 		},
 		Outbounds: []coreObj.OutboundObject{

@@ -15,6 +15,9 @@ const (
 type Setting struct {
 	LogLevel                           string `json:"logLevel"`
 	KernelMode                         string `json:"kernelMode"`
+	EnableSniff                        bool   `json:"enableSniff"`
+	EnableHijackDNS                    bool   `json:"enableHijackDNS"`
+	DNSMode                            string `json:"dnsMode"`
 	SubscriptionAutoUpdateMode         string `json:"subscriptionAutoUpdateMode"`
 	SubscriptionAutoUpdateIntervalHour int    `json:"subscriptionAutoUpdateIntervalHour"`
 	TransparentMode                    string `json:"transparentMode"`
@@ -45,6 +48,9 @@ func NewSetting() *Setting {
 	return &Setting{
 		LogLevel:                           "info",
 		KernelMode:                         "auto",
+		EnableSniff:                        false,
+		EnableHijackDNS:                    false,
+		DNSMode:                            "lightweight",
 		SubscriptionAutoUpdateMode:         "off",
 		SubscriptionAutoUpdateIntervalHour: 12,
 		TransparentMode:                    "close",
@@ -69,6 +75,10 @@ func GetSettingNotNil() *Setting {
 	}
 	if s.KernelMode == "" {
 		s.KernelMode = "auto"
+		changed = true
+	}
+	if s.DNSMode == "" {
+		s.DNSMode = "lightweight"
 		changed = true
 	}
 	if s.WebPassword == "" {

@@ -64,7 +64,7 @@ type EngineManager struct {
 	cancel  context.CancelFunc
 	kernel  KernelType
 	dataDir string
-	running bool  // 添加运行状态标志
+	running bool // 添加运行状态标志
 }
 
 func Init(dataDir string) {
@@ -75,7 +75,7 @@ func Init(dataDir string) {
 func (em *EngineManager) Start() error {
 	em.mu.Lock()
 	defer em.mu.Unlock()
-	
+
 	// 停止旧进程
 	if em.cancel != nil {
 		em.cancel()
@@ -175,6 +175,11 @@ func (em *EngineManager) Start() error {
 			_ = configure.SetRunning(false)
 			return fmt.Errorf("write xray config: %w", e)
 		}
+		if e := ensureKernelDataFiles(binPath); e != nil {
+			em.running = false
+			_ = configure.SetRunning(false)
+			return fmt.Errorf("prepare xray data files: %w", e)
+		}
 		args = []string{binPath, "run", "--config=" + configPath}
 
 	case KernelV2ray:
@@ -203,6 +208,11 @@ func (em *EngineManager) Start() error {
 			_ = configure.SetRunning(false)
 			return fmt.Errorf("write v2ray config: %w", e)
 		}
+		if e := ensureKernelDataFiles(binPath); e != nil {
+			em.running = false
+			_ = configure.SetRunning(false)
+			return fmt.Errorf("prepare v2ray data files: %w", e)
+		}
 		args = []string{binPath, "run", "--config=" + configPath}
 
 	default:
@@ -213,7 +223,8 @@ func (em *EngineManager) Start() error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
-	
+	cmd.Dir = em.dataDir
+
 	// 创建多路输出：既输出到控制台，也转发到日志系统
 	cmd.Stdout = &logWriter{}
 	cmd.Stderr = &logWriter{}
@@ -248,7 +259,7 @@ func (em *EngineManager) Start() error {
 	// 只有在端口就绪后才设置运行状态
 	em.running = true
 	_ = configure.SetRunning(true)
-	
+
 	// 启动 goroutine 监听进程退出
 	// 使用局部变量保存当前进程，避免竞态条件
 	currentProc := em.proc
@@ -343,6 +354,7 @@ func (em *EngineManager) hasAnyOutbound() bool {
 	}
 	return false
 }
+
 // 如果有任何节点需要 sing-box，就用 sing-box（它也支持 vmess/vless/ss/trojan）
 // 如果 sing-box 已安装，优先使用它（协议支持更广）；否则用 xray
 func (em *EngineManager) selectKernel(setting *configure.Setting) KernelType {
@@ -681,6 +693,54 @@ func explainKernelStartError(binPath string, err error) error {
 	return err
 }
 
+func ensureKernelDataFiles(binPath string) error {
+	if Manager.dataDir == "" || binPath == "" {
+		return nil
+	}
+	binDir := filepath.Dir(binPath)
+	for _, name := range []string{"geoip.dat", "geosite.dat"} {
+		src := filepath.Join(Manager.dataDir, name)
+		fi, err := os.Stat(src)
+		if err != nil || fi.IsDir() {
+			continue
+		}
+		dst := filepath.Join(binDir, name)
+		if sameFileInfo(fi, dst) {
+			continue
+		}
+		if err := copyFile(src, dst, fi.Mode()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func sameFileInfo(srcInfo os.FileInfo, dst string) bool {
+	dstInfo, err := os.Stat(dst)
+	if err != nil || dstInfo.IsDir() {
+		return false
+	}
+	return srcInfo.Size() == dstInfo.Size() && !srcInfo.ModTime().After(dstInfo.ModTime())
+}
+
+func copyFile(src, dst string, mode os.FileMode) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	return out.Sync()
+}
 
 // logWriter 实现 io.Writer 接口，用于捕获进程输出并转发到日志系统
 type logWriter struct {
@@ -691,13 +751,13 @@ type logWriter struct {
 func (w *logWriter) Write(p []byte) (n int, err error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	
+
 	// 同时输出到控制台（保留原始 ANSI 颜色）
 	_, _ = os.Stdout.Write(p)
-	
+
 	// 缓冲数据，按行处理
 	w.buffer.Write(p)
-	
+
 	for {
 		line, err := w.buffer.ReadBytes('\n')
 		if err != nil {
@@ -717,7 +777,7 @@ func (w *logWriter) Write(p []byte) (n int, err error) {
 			}
 		}
 	}
-	
+
 	return len(p), nil
 }
 
