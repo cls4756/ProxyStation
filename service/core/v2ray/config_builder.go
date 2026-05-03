@@ -73,6 +73,7 @@ func BuildConfig(setting *configure.Setting) (*coreObj.Config, error) {
 
 	// 添加自定义入站
 	for _, ci := range configure.GetCustomInbounds() {
+		accounts := ci.AuthAccounts()
 		ib := coreObj.Inbound{
 			Tag:      ci.Tag,
 			Port:     ci.Port,
@@ -93,19 +94,21 @@ func BuildConfig(setting *configure.Setting) (*coreObj.Config, error) {
 				UDP:  ci.UDPEnabled,
 				Auth: "noauth",
 			}
-			if ci.Username != "" && ci.Password != "" {
+			if len(accounts) > 0 {
 				ib.Settings.Auth = "password"
-				ib.Settings.Accounts = []coreObj.InboundAccount{
-					{User: ci.Username, Pass: ci.Password},
+				ib.Settings.Accounts = make([]coreObj.InboundAccount, 0, len(accounts))
+				for _, a := range accounts {
+					ib.Settings.Accounts = append(ib.Settings.Accounts, coreObj.InboundAccount{User: a.Username, Pass: a.Password})
 				}
 			}
 		case "http":
-			if ci.Username != "" && ci.Password != "" {
+			if len(accounts) > 0 {
 				ib.Settings = &coreObj.InboundSettings{
 					Auth: "basic",
-					Accounts: []coreObj.InboundAccount{
-						{User: ci.Username, Pass: ci.Password},
-					},
+					Accounts: make([]coreObj.InboundAccount, 0, len(accounts)),
+				}
+				for _, a := range accounts {
+					ib.Settings.Accounts = append(ib.Settings.Accounts, coreObj.InboundAccount{User: a.Username, Pass: a.Password})
 				}
 			}
 		case "dokodemo-door":

@@ -21,8 +21,32 @@ type CustomInbound struct {
 	SniffEnabled bool     `json:"sniffEnabled,omitempty"`
 	SniffDest    []string `json:"sniffDest,omitempty"` // ["http","tls","quic"]
 	// 认证（socks 和 http 支持）
-	Username string `json:"username,omitempty"`
-	Password string `json:"password,omitempty"`
+	Username string `json:"username,omitempty"` // 兼容旧配置：单账号
+	Password string `json:"password,omitempty"` // 兼容旧配置：单账号
+	Accounts []InboundAccount `json:"accounts,omitempty"`
+}
+
+type InboundAccount struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+// AuthAccounts 返回可用账号列表，优先使用 accounts；若为空则回退到旧字段 username/password。
+func (c CustomInbound) AuthAccounts() []InboundAccount {
+	accounts := make([]InboundAccount, 0, len(c.Accounts))
+	for _, a := range c.Accounts {
+		if a.Username == "" && a.Password == "" {
+			continue
+		}
+		accounts = append(accounts, a)
+	}
+	if len(accounts) > 0 {
+		return accounts
+	}
+	if c.Username != "" || c.Password != "" {
+		return []InboundAccount{{Username: c.Username, Password: c.Password}}
+	}
+	return nil
 }
 
 func GetCustomInbounds() []CustomInbound {

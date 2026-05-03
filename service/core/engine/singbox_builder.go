@@ -199,8 +199,8 @@ func BuildSingboxConfig(setting *configure.Setting) (*SingboxConfig, error) {
 			Final:   "remote",
 		},
 		Inbounds: []SingboxInbound{
-			buildSingboxInbound("socks", "socks-in", listenAddr, setting.Socks5Port, setting.Socks5Username, setting.Socks5Password),
-			buildSingboxInbound("http", "http-in", listenAddr, setting.HttpPort, setting.HttpUsername, setting.HttpPassword),
+			buildSingboxInbound("socks", "socks-in", listenAddr, setting.Socks5Port, []configure.InboundAccount{{Username: setting.Socks5Username, Password: setting.Socks5Password}}),
+			buildSingboxInbound("http", "http-in", listenAddr, setting.HttpPort, []configure.InboundAccount{{Username: setting.HttpUsername, Password: setting.HttpPassword}}),
 		},
 		Outbounds: []SingboxOutbound{
 			{Type: "direct", Tag: "direct"},
@@ -220,7 +220,7 @@ func BuildSingboxConfig(setting *configure.Setting) (*SingboxConfig, error) {
 
 	// 添加自定义入站
 	for _, ci := range configure.GetCustomInbounds() {
-		ib := buildSingboxInbound("", ci.Tag, ci.Listen, ci.Port, ci.Username, ci.Password)
+		ib := buildSingboxInbound("", ci.Tag, ci.Listen, ci.Port, ci.AuthAccounts())
 		if ib.Listen == "" {
 			ib.Listen = "127.0.0.1"
 		}
@@ -455,6 +455,7 @@ func BuildSingboxConfig(setting *configure.Setting) (*SingboxConfig, error) {
 	cfg.Experimental = &SingboxExperimental{
 		CacheFile: &SingboxCacheFile{Enabled: true, Path: "cache.db"},
 	}
+	cfg.Route.Rules = optimizeSingboxRules(cfg.Route.Rules)
 
 	return cfg, nil
 }
@@ -883,11 +884,14 @@ var geoNameAliases = map[string]string{
 }
 
 // singboxLogLevel 将通用日志级别直接传给 sing-box，保持一致
-// buildSingboxInbound 构建 SingboxInbound，若有用户名密码则填入 users 数组
-func buildSingboxInbound(typ, tag, listen string, port int, username, password string) SingboxInbound {
+// buildSingboxInbound 构建 SingboxInbound，若有账号则填入 users 数组
+func buildSingboxInbound(typ, tag, listen string, port int, accounts []configure.InboundAccount) SingboxInbound {
 	ib := SingboxInbound{Type: typ, Tag: tag, Listen: listen, ListenPort: port}
-	if username != "" || password != "" {
-		ib.Users = []SingboxInboundUser{{Username: username, Password: password}}
+	if len(accounts) > 0 {
+		ib.Users = make([]SingboxInboundUser, 0, len(accounts))
+		for _, a := range accounts {
+			ib.Users = append(ib.Users, SingboxInboundUser{Username: a.Username, Password: a.Password})
+		}
 	}
 	return ib
 }
