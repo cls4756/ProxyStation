@@ -42,6 +42,28 @@ func BuildXrayConfig(setting *configure.Setting) (*coreObj.Config, error) {
 			{Tag: "block", Protocol: "blackhole"},
 		},
 	}
+	socksAccounts := setting.Socks5AuthAccounts()
+	if len(socksAccounts) > 0 {
+		cfg.Inbounds[0].Settings.Auth = "password"
+		cfg.Inbounds[0].Settings.Accounts = make([]coreObj.InboundAccount, 0, len(socksAccounts))
+		for _, a := range socksAccounts {
+			cfg.Inbounds[0].Settings.Accounts = append(cfg.Inbounds[0].Settings.Accounts, coreObj.InboundAccount{
+				User: a.Username, Pass: a.Password,
+			})
+		}
+	}
+	httpAccounts := setting.HTTPAuthAccounts()
+	if len(httpAccounts) > 0 {
+		cfg.Inbounds[1].Settings = &coreObj.InboundSettings{
+			Auth: "basic",
+			Accounts: make([]coreObj.InboundAccount, 0, len(httpAccounts)),
+		}
+		for _, a := range httpAccounts {
+			cfg.Inbounds[1].Settings.Accounts = append(cfg.Inbounds[1].Settings.Accounts, coreObj.InboundAccount{
+				User: a.Username, Pass: a.Password,
+			})
+		}
+	}
 
 	// 添加自定义入站
 	for _, ci := range configure.GetCustomInbounds() {

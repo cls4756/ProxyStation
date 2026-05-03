@@ -35,6 +35,8 @@ type Setting struct {
 	Socks5Password string `json:"socks5Password,omitempty"`
 	HttpUsername   string `json:"httpUsername,omitempty"`
 	HttpPassword   string `json:"httpPassword,omitempty"`
+	Socks5Accounts []InboundAccount `json:"socks5Accounts,omitempty"`
+	HttpAccounts   []InboundAccount `json:"httpAccounts,omitempty"`
 	// Web 管理端认证
 	WebUsername string `json:"webUsername,omitempty"`
 	WebPassword string `json:"webPassword,omitempty"`
@@ -130,4 +132,35 @@ func BuiltinProxyListenAddress(setting *Setting) string {
 		return "0.0.0.0"
 	}
 	return "127.0.0.1"
+}
+
+func (s *Setting) Socks5AuthAccounts() []InboundAccount {
+	if s == nil {
+		return nil
+	}
+	return normalizeInboundAccounts(s.Socks5Accounts, s.Socks5Username, s.Socks5Password)
+}
+
+func (s *Setting) HTTPAuthAccounts() []InboundAccount {
+	if s == nil {
+		return nil
+	}
+	return normalizeInboundAccounts(s.HttpAccounts, s.HttpUsername, s.HttpPassword)
+}
+
+func normalizeInboundAccounts(accounts []InboundAccount, fallbackUser, fallbackPass string) []InboundAccount {
+	out := make([]InboundAccount, 0, len(accounts))
+	for _, a := range accounts {
+		if a.Username == "" && a.Password == "" {
+			continue
+		}
+		out = append(out, a)
+	}
+	if len(out) > 0 {
+		return out
+	}
+	if fallbackUser != "" || fallbackPass != "" {
+		return []InboundAccount{{Username: fallbackUser, Password: fallbackPass}}
+	}
+	return nil
 }

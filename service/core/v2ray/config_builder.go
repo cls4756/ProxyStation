@@ -56,18 +56,26 @@ func BuildConfig(setting *configure.Setting) (*coreObj.Config, error) {
 	}
 
 	// 为默认入站添加认证
-	if setting.Socks5Username != "" && setting.Socks5Password != "" {
+	socksAccounts := setting.Socks5AuthAccounts()
+	if len(socksAccounts) > 0 {
 		cfg.Inbounds[0].Settings.Auth = "password"
-		cfg.Inbounds[0].Settings.Accounts = []coreObj.InboundAccount{
-			{User: setting.Socks5Username, Pass: setting.Socks5Password},
+		cfg.Inbounds[0].Settings.Accounts = make([]coreObj.InboundAccount, 0, len(socksAccounts))
+		for _, a := range socksAccounts {
+			cfg.Inbounds[0].Settings.Accounts = append(cfg.Inbounds[0].Settings.Accounts, coreObj.InboundAccount{
+				User: a.Username, Pass: a.Password,
+			})
 		}
 	}
-	if setting.HttpUsername != "" && setting.HttpPassword != "" {
+	httpAccounts := setting.HTTPAuthAccounts()
+	if len(httpAccounts) > 0 {
 		cfg.Inbounds[1].Settings = &coreObj.InboundSettings{
 			Auth: "basic",
-			Accounts: []coreObj.InboundAccount{
-				{User: setting.HttpUsername, Pass: setting.HttpPassword},
-			},
+			Accounts: make([]coreObj.InboundAccount, 0, len(httpAccounts)),
+		}
+		for _, a := range httpAccounts {
+			cfg.Inbounds[1].Settings.Accounts = append(cfg.Inbounds[1].Settings.Accounts, coreObj.InboundAccount{
+				User: a.Username, Pass: a.Password,
+			})
 		}
 	}
 

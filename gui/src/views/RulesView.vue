@@ -80,7 +80,7 @@
             <span class="inbound-proto-badge">socks</span>
             <span class="inbound-addr">127.0.0.1:{{ socksPort }}</span>
             <span class="inbound-tag-badge">tag: socks-in</span>
-            <span v-if="builtinSocks.username" class="inbound-auth-badge">🔒 认证</span>
+            <span v-if="builtinSocks.accounts?.length" class="inbound-auth-badge">🔒 认证</span>
           </div>
           <div class="rule-ops">
             <button class="icon-btn" @click="editBuiltinInbound('socks')" title="编辑">✏</button>
@@ -92,7 +92,7 @@
             <span class="inbound-proto-badge">http</span>
             <span class="inbound-addr">127.0.0.1:{{ httpPort }}</span>
             <span class="inbound-tag-badge">tag: http-in</span>
-            <span v-if="builtinHttp.username" class="inbound-auth-badge">🔒 认证</span>
+            <span v-if="builtinHttp.accounts?.length" class="inbound-auth-badge">🔒 认证</span>
           </div>
           <div class="rule-ops">
             <button class="icon-btn" @click="editBuiltinInbound('http')" title="编辑">✏</button>
@@ -130,14 +130,18 @@
             <label class="form-label">监听端口</label>
             <input class="input" type="number" v-model.number="builtinForm.port" />
           </div>
-          <div class="form-row">
-            <div class="form-group" style="flex:1">
-              <label class="form-label">用户名（可选）</label>
-              <input class="input" v-model="builtinForm.username" placeholder="留空表示不需要认证" />
-            </div>
-            <div class="form-group" style="flex:1">
-              <label class="form-label">密码（可选）</label>
-              <input class="input" type="password" v-model="builtinForm.password" placeholder="留空表示不需要认证" />
+          <div class="form-group">
+            <label class="form-label">
+              认证账号（可选）
+              <span class="form-hint">可配置多组用户名/密码，留空表示不需要认证</span>
+            </label>
+            <div class="auth-accounts-wrap">
+              <div v-for="(acc, idx) in builtinForm.accounts" :key="idx" class="auth-account-row">
+                <input class="input" v-model="acc.username" placeholder="用户名" />
+                <input class="input" type="password" v-model="acc.password" placeholder="密码" />
+                <button class="icon-btn icon-btn-danger" @click="removeBuiltinAccount(idx)" title="删除">✕</button>
+              </div>
+              <button class="btn btn-light btn-sm" @click="addBuiltinAccount">＋ 添加账号</button>
             </div>
           </div>
         </div>
@@ -456,11 +460,11 @@ const httpPort = computed(() => store.setting?.httpPort || 20261)
 const outbounds = computed(() => store.outbounds)
 
 // 内置入站状态
-const builtinSocks = reactive({ port: 20260, username: '', password: '' })
-const builtinHttp = reactive({ port: 20261, username: '', password: '' })
+const builtinSocks = reactive({ port: 20260, username: '', password: '', accounts: [] })
+const builtinHttp = reactive({ port: 20261, username: '', password: '', accounts: [] })
 const showBuiltinModal = ref(false)
 const builtinEditType = ref('socks')
-const builtinForm = reactive({ port: 20260, username: '', password: '' })
+const builtinForm = reactive({ port: 20260, accounts: [] })
 
 const dataFiles = ref([
   { type: 'geoip', label: 'geoip.dat', desc: 'IP 地理位置数据（geoip:cn 等）', exists: false },
@@ -511,11 +515,13 @@ onMounted(async () => {
     const s = r.data.setting || {}
     githubMirror.value = s.githubMirror || ''
     builtinSocks.port = s.socks5Port || 20260
-    builtinSocks.username = s.socks5Username || ''
-    builtinSocks.password = s.socks5Password || ''
+    builtinSocks.accounts = normalizeAccounts(s.socks5Accounts, s.socks5Username, s.socks5Password)
+    builtinSocks.username = builtinSocks.accounts[0]?.username || ''
+    builtinSocks.password = builtinSocks.accounts[0]?.password || ''
     builtinHttp.port = s.httpPort || 20261
-    builtinHttp.username = s.httpUsername || ''
-    builtinHttp.password = s.httpPassword || ''
+    builtinHttp.accounts = normalizeAccounts(s.httpAccounts, s.httpUsername, s.httpPassword)
+    builtinHttp.username = builtinHttp.accounts[0]?.username || ''
+    builtinHttp.password = builtinHttp.accounts[0]?.password || ''
   }).catch(() => {})
 })
 
@@ -664,10 +670,11 @@ async function exportRules() {
 function editBuiltinInbound(type) {
   builtinEditType.value = type
   if (type === 'socks') {
-    Object.assign(builtinForm, { port: builtinSocks.port, username: builtinSocks.username, password: builtinSocks.password })
+    Object.assign(builtinForm, { port: builtinSocks.port, accounts: cloneAccounts(builtinSocks.accounts) })
   } else {
-    Object.assign(builtinForm, { port: builtinHttp.port, username: builtinHttp.username, password: builtinHttp.password })
+    Object.assign(builtinForm, { port: builtinHttp.port, accounts: cloneAccounts(builtinHttp.accounts) })
   }
+  if (!builtinForm.accounts.length) addBuiltinAccount()
   showBuiltinModal.value = true
 }
 
@@ -675,16 +682,22 @@ async function saveBuiltinInbound() {
   try {
     const { data } = await api.getSetting()
     const s = { ...data.setting }
+    const accounts = (builtinForm.accounts || [])
+      .map(a => ({ username: String(a?.username || '').trim(), password: String(a?.password || '') }))
+      .filter(a => a.username || a.password)
+    const first = accounts[0] || { username: '', password: '' }
     if (builtinEditType.value === 'socks') {
       s.socks5Port = builtinForm.port
-      s.socks5Username = builtinForm.username
-      s.socks5Password = builtinForm.password
-      Object.assign(builtinSocks, { port: builtinForm.port, username: builtinForm.username, password: builtinForm.password })
+      s.socks5Accounts = accounts
+      s.socks5Username = first.username
+      s.socks5Password = first.password
+      Object.assign(builtinSocks, { port: builtinForm.port, username: first.username, password: first.password, accounts: cloneAccounts(accounts) })
     } else {
       s.httpPort = builtinForm.port
-      s.httpUsername = builtinForm.username
-      s.httpPassword = builtinForm.password
-      Object.assign(builtinHttp, { port: builtinForm.port, username: builtinForm.username, password: builtinForm.password })
+      s.httpAccounts = accounts
+      s.httpUsername = first.username
+      s.httpPassword = first.password
+      Object.assign(builtinHttp, { port: builtinForm.port, username: first.username, password: first.password, accounts: cloneAccounts(accounts) })
     }
     await api.setSetting(s)
     await store.fetchAll()
@@ -771,6 +784,28 @@ function addInboundAccount() {
 
 function removeInboundAccount(idx) {
   inboundForm.value.accounts.splice(idx, 1)
+}
+
+function normalizeAccounts(accounts, fallbackUser, fallbackPass) {
+  const arr = (Array.isArray(accounts) ? accounts : [])
+    .map(a => ({ username: String(a?.username || ''), password: String(a?.password || '') }))
+    .filter(a => a.username || a.password)
+  if (arr.length) return arr
+  if (fallbackUser || fallbackPass) return [{ username: String(fallbackUser || ''), password: String(fallbackPass || '') }]
+  return []
+}
+
+function cloneAccounts(accounts) {
+  return (accounts || []).map(a => ({ username: a.username, password: a.password }))
+}
+
+function addBuiltinAccount() {
+  if (!Array.isArray(builtinForm.accounts)) builtinForm.accounts = []
+  builtinForm.accounts.push({ username: '', password: '' })
+}
+
+function removeBuiltinAccount(idx) {
+  builtinForm.accounts.splice(idx, 1)
 }
 
 async function downloadData(type) {

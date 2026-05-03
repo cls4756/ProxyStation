@@ -199,8 +199,8 @@ func BuildSingboxConfig(setting *configure.Setting) (*SingboxConfig, error) {
 			Final:   "remote",
 		},
 		Inbounds: []SingboxInbound{
-			buildSingboxInbound("socks", "socks-in", listenAddr, setting.Socks5Port, []configure.InboundAccount{{Username: setting.Socks5Username, Password: setting.Socks5Password}}),
-			buildSingboxInbound("http", "http-in", listenAddr, setting.HttpPort, []configure.InboundAccount{{Username: setting.HttpUsername, Password: setting.HttpPassword}}),
+			buildSingboxInbound("socks", "socks-in", listenAddr, setting.Socks5Port, setting.Socks5AuthAccounts()),
+			buildSingboxInbound("http", "http-in", listenAddr, setting.HttpPort, setting.HTTPAuthAccounts()),
 		},
 		Outbounds: []SingboxOutbound{
 			{Type: "direct", Tag: "direct"},
