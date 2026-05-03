@@ -105,7 +105,7 @@
             <span class="inbound-proto-badge">{{ ib.protocol }}</span>
             <span class="inbound-addr">{{ ib.listen || '127.0.0.1' }}:{{ ib.port }}</span>
             <span class="inbound-tag-badge">tag: {{ ib.tag }}</span>
-            <span v-if="ib.username" class="inbound-auth-badge">🔒 认证</span>
+            <span v-if="hasInboundAuth(ib)" class="inbound-auth-badge">🔒 认证</span>
           </div>
           <div class="rule-ops">
             <button class="icon-btn" @click="editInbound(i)" title="编辑">✏</button>
@@ -293,14 +293,18 @@
           </div>
           <!-- 认证字段（socks 和 http 支持） -->
           <template v-if="inboundForm.protocol === 'socks' || inboundForm.protocol === 'http'">
-            <div class="form-row">
-              <div class="form-group" style="flex:1">
-                <label class="form-label">用户名（可选）</label>
-                <input class="input" v-model="inboundForm.username" placeholder="留空表示不需要认证" />
-              </div>
-              <div class="form-group" style="flex:1">
-                <label class="form-label">密码（可选）</label>
-                <input class="input" type="password" v-model="inboundForm.password" placeholder="留空表示不需要认证" />
+            <div class="form-group">
+              <label class="form-label">
+                认证账号（可选）
+                <span class="form-hint">可配置多组用户名/密码，留空表示不需要认证</span>
+              </label>
+              <div class="auth-accounts-wrap">
+                <div v-for="(acc, idx) in inboundForm.accounts" :key="idx" class="auth-account-row">
+                  <input class="input" v-model="acc.username" placeholder="用户名" />
+                  <input class="input" type="password" v-model="acc.password" placeholder="密码" />
+                  <button class="icon-btn icon-btn-danger" @click="removeInboundAccount(idx)" title="删除">✕</button>
+                </div>
+                <button class="btn btn-light btn-sm" @click="addInboundAccount">＋ 添加账号</button>
               </div>
             </div>
           </template>
@@ -493,7 +497,7 @@ function appendToTextarea(field, value) {
 const defaultInboundForm = () => ({
   id: '', name: '', tag: '', protocol: 'socks', listen: '127.0.0.1', port: 1080,
   udpEnabled: true, network: 'tcp,udp', followRedirect: false, sniffEnabled: true, sniffDest: [],
-  username: '', password: '',
+  username: '', password: '', accounts: [],
 })
 
 const ruleForm = ref(defaultRuleForm())
@@ -522,7 +526,7 @@ async function loadRules() {
 
 async function loadInbounds() {
   const { data } = await api.getCustomInbounds()
-  inbounds.value = data.inbounds || []
+  inbounds.value = (data.inbounds || []).map(normalizeInbound)
 }
 
 async function checkDataFiles() {
@@ -693,17 +697,32 @@ async function saveBuiltinInbound() {
 function openAddInbound() {
   editingInboundIdx.value = -1
   inboundForm.value = defaultInboundForm()
+  addInboundAccount()
   showInboundModal.value = true
 }
 
 function editInbound(i) {
   editingInboundIdx.value = i
-  inboundForm.value = { ...inbounds.value[i] }
+  inboundForm.value = normalizeInbound({ ...inbounds.value[i] })
+  if (!inboundForm.value.accounts.length) addInboundAccount()
   showInboundModal.value = true
 }
 
 async function saveInbound() {
-  const ib = { ...inboundForm.value }
+  const accounts = (inboundForm.value.accounts || [])
+    .map(a => ({
+      username: String(a?.username || '').trim(),
+      password: String(a?.password || ''),
+    }))
+    .filter(a => a.username || a.password)
+  const ib = { ...inboundForm.value, accounts }
+  if (accounts.length > 0) {
+    ib.username = accounts[0].username
+    ib.password = accounts[0].password
+  } else {
+    ib.username = ''
+    ib.password = ''
+  }
   if (editingInboundIdx.value >= 0) {
     inbounds.value[editingInboundIdx.value] = ib
   } else {
@@ -717,6 +736,41 @@ async function saveInbound() {
 async function deleteInbound(i) {
   inbounds.value.splice(i, 1)
   await api.setCustomInbounds(inbounds.value)
+}
+
+function normalizeInbound(ib) {
+  const accounts = Array.isArray(ib.accounts) ? ib.accounts : []
+  const normalized = accounts
+    .map(a => ({
+      username: String(a?.username || ''),
+      password: String(a?.password || ''),
+    }))
+    .filter(a => a.username || a.password)
+  if (!normalized.length && (ib.username || ib.password)) {
+    normalized.push({
+      username: String(ib.username || ''),
+      password: String(ib.password || ''),
+    })
+  }
+  return {
+    ...defaultInboundForm(),
+    ...ib,
+    accounts: normalized,
+  }
+}
+
+function hasInboundAuth(ib) {
+  const n = normalizeInbound(ib)
+  return n.accounts.length > 0
+}
+
+function addInboundAccount() {
+  if (!Array.isArray(inboundForm.value.accounts)) inboundForm.value.accounts = []
+  inboundForm.value.accounts.push({ username: '', password: '' })
+}
+
+function removeInboundAccount(idx) {
+  inboundForm.value.accounts.splice(idx, 1)
 }
 
 async function downloadData(type) {
@@ -897,6 +951,17 @@ async function downloadData(type) {
   background: #f5f5f5; color: #595959; border: 1px solid #e8e8e8;
 }
 .quick-tag:hover { background: #e6f4ff; color: #1677ff; border-color: #91caff; }
+.auth-accounts-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.auth-account-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr auto;
+  gap: 8px;
+  align-items: center;
+}
 
 .data-file-row {
   display: flex; align-items: center; justify-content: space-between;
