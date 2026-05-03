@@ -145,6 +145,8 @@ func BuildXrayConfig(setting *configure.Setting) (*coreObj.Config, error) {
 		cfg.Routing.Rules = append(cfg.Routing.Rules, rule)
 	}
 
+	cfg.Routing.Rules = optimizeXrayRules(cfg.Routing.Rules)
+
 	return cfg, nil
 }
 

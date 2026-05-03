@@ -200,10 +200,12 @@
 <script setup>
 import { ref, reactive, onMounted, computed } from 'vue'
 import { api } from '../api'
+import { useProxyStore } from '../stores/proxy'
 
 const saving = ref(false)
 const saveMsg = ref(null)
 const showKernelModal = ref(false)
+const proxyStore = useProxyStore()
 
 const form = reactive({
   logLevel: 'info',
@@ -328,7 +330,7 @@ async function saveSettings() {
   saving.value = true
   saveMsg.value = null
   try {
-    await api.setSetting({
+    const { data } = await api.setSetting({
       ...fullSetting,
       logLevel: form.logLevel,
       kernelMode: form.kernelMode,
@@ -343,6 +345,8 @@ async function saveSettings() {
       maxLogFileSize: Math.round(form.maxLogFileSizeMB * 1024 * 1024),
       githubMirror: form.githubMirror,
     })
+    // 设置接口在“保存成功但重启失败”时返回 200 + warning，需提示并刷新运行状态
+    await proxyStore.fetchStatus()
     fullSetting = {
       ...fullSetting,
       logLevel: form.logLevel,
@@ -358,7 +362,11 @@ async function saveSettings() {
       maxLogFileSize: Math.round(form.maxLogFileSizeMB * 1024 * 1024),
       githubMirror: form.githubMirror,
     }
-    saveMsg.value = { error: false, text: '保存成功' }
+    if (data?.warning) {
+      saveMsg.value = { error: true, text: data.warning }
+    } else {
+      saveMsg.value = { error: false, text: '保存成功' }
+    }
     setTimeout(() => { saveMsg.value = null }, 3000)
   } catch (e) {
     saveMsg.value = { error: true, text: e?.response?.data?.error || '保存失败' }
