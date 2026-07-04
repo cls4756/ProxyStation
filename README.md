@@ -18,7 +18,8 @@ local proxy inbounds, and runtime kernel downloads for Xray, sing-box, and V2Ray
 - `gui/`: Vue 3 frontend built with Vite
 - `service/`: Go backend, engine management, config storage, and HTTP API
 - `Dockerfile`: multi-stage build for frontend and backend
-- `docker-compose.yml`: example deployment definition
+- `docker-compose.yml`: deployment definition using local `.env` variables
+- `.env.example`: sample environment configuration for Docker Compose
 
 ## Local Development
 
@@ -49,23 +50,35 @@ go run . --addr=127.0.0.1:2026 --data=./data --gui=../gui/dist
 
 ## Docker
 
+Create a local `.env` file from the example before starting Docker Compose:
+
+```powershell
+cp .env.example .env
+```
+
+Edit `.env` and set your local values, especially `PROXYSTATION_WEB_USERNAME`,
+`PROXYSTATION_WEB_PASSWORD`, and `PROXYSTATION_DATA_DIR`. The real `.env` file is
+ignored by Git and must not be committed.
+
 Build and run with Docker Compose:
 
 ```powershell
 docker compose up -d --build
 ```
 
-Default exposed ports:
+Default exposed ports are configured in `.env.example`:
 
-- `2026`: Web UI
-- `20260`: local SOCKS5 proxy
-- `20261`: local HTTP proxy
+- `PROXYSTATION_WEB_PORT=2026`: Web UI
+- `PROXYSTATION_SOCKS_PORT=20260`: local SOCKS5 proxy
+- `PROXYSTATION_HTTP_PORT=20261`: local HTTP proxy
+- `PROXYSTATION_SOCKS_UDP_PORT=20262`: local SOCKS5 UDP proxy
 
-Persistent runtime data is mounted to `./data` in the compose example.
+Persistent runtime data is mounted from `PROXYSTATION_DATA_DIR` to `/app/data` in
+the container.
 
 ## Authentication
 
-The container supports these environment variables:
+Docker Compose reads authentication settings from your local `.env` file:
 
 - `PROXYSTATION_WEB_USERNAME`
 - `PROXYSTATION_WEB_PASSWORD`
@@ -74,7 +87,7 @@ These values are applied at startup and stored in hashed form where applicable.
 
 ## Privacy Notes
 
-- Do not commit `service/data/`, databases, logs, downloaded kernels, or local build artifacts.
+- Do not commit `.env`, `service/data/`, databases, logs, downloaded kernels, or local build artifacts.
 - This repository already ignores common runtime and secret-bearing local files via `.gitignore`.
 
 ## License

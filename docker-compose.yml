@@ -1,0 +1,23 @@
+services:
+  proxystation:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: proxystation:latest
+    container_name: proxystation
+    restart: unless-stopped
+    ports:
+      - "${PROXYSTATION_WEB_PORT}:2026"         # Web UI
+      - "${PROXYSTATION_SOCKS_PORT}:20260"      # SOCKS5 proxy
+      - "${PROXYSTATION_HTTP_PORT}:20261"       # HTTP proxy
+      - "${PROXYSTATION_SOCKS_UDP_PORT}:20262"  # SOCKS5 UDP proxy
+    volumes:
+      - ${PROXYSTATION_DATA_DIR}:/app/data  # Persistent data (db, kernels, rule-sets, logs)
+    environment:
+      - TZ=${TZ}
+      - PROXYSTATION_WEB_USERNAME=${PROXYSTATION_WEB_USERNAME}
+      - PROXYSTATION_WEB_PASSWORD=${PROXYSTATION_WEB_PASSWORD}
+    # 如果需要透明代理，取消注释以下配置
+    # cap_add:
+    #   - NET_ADMIN
+    # network_mode: host
