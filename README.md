@@ -66,12 +66,17 @@ Build and run with Docker Compose:
 docker compose up -d --build
 ```
 
-Default exposed ports are configured in `.env.example`:
+The default Compose deployment uses host networking (`network_mode: host`), so
+ProxyStation listens directly on the host ports configured by the application:
 
-- `PROXYSTATION_WEB_PORT=2026`: Web UI
-- `PROXYSTATION_SOCKS_PORT=20260`: local SOCKS5 proxy
-- `PROXYSTATION_HTTP_PORT=20261`: local HTTP proxy
-- `PROXYSTATION_SOCKS_UDP_PORT=20262`: local SOCKS5 UDP proxy
+- `2026`: Web UI
+- `20260`: local SOCKS5 proxy
+- `20261`: local HTTP proxy
+- `20262`: local SOCKS5 UDP proxy
+
+If you prefer Docker bridge networking, comment out `network_mode: host` in
+`docker-compose.yml` and uncomment the `ports` section. The optional published
+host ports for bridge mode are documented in `.env.example`.
 
 Persistent runtime data is mounted from `PROXYSTATION_DATA_DIR` to `/app/data` in
 the container.
