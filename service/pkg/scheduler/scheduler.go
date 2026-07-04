@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/ProxyStation/proxystation/db/configure"
+	"github.com/ProxyStation/proxystation/pkg/observatory"
 	"github.com/ProxyStation/proxystation/pkg/subscription"
 	"github.com/ProxyStation/proxystation/pkg/util/log"
 )
@@ -102,6 +103,7 @@ func updateSub(index int, sub *configure.SubscriptionRaw) {
 	if sub.Format == configure.FormatAuto {
 		sub.Format = format
 	}
+	configure.PreserveServerProbeResults(sub.Servers, servers)
 	for i := range servers {
 		servers[i].Source = sub.ID
 	}
@@ -120,5 +122,6 @@ func updateSub(index int, sub *configure.SubscriptionRaw) {
 			group.Servers = refs
 			_ = configure.SetGroup(groupIndex, group)
 		}
+		observatory.OnGroupUpdated(sub.GroupID)
 	}
 }

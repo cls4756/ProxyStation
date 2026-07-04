@@ -1,7 +1,7 @@
 <!-- 节点右键/操作菜单：编辑、分享（二维码）、复制到分组 -->
 <template>
   <!-- 编辑弹窗 -->
-  <div class="modal-overlay" v-if="mode === 'edit'" @click.self="close">
+  <div class="modal-overlay" v-if="mode === 'edit'" @mousedown.self="close">
     <div class="modal-box" style="width:480px">
       <div class="modal-header">
         <span class="modal-title">编辑节点</span>
@@ -26,7 +26,7 @@
   </div>
 
   <!-- 分享二维码弹窗 -->
-  <div class="modal-overlay" v-if="mode === 'share'" @click.self="close">
+  <div class="modal-overlay" v-if="mode === 'share'" @mousedown.self="close">
     <div class="modal-box" style="width:360px; text-align:center">
       <div class="modal-header">
         <span class="modal-title">分享节点</span>
@@ -48,7 +48,7 @@
   </div>
 
   <!-- 复制到分组弹窗 -->
-  <div class="modal-overlay" v-if="mode === 'copy'" @click.self="close">
+  <div class="modal-overlay" v-if="mode === 'copy'" @mousedown.self="close">
     <div class="modal-box" style="width:360px">
       <div class="modal-header">
         <span class="modal-title">复制到分组</span>
@@ -145,3 +145,4 @@ async function doCopy() {
   close()
 }
 </script>
+

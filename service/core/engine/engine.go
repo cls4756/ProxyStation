@@ -10,14 +10,18 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/ProxyStation/proxystation/core/cfdo"
+	"github.com/ProxyStation/proxystation/core/cfgoodnet"
 	"github.com/ProxyStation/proxystation/db/configure"
 )
 
@@ -45,6 +49,7 @@ var ProtocolKernelMap = map[string]KernelType{
 	"socks":       KernelXray,
 	"http":        KernelXray,
 	"https":       KernelXray,
+	"cfgoodnet":   KernelXray,
 	"hysteria2":   KernelSingbox,
 	"hy2":         KernelSingbox,
 	"hysteria":    KernelSingbox,
@@ -68,7 +73,11 @@ type EngineManager struct {
 }
 
 func Init(dataDir string) {
-	Manager.dataDir = dataDir
+	Manager.dataDir = normalizeBinPath(dataDir)
+}
+
+func DataDir() string {
+	return Manager.dataDir
 }
 
 // Start 根据当前出站节点协议选择内核并启动
@@ -96,6 +105,16 @@ func (em *EngineManager) Start() error {
 	}
 
 	setting := configure.GetSettingNotNil()
+	if err := em.ensureCfGoodNetSidecars(); err != nil {
+		em.running = false
+		_ = configure.SetRunning(false)
+		return fmt.Errorf("prepare cfgoodnet sidecars: %w", err)
+	}
+	if err := em.ensureCfDOSidecars(); err != nil {
+		em.running = false
+		_ = configure.SetRunning(false)
+		return fmt.Errorf("prepare cfdo sidecars: %w", err)
+	}
 
 	// 确定需要哪个内核
 	kernel := em.selectKernel(setting)
@@ -347,8 +366,7 @@ func (em *EngineManager) hasAnyOutbound() bool {
 		if o == nil {
 			continue
 		}
-		ref := resolveActiveNode(o)
-		if ref != nil {
+		if s := resolveOutboundServerRaw(name, o); s != nil {
 			return true
 		}
 	}
@@ -374,11 +392,7 @@ func (em *EngineManager) selectKernel(setting *configure.Setting) KernelType {
 		if o == nil {
 			continue
 		}
-		ref := resolveActiveNode(o)
-		if ref == nil {
-			continue
-		}
-		s := getServerRaw(ref)
+		s := resolveOutboundServerRaw(name, o)
 		if s == nil {
 			continue
 		}
@@ -434,6 +448,253 @@ func getServerRaw(ref *configure.NodeRef) *configure.ServerRaw {
 	return nil
 }
 
+func (em *EngineManager) ensureCfGoodNetSidecars() error {
+	cfgoodnet.StopAll()
+	for _, ib := range configure.GetCustomInbounds() {
+		if strings.ToLower(strings.TrimSpace(ib.Protocol)) != "cfgoodnet" || ib.CfGoodNet == nil {
+			continue
+		}
+		cfg := &cfgoodnet.Config{
+			ListenHost: ib.CfGoodNet.ListenHost,
+			ListenPort: ib.CfGoodNet.ListenPort,
+			CfProxy:    ib.CfGoodNet.CfProxy,
+			CfGoodIP:   ib.CfGoodNet.CfGoodIP,
+			EnableXFF:  ib.CfGoodNet.EnableXFF,
+			DataDir:    Manager.dataDir,
+		}
+		for _, r := range ib.CfGoodNet.Rules {
+			cfg.Rules = append(cfg.Rules, cfgoodnet.Rule{Pattern: r.Pattern, Action: r.Action})
+		}
+		key := "inbound:" + ib.ID
+		addr, err := cfgoodnet.EnsureRunning(key, cfg, LogCallback)
+		if err != nil {
+			return fmt.Errorf("start cfgoodnet for inbound %s failed: %w", ib.Name, err)
+		}
+		if p := portFromAddr(addr); p > 0 {
+			updateInboundRuntimePort(ib.ID, "cfgoodnet", p)
+		}
+	}
+	for _, name := range configure.GetOutboundNames() {
+		o := configure.GetOutbound(name)
+		if o == nil {
+			continue
+		}
+	}
+	return nil
+}
+
+func resolveOutboundServerRaw(name string, o *configure.Outbound) *configure.ServerRaw {
+	if o == nil {
+		return nil
+	}
+	ref := resolveActiveNode(o)
+	if ref == nil {
+		return nil
+	}
+	return getServerRaw(ref)
+}
+
+func (em *EngineManager) ensureCfDOSidecars() error {
+	cfdo.StopAll()
+	// 自定义入站中的 cfdo，可被出站复用
+	for _, ib := range configure.GetCustomInbounds() {
+		if strings.ToLower(strings.TrimSpace(ib.Protocol)) != "cfdo" || ib.CfDO == nil {
+			continue
+		}
+		cfg := &cfdo.Config{
+			ListenHost:           "127.0.0.1",
+			ListenPort:           ib.CfDO.Port,
+			Listeners:            toCFDOListenerConfigs(ib.CfDO.Listeners),
+			WorkerDomain:         ib.CfDO.WorkerDomain,
+			Secret:               ib.CfDO.Secret,
+			Path:                 ib.CfDO.Path,
+			WorkerIP:             ib.CfDO.WorkerIP,
+			UseBareWS:            ib.CfDO.UseBareWS,
+			AlwaysUseDO:          ib.CfDO.AlwaysUseDO,
+			DOPoolSize:           ib.CfDO.DOPoolSize,
+			RejectDomains:        ib.CfDO.RejectDomains,
+			DOFallbackDomains:    ib.CfDO.DOFallbackDomains,
+			DOFallbackExtensions: ib.CfDO.DOFallbackExtensions,
+		}
+		key := "inbound:" + ib.ID
+		addr, err := cfdo.EnsureRunning(key, cfg, LogCallback)
+		if err != nil {
+			return fmt.Errorf("start cfdo for inbound %s failed: %w", ib.Name, err)
+		}
+		if p := portFromAddr(addr); p > 0 {
+			updateInboundRuntimePort(ib.ID, "cfdo", p)
+		}
+		if LogCallback != nil {
+			LogCallback(fmt.Sprintf("✅ cfdo inbound %s reachable: %s", ib.Name, addr))
+		}
+	}
+	for _, name := range configure.GetOutboundNames() {
+		o := configure.GetOutbound(name)
+		if o == nil {
+			continue
+		}
+	}
+	return nil
+}
+
+func toCFDOListenerConfigs(listeners []configure.CfDOListener) []cfdo.ListenerConfig {
+	if len(listeners) == 0 {
+		return nil
+	}
+	out := make([]cfdo.ListenerConfig, 0, len(listeners))
+	for _, l := range listeners {
+		out = append(out, cfdo.ListenerConfig{
+			ListenPort: l.ListenPort,
+			WorkerIP:   l.WorkerIP,
+		})
+	}
+	return out
+}
+
+func portFromAddr(addr string) int {
+	_, p, err := net.SplitHostPort(addr)
+	if err != nil {
+		return 0
+	}
+	n, _ := strconv.Atoi(p)
+	return n
+}
+
+func updateInboundRuntimePort(id, protocol string, port int) {
+	if id == "" || port <= 0 {
+		return
+	}
+	inbounds := configure.GetCustomInbounds()
+	changed := false
+	for i := range inbounds {
+		if inbounds[i].ID != id || strings.ToLower(strings.TrimSpace(inbounds[i].Protocol)) != protocol {
+			continue
+		}
+		switch protocol {
+		case "cfdo":
+			if inbounds[i].CfDO != nil && inbounds[i].CfDO.Port != port {
+				inbounds[i].CfDO.Port = port
+				inbounds[i].Port = port
+				changed = true
+			}
+		case "cfgoodnet":
+			if inbounds[i].CfGoodNet != nil && inbounds[i].CfGoodNet.ListenPort != port {
+				inbounds[i].CfGoodNet.ListenPort = port
+				inbounds[i].Port = port
+				changed = true
+			}
+		}
+	}
+	if changed {
+		_ = configure.SetCustomInbounds(inbounds)
+		syncInboundProxyServersFromConfig(inbounds)
+	}
+}
+
+func syncInboundProxyServersFromConfig(inbounds []configure.CustomInbound) {
+	servers := configure.GetServers()
+	indexBySource := map[string]int{}
+	for i, s := range servers {
+		if strings.HasPrefix(s.Source, "inbound:") {
+			indexBySource[s.Source] = i
+		}
+	}
+	for _, ib := range inbounds {
+		p := strings.ToLower(strings.TrimSpace(ib.Protocol))
+		if p != "cfdo" && p != "cfgoodnet" {
+			continue
+		}
+		name := ib.Name
+		if strings.TrimSpace(name) == "" {
+			name = ib.ID
+		}
+		if p == "cfdo" {
+			ports := cfdoListenPortsForInbound(ib)
+			for _, port := range ports {
+				if port <= 0 {
+					continue
+				}
+				source := fmt.Sprintf("inbound:%s:cfdo:%d", ib.ID, port)
+				serverName := name
+				if len(ports) > 1 {
+					serverName = fmt.Sprintf("%s [%d]", name, port)
+				}
+				srv := &configure.ServerRaw{
+					Link:    fmt.Sprintf("socks5://127.0.0.1:%d#%s", port, url.QueryEscape(serverName)),
+					Name:    serverName,
+					Host:    "127.0.0.1",
+					Port:    port,
+					Type:    "socks5",
+					Latency: -1,
+					Source:  source,
+				}
+				if idx, ok := indexBySource[source]; ok {
+					_ = configure.SetServer(idx, srv)
+				} else if err := configure.AppendServers([]*configure.ServerRaw{srv}); err == nil {
+					indexBySource[source] = configure.GetLenServers() - 1
+				}
+			}
+			continue
+		}
+		port := ib.Port
+		if ib.CfGoodNet != nil && ib.CfGoodNet.ListenPort > 0 {
+			port = ib.CfGoodNet.ListenPort
+		}
+		if port <= 0 {
+			continue
+		}
+		srv := &configure.ServerRaw{
+			Link:    fmt.Sprintf("http://127.0.0.1:%d#%s", port, url.QueryEscape(name)),
+			Name:    name,
+			Host:    "127.0.0.1",
+			Port:    port,
+			Type:    "http",
+			Latency: -1,
+			Source:  "inbound:" + ib.ID,
+		}
+		src := srv.Source
+		if idx, ok := indexBySource[src]; ok {
+			_ = configure.SetServer(idx, srv)
+		} else {
+			if err := configure.AppendServers([]*configure.ServerRaw{srv}); err == nil {
+				indexBySource[src] = configure.GetLenServers() - 1
+			}
+		}
+	}
+}
+
+func cfdoListenPortsForInbound(ib configure.CustomInbound) []int {
+	if ib.CfDO == nil {
+		if ib.Port > 0 {
+			return []int{ib.Port}
+		}
+		return nil
+	}
+	seen := map[int]struct{}{}
+	var out []int
+	for _, l := range ib.CfDO.Listeners {
+		if l.ListenPort <= 0 {
+			continue
+		}
+		if _, ok := seen[l.ListenPort]; ok {
+			continue
+		}
+		seen[l.ListenPort] = struct{}{}
+		out = append(out, l.ListenPort)
+	}
+	if len(out) > 0 {
+		return out
+	}
+	port := ib.CfDO.Port
+	if port <= 0 {
+		port = ib.Port
+	}
+	if port > 0 {
+		return []int{port}
+	}
+	return nil
+}
+
 func findBin(names, paths []string) (string, error) {
 	names = filterBinNamesForCurrentOS(names)
 	paths = filterBinPathsForCurrentOS(paths)
@@ -441,13 +702,13 @@ func findBin(names, paths []string) (string, error) {
 	// 1. PATH 里找
 	for _, name := range names {
 		if p, err := exec.LookPath(name); err == nil {
-			return p, nil
+			return normalizeBinPath(p), nil
 		}
 	}
 	// 2. 固定路径找
 	for _, p := range paths {
 		if _, err := os.Stat(p); err == nil {
-			return p, nil
+			return normalizeBinPath(p), nil
 		}
 	}
 	// 3. dataDir/bin/ 里找
@@ -455,7 +716,7 @@ func findBin(names, paths []string) (string, error) {
 		for _, name := range names {
 			p := filepath.Join(Manager.dataDir, "bin", name)
 			if _, err := os.Stat(p); err == nil {
-				return p, nil
+				return normalizeBinPath(p), nil
 			}
 		}
 	}
@@ -465,15 +726,25 @@ func findBin(names, paths []string) (string, error) {
 		for _, name := range names {
 			p := filepath.Join(dir, name)
 			if isUsableBinaryPath(p) {
-				return p, nil
+				return normalizeBinPath(p), nil
 			}
 			p = filepath.Join(dir, "bin", name)
 			if isUsableBinaryPath(p) {
-				return p, nil
+				return normalizeBinPath(p), nil
 			}
 		}
 	}
 	return "", fmt.Errorf("binary not found for %s: %v", runtime.GOOS, names)
+}
+
+func normalizeBinPath(path string) string {
+	if path == "" || filepath.IsAbs(path) {
+		return path
+	}
+	if abs, err := filepath.Abs(path); err == nil {
+		return abs
+	}
+	return path
 }
 
 func filterBinNamesForCurrentOS(names []string) []string {
@@ -697,6 +968,9 @@ func ensureKernelDataFiles(binPath string) error {
 	if Manager.dataDir == "" || binPath == "" {
 		return nil
 	}
+	if err := ensureKernelDataFilesAvailable(); err != nil {
+		return err
+	}
 	binDir := filepath.Dir(binPath)
 	for _, name := range []string{"geoip.dat", "geosite.dat"} {
 		src := filepath.Join(Manager.dataDir, name)
@@ -710,6 +984,43 @@ func ensureKernelDataFiles(binPath string) error {
 		}
 		if err := copyFile(src, dst, fi.Mode()); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+func ensureKernelDataFilesAvailable() error {
+	required := []struct {
+		FileName string
+		DataType string
+	}{
+		{FileName: "geoip.dat", DataType: "geoip"},
+		{FileName: "geosite.dat", DataType: "geosite"},
+	}
+	for _, item := range required {
+		item := item
+		path := filepath.Join(Manager.dataDir, item.FileName)
+		if fi, err := os.Stat(path); err == nil && !fi.IsDir() && fi.Size() > 0 {
+			continue
+		}
+		if LogCallback != nil {
+			LogCallback(fmt.Sprintf("📦 缺少 %s，开始自动下载…", item.FileName))
+		}
+		progressCh := make(chan DownloadProgress, 32)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			for p := range progressCh {
+				if LogCallback != nil && p.Message != "" {
+					LogCallback(fmt.Sprintf("[%s] %s", item.DataType, p.Message))
+				}
+			}
+		}()
+		err := DownloadData(item.DataType, progressCh)
+		close(progressCh)
+		<-done
+		if err != nil {
+			return fmt.Errorf("auto download %s failed: %w", item.FileName, err)
 		}
 	}
 	return nil

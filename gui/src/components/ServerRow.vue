@@ -23,8 +23,8 @@
     <!-- 协议 -->
     <span :class="['tag', `tag-${server.type || 'vmess'}`]">{{ server.type || '?' }}</span>
 
-    <!-- 延迟 -->
-    <span :class="['row-lat', latClass(server.latency)]">{{ latText(server.latency) }}</span>
+    <!-- 探测状态/延迟 -->
+    <span :class="['row-lat', pingStateClass, latClass(server.latency)]">{{ pingStateText }}</span>
 
     <!-- 操作按钮 -->
     <div class="row-ops">
@@ -65,6 +65,7 @@ const props = defineProps({
   removable: { type: Boolean, default: false },
   selected:  { type: Boolean, default: false },
   currentOutbound: { type: String, default: 'proxy' },
+  pingState: { type: Object, default: null },
 })
 defineEmits(['connect', 'remove', 'edit', 'share', 'select', 'copy-to-group', 'move-to-group'])
 
@@ -95,6 +96,25 @@ function latClass(lat) {
   if (lat < 500) return 'lat-ok'
   return 'lat-bad'
 }
+
+const pingStateText = computed(() => {
+  if (!props.pingState) return latText(props.server.latency)
+  if (props.pingState.status === 'pending') return '等待中'
+  if (props.pingState.status === 'running') return '测速中'
+  if (typeof props.pingState.latency === 'number') {
+    if (props.pingState.latency < 0) return '-1'
+    return `${props.pingState.latency}ms`
+  }
+  return latText(props.server.latency)
+})
+
+const pingStateClass = computed(() => {
+  if (!props.pingState) return ''
+  if (props.pingState.status === 'pending') return 'lat-pending'
+  if (props.pingState.status === 'running') return 'lat-running'
+  if (typeof props.pingState.latency === 'number' && props.pingState.latency < 0) return 'lat-fail'
+  return ''
+})
 </script>
 
 <style scoped>
@@ -183,6 +203,9 @@ function latClass(lat) {
 .lat-ok   { color: #faad14; }
 .lat-bad  { color: #ff4d4f; }
 .lat-none { color: #bfbfbf; font-weight: 400; }
+.lat-pending { color: #8c8c8c; font-weight: 500; }
+.lat-running { color: #1677ff; font-weight: 600; }
+.lat-fail { color: #ff4d4f; font-weight: 600; }
 
 .row-ops { 
   display: flex; 

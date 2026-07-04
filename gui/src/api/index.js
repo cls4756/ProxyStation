@@ -65,6 +65,8 @@ export const api = {
   deleteOutbound: (name) => http.delete(`/outbounds/${name}`),
   connectOutbound: (name, target) => http.post(`/outbounds/${name}/connect`, target),
   disconnectOutbound: (name) => http.post(`/outbounds/${name}/disconnect`),
+  downloadCfGoodNetCA: () => window.open('/api/cfgoodnet/ca/download', '_blank'),
+  importCfGoodNetCA: () => http.post('/cfgoodnet/ca/import'),
 
   // 设置
   getSetting: () => http.get('/setting'),
@@ -112,8 +114,8 @@ export const api = {
       }
     })
   },
-  pingNodes: (refs) => http.post('/ping', { refs }),
-  pingGroup: (index) => http.post(`/groups/${index}/ping`),
+  pingNodes: (refs, mode = 'fast', config = {}) => http.post('/ping', { refs, mode }, config),
+  pingGroup: (index, mode = 'fast') => http.post(`/groups/${index}/ping`, null, { params: { mode } }),
 
   // 日志
   getLogs: () => http.get('/logs'),
@@ -141,6 +143,8 @@ export const api = {
   // 自定义入站
   getCustomInbounds: () => http.get('/custom-inbounds'),
   setCustomInbounds: (inbounds) => http.put('/custom-inbounds', inbounds),
+  getBuiltinProxyStatuses: () => http.get('/builtin-proxies/status'),
+  restartBuiltinProxy: (id) => http.post(`/builtin-proxies/${id}/restart`),
 
   // rule-set 下载
   downloadRuleSets: (mirror, onProgress) => {

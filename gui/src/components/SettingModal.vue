@@ -52,9 +52,17 @@
                   <option value="on">开启</option>
                 </select>
               </div>
+
               <div class="field-row" v-if="form.subscriptionAutoUpdateMode === 'on'">
                 <label class="field-label">更新间隔（小时）</label>
                 <input type="number" class="input field-input" v-model.number="form.subscriptionAutoUpdateIntervalHour" />
+              </div>
+              <div class="field-row">
+                <label class="field-label">默认测速方式</label>
+                <select class="input field-input" v-model="form.groupProbeMode">
+                  <option value="real">真连测试</option>
+                  <option value="fast">快速测试</option>
+                </select>
               </div>
             </div>
           </div>
@@ -78,15 +86,12 @@
               <div v-for="k in kernelList" :key="k.id" class="kernel-row">
                 <div class="kernel-info">
                   <span class="kernel-name">{{ k.label }}</span>
-                  <span :class="['kbadge', k.installed ? 'kbadge-ok' : 'kbadge-miss']">{{ kernelBadgeText(k) }}</span>
-                  <span v-if="k.installed" class="kernel-version-text">
-                    当前：{{ k.localVersion || '未知' }}<template v-if="k.latestVersion"> · 最新：{{ k.latestVersion }}</template>
-                  </span>
+                  <span :class="['kbadge', k.installed ? 'kbadge-ok' : 'kbadge-miss']">{{ k.installed ? (k.version || '已安装') : '未安装' }}</span>
                 </div>
                 <template v-if="kernelDownloading[k.id]">
                   <div class="dl-wrap"><div class="dl-bar"><div class="dl-fill" :style="{width: kernelDownloading[k.id].percent+'%'}"></div></div><span class="dl-msg">{{ kernelDownloading[k.id].message }}</span></div>
                 </template>
-                <button v-else :class="['btn','btn-sm', kernelActionClass(k)]" :disabled="k.installed && !k.hasUpdate" @click="downloadKernel(k.id)">{{ kernelActionText(k) }}</button>
+                <button v-else :class="['btn','btn-sm', k.installed ? 'btn-light' : 'btn-primary']" @click="downloadKernel(k.id)">{{ k.installed ? '更新' : '下载' }}</button>
               </div>
             </div>
           </div>
@@ -100,6 +105,7 @@
     </div>
   </div>
 </template>
+
 
 <script setup>
 import { ref, reactive, onMounted } from 'vue'
@@ -119,6 +125,7 @@ const form = reactive({
   logLevel: 'info',
   subscriptionAutoUpdateMode: 'off',
   subscriptionAutoUpdateIntervalHour: 12,
+  groupProbeMode: 'real',
   transparentMode: 'close',
   maxLogLines: 500,
   maxLogFileSizeMB: 2,
@@ -126,9 +133,9 @@ const form = reactive({
 })
 
 const kernelList = ref([
-  { id: 'singbox', label: 'sing-box', installed: false, localVersion: '', latestVersion: '', hasUpdate: false, checkError: '' },
-  { id: 'xray',    label: 'Xray',     installed: false, localVersion: '', latestVersion: '', hasUpdate: false, checkError: '' },
-  { id: 'v2ray',   label: 'V2Ray',    installed: false, localVersion: '', latestVersion: '', hasUpdate: false, checkError: '' },
+  { id: 'singbox', label: 'sing-box', installed: false, version: '' },
+  { id: 'xray',    label: 'Xray',     installed: false, version: '' },
+  { id: 'v2ray',   label: 'V2Ray',    installed: false, version: '' },
 ])
 const kernelDownloading = reactive({})
 const mirrorPresets = ['https://ghfast.top', 'https://mirror.ghproxy.com', 'https://gh-proxy.com']
@@ -143,6 +150,7 @@ onMounted(async () => {
       logLevel: s.logLevel || 'info',
       subscriptionAutoUpdateMode: s.subscriptionAutoUpdateMode || 'off',
       subscriptionAutoUpdateIntervalHour: s.subscriptionAutoUpdateIntervalHour || 12,
+      groupProbeMode: s.groupProbeMode || 'real',
       transparentMode: s.transparentMode || 'close',
       maxLogLines: s.maxLogLines || 500,
       maxLogFileSizeMB: (s.maxLogFileSize || 2097152) / (1024 * 1024),
@@ -151,55 +159,25 @@ onMounted(async () => {
   } catch (e) {
     msg.value = { error: true, text: '加载设置失败' }
   }
-  await refreshKernelStatus()
+  try {
+    const { data } = await api.getKernelStatus()
+    const kernels = data.kernels || {}
+    kernelList.value.forEach(k => { k.installed = !!kernels[k.id]; k.version = kernels[k.id] || '' })
+  } catch {}
 })
 
 async function downloadKernel(id) {
-  const item = kernelList.value.find(k => k.id === id)
-  if (item?.installed && !item.hasUpdate) return
-
   kernelDownloading[id] = { percent: 0, message: '准备中...' }
   try {
     await api.downloadKernel(id, (p) => { kernelDownloading[id] = { percent: p.percent, message: p.message } })
-    await refreshKernelStatus()
+    const { data } = await api.getKernelStatus()
+    const kernels = data.kernels || {}
+    kernelList.value.forEach(k => { k.installed = !!kernels[k.id]; k.version = kernels[k.id] || '' })
   } catch (e) {
     msg.value = { error: true, text: id + ' 下载失败: ' + (e?.message || '未知错误') }
   } finally {
     delete kernelDownloading[id]
   }
-}
-
-async function refreshKernelStatus() {
-  try {
-    const { data } = await api.getKernelStatus()
-    const kernels = data.kernels || {}
-    const meta = data.kernelMeta || {}
-    kernelList.value.forEach(k => {
-      const info = meta[k.id] || {}
-      k.installed = !!kernels[k.id]
-      k.localVersion = info.localVersion || ''
-      k.latestVersion = info.latestVersion || ''
-      k.hasUpdate = !!info.hasUpdate
-      k.checkError = info.checkError || ''
-    })
-  } catch {}
-}
-
-function kernelBadgeText(k) {
-  if (!k.installed) return '未安装'
-  if (k.hasUpdate) return '可更新'
-  if (k.localVersion) return `已安装 ${k.localVersion}`
-  return '已安装'
-}
-
-function kernelActionText(k) {
-  if (!k.installed) return '下载'
-  if (k.hasUpdate) return '更新'
-  return '已最新'
-}
-
-function kernelActionClass(k) {
-  return k.installed ? 'btn-light' : 'btn-primary'
 }
 
 async function saveSetting() {
@@ -211,6 +189,7 @@ async function saveSetting() {
       logLevel: form.logLevel,
       subscriptionAutoUpdateMode: form.subscriptionAutoUpdateMode,
       subscriptionAutoUpdateIntervalHour: form.subscriptionAutoUpdateIntervalHour,
+      groupProbeMode: form.groupProbeMode,
       transparentMode: form.transparentMode,
       maxLogLines: form.maxLogLines,
       maxLogFileSize: Math.round(form.maxLogFileSizeMB * 1024 * 1024),
@@ -225,6 +204,7 @@ async function saveSetting() {
   }
 }
 </script>
+
 
 <style scoped>
 .setting-modal-box { width: 720px; max-height: 88vh; display: flex; flex-direction: column; }
@@ -276,7 +256,6 @@ async function saveSetting() {
 .kernel-row:last-child { border-bottom: none; }
 .kernel-info { display: flex; align-items: center; gap: 8px; }
 .kernel-name { font-size: 13px; font-weight: 500; }
-.kernel-version-text { font-size: 12px; color: #8c8c8c; }
 .kbadge { font-size: 11px; padding: 2px 7px; border-radius: 3px; }
 .kbadge-ok { background: #f6ffed; color: #52c41a; border: 1px solid #b7eb8f; }
 .kbadge-miss { background: #fff2f0; color: #ff4d4f; border: 1px solid #ffccc7; }

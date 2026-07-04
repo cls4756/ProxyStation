@@ -64,6 +64,8 @@ func NewRouter(guiDir string) *gin.Engine {
 		api.DELETE("/outbounds/:name", deleteOutbound)
 		api.POST("/outbounds/:name/connect", connectOutbound)
 		api.POST("/outbounds/:name/disconnect", disconnectOutbound)
+		api.GET("/cfgoodnet/ca/download", downloadCfGoodNetCA)
+		api.POST("/cfgoodnet/ca/import", importCfGoodNetCAToSystem)
 
 		// 测速
 		api.POST("/ping", pingNodes)
@@ -100,6 +102,8 @@ func NewRouter(guiDir string) *gin.Engine {
 		// 自定义入站
 		api.GET("/custom-inbounds", getCustomInbounds)
 		api.PUT("/custom-inbounds", setCustomInbounds)
+		api.GET("/builtin-proxies/status", getBuiltinProxyStatuses)
+		api.POST("/builtin-proxies/:id/restart", restartBuiltinProxy)
 	}
 
 	// 前端静态文件服务

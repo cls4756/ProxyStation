@@ -8,6 +8,7 @@ export const useProxyStore = defineStore('proxy', () => {
   const subscriptions = ref([])
   const groups = ref([])
   const outbounds = ref([])
+  const customInbounds = ref([])
 
   // 实时获取所有数据
   async function fetchStatus() {
@@ -35,6 +36,11 @@ export const useProxyStore = defineStore('proxy', () => {
     outbounds.value = data.outbounds || []
   }
 
+  async function fetchCustomInbounds() {
+    const { data } = await api.getCustomInbounds()
+    customInbounds.value = data.inbounds || []
+  }
+
   async function fetchAll() {
     await Promise.all([
       fetchStatus(),
@@ -42,6 +48,7 @@ export const useProxyStore = defineStore('proxy', () => {
       fetchSubscriptions(),
       fetchGroups(),
       fetchOutbounds(),
+      fetchCustomInbounds(),
     ])
   }
 
@@ -67,11 +74,13 @@ export const useProxyStore = defineStore('proxy', () => {
     subscriptions, 
     groups, 
     outbounds, 
+    customInbounds,
     fetchStatus, 
     fetchServers,
     fetchSubscriptions,
     fetchGroups,
     fetchOutbounds,
+    fetchCustomInbounds,
     fetchAll, 
     toggleProxy 
   }

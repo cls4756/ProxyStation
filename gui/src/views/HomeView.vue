@@ -22,15 +22,6 @@
           </span>
         </div>
         <div class="tab-actions">
-          <input
-            class="search-input"
-            v-model="searchQuery"
-            placeholder="搜索节点…"
-            @input="onSearch"
-          />
-          <button class="action-btn" @click="pingCurrentTab" :disabled="pinging">
-            ⚡ {{ pinging ? '测速中…' : '测速' }}
-          </button>
           <button class="action-btn action-btn-primary" @click="openImport">＋ 导入</button>
           <button class="action-btn" @click="showNewGroup = true">📁 新建分组</button>
         </div>
@@ -45,7 +36,10 @@
         <span class="bulk-count">已选 {{ selectedRefs.length }} 个节点</span>
         <button class="action-btn" @click="selectAll" v-if="!allSelected">☑ 全选</button>
         <button class="action-btn" @click="selectedRefs = []" v-if="allSelected">☐ 取消全选</button>
-        <button class="action-btn" @click="pingSelected" :disabled="pinging">⚡ 批量测速</button>
+        <button class="action-btn" @click="pingSelected('fast')" :disabled="pinging">⚡ 批量快速</button>
+        <button class="action-btn" @click="pingSelected('real')" :disabled="pinging">🧪 批量真连</button>
+        <button v-if="pinging" class="action-btn action-btn-danger" @click="abortPing">⏹ 中止检测</button>
+        <span v-if="pinging && pingProgress.total > 0" class="ping-progress">{{ pingProgress.done }}/{{ pingProgress.total }}</span>
         <button class="action-btn" @click="shareSelected">🔗 批量分享</button>
         <button class="action-btn" @click="showBulkCopyModal = true">📋 复制到分组</button>
         <button v-if="canBulkRemove" class="action-btn" @click="showBulkMoveModal = true">✂ 移动到分组</button>
@@ -57,17 +51,29 @@
       <div v-if="isSearching" class="panel" style="margin-bottom:0">
         <div class="info-bar">
           <span style="font-weight:600">搜索结果</span>
-          <span class="info-count">{{ searchResults.length }} 个节点</span>
+          <span class="info-count">{{ sortedSearchResults.length }} 个节点</span>
           <button class="action-btn" style="margin-left:auto" @click="searchQuery=''; isSearching=false">✕ 关闭</button>
         </div>
-        <div v-if="!searchResults.length" class="empty-hint" style="padding:20px 0">
+        <div class="server-list-head" v-if="sortedSearchResults.length">
+          <span class="head-placeholder"></span>
+          <span class="head-placeholder"></span>
+          <span class="head-cell head-name">节点</span>
+          <span class="head-cell head-addr">地址</span>
+          <span class="head-cell head-type">协议</span>
+          <button class="head-lat-btn" @click="toggleLatencySort">
+            延迟{{ latencySortAsc ? ' ↑' : '' }}
+          </button>
+          <span class="head-cell head-ops">操作</span>
+        </div>
+        <div v-if="!sortedSearchResults.length" class="empty-hint" style="padding:20px 0">
           <p class="empty-sub">无匹配节点</p>
         </div>
-        <ServerRow
-          v-for="(r, i) in searchResults" :key="i"
-          :server="r.server" :ref-obj="r.ref" :outbounds="store.outbounds" :removable="false"
-          :current-outbound="currentOutbound"
-          :selected="isSelected(r.ref)"
+          <ServerRow
+            v-for="(r, i) in sortedSearchResults" :key="refKey(r.ref) + ':' + i"
+            :server="r.server" :ref-obj="r.ref" :outbounds="store.outbounds" :removable="false"
+            :current-outbound="currentOutbound"
+            :ping-state="pingStates[refKey(r.ref)] || null"
+            :selected="isSelected(r.ref)"
           @connect="connectNode" 
           @select="toggleSelect"
           @share="(ref, sv) => openNodeMenu('share', ref, sv)"
@@ -76,13 +82,27 @@
 
       <!-- 订阅 tab -->
       <template v-for="(sub, si) in store.subscriptions" :key="'sub-' + sub.id">
-        <div v-if="activeTab === 'sub-' + si" class="panel">
+        <div v-if="activeTab === 'sub-' + si" class="panel panel-fill">
           <div class="info-bar">
             <div class="info-bar-left">
               <span class="info-url" :title="sub.url">{{ sub.url }}</span>
               <span v-if="sub.updatedAt" class="info-time">{{ formatTime(sub.updatedAt) }}</span>
             </div>
             <div class="info-bar-right">
+              <input
+                class="search-input"
+                v-model="searchQuery"
+                placeholder="搜索节点…"
+                @input="onSearch"
+              />
+              <button class="action-btn" @click="pingCurrentTab('fast')" :disabled="pinging">
+                ⚡ {{ pinging ? '探测中…' : '快速检测' }}
+              </button>
+              <button class="action-btn" @click="pingCurrentTab('real')" :disabled="pinging">
+                🧪 {{ pinging ? '探测中…' : '真连接检测' }}
+              </button>
+              <button v-if="pinging" class="action-btn action-btn-danger" @click="abortPing">⏹ 中止检测</button>
+              <span v-if="pinging && pingProgress.total > 0" class="ping-progress">{{ pingProgress.done }}/{{ pingProgress.total }}</span>
               <button class="action-btn" @click="refreshSub(si)" title="重新拉取订阅节点">↻ 更新节点</button>
               <button class="action-btn" @click="openEditSub(si)" title="编辑订阅名称和链接">✏ 编辑</button>
               <button class="action-btn action-btn-danger" @click="deleteSub(si)">删除</button>
@@ -91,50 +111,92 @@
           <div v-if="!sub.servers?.length" class="empty-hint">
             <p class="empty-sub">订阅为空，点击「更新节点」拉取</p>
           </div>
-          <ServerRow
-            v-for="(s, i) in sub.servers" :key="i"
-            :server="s" :ref-obj="{ type: 'sub_server', index: i, sub: si }"
-            :outbounds="store.outbounds" :removable="false"
-            :current-outbound="currentOutbound"
-            :selected="isSelected({ type: 'sub_server', index: i, sub: si })"
-            @connect="connectNode"
-            @select="toggleSelect"
-            @share="(r, sv) => openNodeMenu('share', r, sv)"
-            @copy-to-group="ref => openSingleCopy(ref)"
-          />
+          <div class="server-list-head" v-if="getSortedSubEntries(sub, si).length">
+            <span class="head-placeholder"></span>
+            <span class="head-placeholder"></span>
+            <span class="head-cell head-name">节点</span>
+            <span class="head-cell head-addr">地址</span>
+            <span class="head-cell head-type">协议</span>
+            <button class="head-lat-btn" @click="toggleLatencySort">
+              延迟{{ latencySortAsc ? ' ↑' : '' }}
+            </button>
+            <span class="head-cell head-ops">操作</span>
+          </div>
+          <div class="server-list-body" v-if="getSortedSubEntries(sub, si).length">
+            <ServerRow
+              v-for="(item, i) in getSortedSubEntries(sub, si)" :key="refKey(item.ref) + ':' + i"
+              :server="item.server" :ref-obj="item.ref"
+              :outbounds="store.outbounds" :removable="false"
+              :current-outbound="currentOutbound"
+              :ping-state="pingStates[refKey(item.ref)] || null"
+              :selected="isSelected(item.ref)"
+              @connect="connectNode"
+              @select="toggleSelect"
+              @share="(r, sv) => openNodeMenu('share', r, sv)"
+              @copy-to-group="ref => openSingleCopy(ref)"
+            />
+          </div>
         </div>
       </template>
 
       <!-- 手动分组 tab -->
       <template v-for="(group, gi) in manualGroups" :key="'group-' + group.id">
-        <div v-if="activeTab === 'group-' + gi" class="panel">
+        <div v-if="activeTab === 'group-' + gi" class="panel panel-fill">
           <div class="info-bar">
             <div class="info-bar-left">
               <span class="group-name-display">{{ group.name }}</span>
-              <span class="info-count">{{ getGroupServers(group).length }} 个节点</span>
+              <span class="info-count">{{ getSortedGroupEntries(group).length }} 个节点</span>
             </div>
             <div class="info-bar-right">
+              <input
+                class="search-input"
+                v-model="searchQuery"
+                placeholder="搜索节点…"
+                @input="onSearch"
+              />
+              <button class="action-btn" @click="pingCurrentTab('fast')" :disabled="pinging">
+                ⚡ {{ pinging ? '探测中…' : '快速检测' }}
+              </button>
+              <button class="action-btn" @click="pingCurrentTab('real')" :disabled="pinging">
+                🧪 {{ pinging ? '探测中…' : '真连接检测' }}
+              </button>
+              <button v-if="pinging" class="action-btn action-btn-danger" @click="abortPing">⏹ 中止检测</button>
+              <span v-if="pinging && pingProgress.total > 0" class="ping-progress">{{ pingProgress.done }}/{{ pingProgress.total }}</span>
               <button v-if="group.name !== 'SERVER'" class="action-btn" @click="openEditGroup(gi)">✏ 编辑</button>
               <button class="action-btn" @click="openAddToGroup(gi)">＋ 添加节点</button>
               <button v-if="group.name !== 'SERVER'" class="action-btn action-btn-danger" @click="deleteGroup(gi)">删除分组</button>
             </div>
           </div>
-          <div v-if="!getGroupServers(group).length" class="empty-hint">
+          <div v-if="!getSortedGroupEntries(group).length" class="empty-hint">
             <p class="empty-sub">分组为空，点击「添加节点」</p>
           </div>
-          <ServerRow
-            v-for="(s, i) in getGroupServers(group)" :key="i"
-            :server="s" :ref-obj="group.servers[i]" :outbounds="store.outbounds" :removable="true"
-            :current-outbound="currentOutbound"
-            :selected="isSelected(group.servers[i])"
-            @connect="connectNode"
-            @select="toggleSelect"
-            @remove="ref => removeFromGroup(realGroupIndex(group), ref)"
-            @edit="(r, sv) => openNodeMenu('edit', r, sv)"
-            @share="(r, sv) => openNodeMenu('share', r, sv)"
-            @copy-to-group="ref => openSingleCopy(ref)"
-            @move-to-group="ref => openSingleMove(ref)"
-          />
+          <div class="server-list-head" v-if="getSortedGroupEntries(group).length">
+            <span class="head-placeholder"></span>
+            <span class="head-placeholder"></span>
+            <span class="head-cell head-name">节点</span>
+            <span class="head-cell head-addr">地址</span>
+            <span class="head-cell head-type">协议</span>
+            <button class="head-lat-btn" @click="toggleLatencySort">
+              延迟{{ latencySortAsc ? ' ↑' : '' }}
+            </button>
+            <span class="head-cell head-ops">操作</span>
+          </div>
+          <div class="server-list-body" v-if="getSortedGroupEntries(group).length">
+            <ServerRow
+              v-for="(item, i) in getSortedGroupEntries(group)" :key="refKey(item.ref) + ':' + i"
+              :server="item.server" :ref-obj="item.ref" :outbounds="store.outbounds" :removable="true"
+              :current-outbound="currentOutbound"
+              :ping-state="pingStates[refKey(item.ref)] || null"
+              :selected="isSelected(item.ref)"
+              @connect="connectNode"
+              @select="toggleSelect"
+              @remove="ref => removeFromGroup(realGroupIndex(group), ref)"
+              @edit="(r, sv) => openNodeMenu('edit', r, sv)"
+              @share="(r, sv) => openNodeMenu('share', r, sv)"
+              @copy-to-group="ref => openSingleCopy(ref)"
+              @move-to-group="ref => openSingleMove(ref)"
+            />
+          </div>
         </div>
       </template>
 
@@ -151,7 +213,7 @@
     />
 
     <!-- 新建分组弹窗 -->
-    <div class="modal-overlay" v-if="showNewGroup" @click.self="showNewGroup = false">
+    <div class="modal-overlay" v-if="showNewGroup" @mousedown.self="showNewGroup = false">
       <div class="modal-box" style="width:380px">
         <div class="modal-header">
           <span class="modal-title">新建分组</span>
@@ -171,7 +233,7 @@
     </div>
 
     <!-- 编辑分组弹窗 -->
-    <div class="modal-overlay" v-if="editGroupIdx >= 0" @click.self="editGroupIdx = -1">
+    <div class="modal-overlay" v-if="editGroupIdx >= 0" @mousedown.self="editGroupIdx = -1">
       <div class="modal-box" style="width:380px">
         <div class="modal-header">
           <span class="modal-title">编辑分组</span>
@@ -191,7 +253,7 @@
     </div>
 
     <!-- 添加节点到分组弹窗 -->
-    <div class="modal-overlay" v-if="showAddToGroup >= 0" @click.self="showAddToGroup = -1">
+    <div class="modal-overlay" v-if="showAddToGroup >= 0" @mousedown.self="showAddToGroup = -1">
       <div class="modal-box">
         <div class="modal-header">
           <span class="modal-title">添加节点到「{{ manualGroups[showAddToGroup]?.name }}」</span>
@@ -222,7 +284,7 @@
     </div>
 
     <!-- 编辑订阅弹窗 -->
-    <div class="modal-overlay" v-if="editSubIdx >= 0" @click.self="editSubIdx = -1">
+    <div class="modal-overlay" v-if="editSubIdx >= 0" @mousedown.self="editSubIdx = -1">
       <div class="modal-box" style="width:480px">
         <div class="modal-header">
           <span class="modal-title">编辑订阅</span>
@@ -255,7 +317,7 @@
     </div>
 
     <!-- 批量复制到分组弹窗 -->
-    <div class="modal-overlay" v-if="showBulkCopyModal" @click.self="showBulkCopyModal = false">
+    <div class="modal-overlay" v-if="showBulkCopyModal" @mousedown.self="showBulkCopyModal = false">
       <div class="modal-box" style="width:380px">
         <div class="modal-header">
           <span class="modal-title">复制到分组</span>
@@ -280,7 +342,7 @@
     </div>
 
     <!-- 批量移动到分组弹窗 -->
-    <div class="modal-overlay" v-if="showBulkMoveModal" @click.self="showBulkMoveModal = false">
+    <div class="modal-overlay" v-if="showBulkMoveModal" @mousedown.self="showBulkMoveModal = false">
       <div class="modal-box" style="width:380px">
         <div class="modal-header">
           <span class="modal-title">移动到分组</span>
@@ -305,7 +367,7 @@
     </div>
 
     <!-- 单节点复制到分组弹窗 -->
-    <div class="modal-overlay" v-if="showSingleCopyModal" @click.self="showSingleCopyModal = false">
+    <div class="modal-overlay" v-if="showSingleCopyModal" @mousedown.self="showSingleCopyModal = false">
       <div class="modal-box" style="width:360px">
         <div class="modal-header">
           <span class="modal-title">复制节点到分组</span>
@@ -328,7 +390,7 @@
     </div>
 
     <!-- 单节点移动到分组弹窗 -->
-    <div class="modal-overlay" v-if="showSingleMoveModal" @click.self="showSingleMoveModal = false">
+    <div class="modal-overlay" v-if="showSingleMoveModal" @mousedown.self="showSingleMoveModal = false">
       <div class="modal-box" style="width:360px">
         <div class="modal-header">
           <span class="modal-title">移动节点到分组</span>
@@ -358,6 +420,7 @@ import { useProxyStore } from '../stores/proxy'
 import { api } from '../api'
 import ServerRow from '../components/ServerRow.vue'
 import NodeMenu from '../components/NodeMenu.vue'
+import axios from 'axios'
 
 const store = useProxyStore()
 const openImport = inject('openImport')
@@ -372,9 +435,16 @@ const editGroupName = ref('')
 const showAddToGroup = ref(-1)
 const selectedAddIdx = ref(-1)
 const addSearch = ref('')
+const selectableServers = ref([])
 const searchQuery = ref('')
 const searchResults = ref([])
 const isSearching = ref(false)
+const pingProgress = ref({ total: 0, done: 0, current: '' })
+const pingStates = ref({})
+const FAST_PING_CONCURRENCY = 6
+const latencySortAsc = ref(false)
+const pingAbortController = ref(null)
+const pingAborted = ref(false)
 
 // 订阅编辑状态
 const editSubIdx = ref(-1)
@@ -442,12 +512,31 @@ watch(
 	() => {
 		const outboundName = currentOutbound?.value || 'proxy'
 		const outbound = store.outbounds.find(o => o.name === outboundName)
-		const groupID = outbound?.target?.targetType === 'group' ? outbound.target.groupId : ''
-		if (!groupID) return
-		const gi = manualGroups.value.findIndex(g => g.id === groupID)
-		if (gi >= 0) {
-			activeTab.value = 'group-' + gi
-		}
+    const target = outbound?.target
+    if (!target?.targetType) return
+
+    if (target.targetType === 'group' && target.groupId) {
+      const gi = manualGroups.value.findIndex(g => g.id === target.groupId)
+      if (gi >= 0) activeTab.value = 'group-' + gi
+      return
+    }
+
+    if (target.targetType === 'node' && target.nodeRef) {
+      const ref = target.nodeRef
+      if (ref.type === 'sub_server') {
+        const si = Number(ref.sub || 0)
+        if (si >= 0 && si < store.subscriptions.length) {
+          activeTab.value = 'sub-' + si
+        }
+        return
+      }
+      if (ref.type === 'server') {
+        const gi = manualGroups.value.findIndex(g =>
+          (g.servers || []).some(r => r.type === 'server' && r.index === ref.index)
+        )
+        if (gi >= 0) activeTab.value = 'group-' + gi
+      }
+    }
 	},
 	{ immediate: true }
 )
@@ -457,13 +546,101 @@ const canBulkRemove = computed(() => {
   return activeTab.value.startsWith('group-')
 })
 
-async function pingSelected() {
+async function pingRefsFastConcurrent(refs) {
+  const queue = refs.map(ref => ({ type: ref.type, index: ref.index, sub: ref.sub || 0 }))
+  const stateMap = {}
+  for (const ref of queue) {
+    stateMap[refKey(ref)] = { status: 'pending' }
+  }
+  pingStates.value = stateMap
+  let cursor = 0
+  const worker = async () => {
+    while (true) {
+      if (pingAbortController.value?.signal?.aborted) return
+      const idx = cursor++
+      if (idx >= queue.length) return
+      const ref = queue[idx]
+      const key = refKey(ref)
+      pingStates.value[key] = { status: 'running' }
+      try {
+        const { data } = await api.pingNodes([ref], 'fast', { signal: pingAbortController.value?.signal })
+        const lat = data?.results?.[0]?.latency
+        pingStates.value[key] = { status: 'done', latency: typeof lat === 'number' ? lat : -1 }
+      } catch (e) {
+        if (axios.isCancel(e) || pingAbortController.value?.signal?.aborted) {
+          pingAborted.value = true
+          pingStates.value[key] = { status: 'pending' }
+          return
+        }
+        pingStates.value[key] = { status: 'done', latency: -1 }
+      } finally {
+        pingProgress.value.done += 1
+      }
+    }
+  }
+  const workers = []
+  const n = Math.min(FAST_PING_CONCURRENCY, queue.length)
+  for (let i = 0; i < n; i += 1) workers.push(worker())
+  await Promise.all(workers)
+}
+
+async function pingRefsRealSequential(refs) {
+  const queue = refs.map(ref => ({ type: ref.type, index: ref.index, sub: ref.sub || 0 }))
+  const stateMap = {}
+  for (const ref of queue) {
+    stateMap[refKey(ref)] = { status: 'pending' }
+  }
+  pingStates.value = stateMap
+  for (const raw of refs) {
+    if (pingAbortController.value?.signal?.aborted) return
+    const ref = { type: raw.type, index: raw.index, sub: raw.sub || 0 }
+    const key = refKey(ref)
+    pingStates.value[key] = { status: 'running' }
+    try {
+      const { data } = await api.pingNodes([ref], 'real', { signal: pingAbortController.value?.signal })
+      const lat = data?.results?.[0]?.latency
+      pingStates.value[key] = { status: 'done', latency: typeof lat === 'number' ? lat : -1 }
+    } catch (e) {
+      if (axios.isCancel(e) || pingAbortController.value?.signal?.aborted) {
+        pingAborted.value = true
+        pingStates.value[key] = { status: 'pending' }
+        return
+      }
+      pingStates.value[key] = { status: 'done', latency: -1 }
+    } finally {
+      pingProgress.value.done += 1
+    }
+  }
+}
+
+async function pingRefsWithProgress(refs, mode = 'fast') {
+  pingProgress.value = { total: refs.length, done: 0, current: '' }
+  pingAborted.value = false
+  pingAbortController.value = new AbortController()
+  if (mode === 'real') {
+    await pingRefsRealSequential(refs)
+  } else {
+    await pingRefsFastConcurrent(refs)
+  }
+}
+
+function abortPing() {
+  if (pingAbortController.value) {
+    pingAbortController.value.abort()
+    pingAborted.value = true
+  }
+}
+
+async function pingSelected(mode = 'fast') {
   if (!selectedRefs.value.length) return
   pinging.value = true
   try {
-    await api.pingNodes(selectedRefs.value.map(r => ({ type: r.type, index: r.index, sub: r.sub || 0 })))
+    await pingRefsWithProgress(selectedRefs.value, mode)
     await store.fetchAll()
   } finally {
+    pingAbortController.value = null
+    pingProgress.value = { total: 0, done: 0, current: '' }
+    pingStates.value = {}
     pinging.value = false
   }
 }
@@ -501,6 +678,20 @@ function openNodeMenu(mode, refObj, server) {
   nodeMenuRef.value = refObj
   nodeMenuServer.value = server
   nodeMenuMode.value = mode
+}
+
+function latencyValue(server) {
+  const lat = Number(server?.latency)
+  return Number.isFinite(lat) && lat >= 0 ? lat : Number.MAX_SAFE_INTEGER
+}
+
+function sortEntriesByLatency(entries) {
+  if (!latencySortAsc.value) return entries
+  return [...entries].sort((a, b) => latencyValue(a.server) - latencyValue(b.server))
+}
+
+function toggleLatencySort() {
+  latencySortAsc.value = !latencySortAsc.value
 }
 
 let searchTimer = null
@@ -592,19 +783,35 @@ function getGroupServers(group) {
   }).filter(Boolean)
 }
 
-const allSelectableServers = computed(() => {
-  const result = []
-  store.servers.forEach((s, i) => result.push({ ...s, _ref: { type: 'server', index: i, sub: 0 } }))
-  store.subscriptions.forEach((sub, si) => {
-    sub.servers?.forEach((s, i) => result.push({ ...s, _ref: { type: 'sub_server', index: i, sub: si } }))
-  })
-  return result
-})
+function getGroupServerEntries(group) {
+  return (group.servers || []).map(ref => {
+    if (ref.type === 'server') return { ref, server: store.servers[ref.index] }
+    const sub = store.subscriptions[ref.sub]
+    return { ref, server: sub?.servers?.[ref.index] }
+  }).filter(item => item.server)
+}
+
+function getSortedGroupEntries(group) {
+  return sortEntriesByLatency(getGroupServerEntries(group))
+}
+
+function getSubServerEntries(sub, si) {
+  return (sub?.servers || []).map((server, index) => ({
+    ref: { type: 'sub_server', index, sub: si },
+    server,
+  }))
+}
+
+function getSortedSubEntries(sub, si) {
+  return sortEntriesByLatency(getSubServerEntries(sub, si))
+}
+
+const sortedSearchResults = computed(() => sortEntriesByLatency(searchResults.value))
 
 const filteredSelectableServers = computed(() => {
-  if (!addSearch.value.trim()) return allSelectableServers.value
+  if (!addSearch.value.trim()) return selectableServers.value
   const q = addSearch.value.toLowerCase()
-  return allSelectableServers.value.filter(s =>
+  return selectableServers.value.filter(s =>
     (s.name || '').toLowerCase().includes(q) ||
     (s.host || '').toLowerCase().includes(q)
   )
@@ -639,27 +846,31 @@ async function connectNode(ref) {
 }
 
 async function pingSingleNode(ref) {
-  await api.pingNodes([{ type: ref.type, index: ref.index, sub: ref.sub || 0 }])
+  await api.pingNodes([{ type: ref.type, index: ref.index, sub: ref.sub || 0 }], 'fast')
   await store.fetchAll()
 }
 
-async function pingCurrentTab() {
+async function pingCurrentTab(mode = 'fast') {
   pinging.value = true
   try {
+    let refs = []
     if (activeTab.value.startsWith('sub-')) {
       const si = parseInt(activeTab.value.replace('sub-', ''))
       const sub = store.subscriptions[si]
       if (sub?.servers?.length) {
-        const refs = sub.servers.map((_, i) => ({ type: 'sub_server', index: i, sub: si }))
-        await api.pingNodes(refs)
+        refs = sub.servers.map((_, i) => ({ type: 'sub_server', index: i, sub: si }))
       }
     } else if (activeTab.value.startsWith('group-')) {
       const gi = parseInt(activeTab.value.replace('group-', ''))
       const group = manualGroups.value[gi]
-      if (group) await api.pingGroup(realGroupIndex(group))
+      if (group) refs = (group.servers || []).map(r => ({ type: r.type, index: r.index, sub: r.sub || 0 }))
     }
+    if (refs.length) await pingRefsWithProgress(refs, mode)
     await store.fetchAll()
   } finally {
+    pingAbortController.value = null
+    pingProgress.value = { total: 0, done: 0, current: '' }
+    pingStates.value = {}
     pinging.value = false
   }
 }
@@ -728,10 +939,17 @@ async function saveEditGroup() {
   await store.fetchAll()
 }
 
-function openAddToGroup(gi) {
+async function openAddToGroup(gi) {
   showAddToGroup.value = gi
   selectedAddIdx.value = -1
   addSearch.value = ''
+  const [sRes, subRes] = await Promise.all([api.getServers(), api.getSubscriptions()])
+  const result = []
+  ;(sRes.data.servers || []).forEach((s, i) => result.push({ ...s, _ref: { type: 'server', index: i, sub: 0 } }))
+  ;(subRes.data.subscriptions || []).forEach((sub, si) => {
+    ;(sub.servers || []).forEach((s, i) => result.push({ ...s, _ref: { type: 'sub_server', index: i, sub: si } }))
+  })
+  selectableServers.value = result
 }
 
 async function confirmAddToGroup() {
@@ -840,8 +1058,10 @@ async function confirmSingleMove() {
 .tabs-wrap {
   display: flex;
   align-items: stretch;
+  min-width: 0;
+  flex: 1 1 auto;
   overflow-x: auto;
-  flex: 1;
+  overflow-y: hidden;
   gap: 0;
 }
 .tabs-wrap::-webkit-scrollbar { height: 3px; }
@@ -883,6 +1103,14 @@ async function confirmSingleMove() {
   gap: 6px;
   padding-left: 16px;
   flex-shrink: 0;
+}
+.ping-progress {
+  font-size: 12px;
+  color: #1677ff;
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .search-input {
@@ -945,12 +1173,15 @@ async function confirmSingleMove() {
 }
 .content-area {
   flex: 1;
-  overflow-y: auto;
+  overflow: hidden;
   padding: 20px 24px;
   max-width: 1200px;
   width: 100%;
   margin: 0 auto;
   box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
 }
 
 .panel {
@@ -960,6 +1191,65 @@ async function confirmSingleMove() {
   overflow: hidden;
   box-shadow: 0 1px 4px rgba(0,0,0,.04);
 }
+.panel-fill {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+.server-list-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 16px;
+  border-bottom: 1px solid #f0f0f0;
+  background: #fcfcfc;
+  flex-shrink: 0;
+}
+.server-list-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+.head-placeholder {
+  width: 14px;
+  flex-shrink: 0;
+}
+.head-cell {
+  font-size: 11px;
+  color: #bfbfbf;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.head-name {
+  flex: 1.5;
+  min-width: 0;
+}
+.head-addr {
+  flex: 2;
+  min-width: 0;
+}
+.head-type {
+  width: 48px;
+  margin-right: 16px;
+}
+.head-ops {
+  width: 180px;
+  text-align: right;
+}
+.head-lat-btn {
+  min-width: 52px;
+  margin-right: 16px;
+  border: none;
+  background: transparent;
+  color: #8c8c8c;
+  font-size: 11px;
+  font-weight: 600;
+  text-align: right;
+  cursor: pointer;
+  padding: 0;
+}
+.head-lat-btn:hover { color: #1677ff; }
 
 /* 信息栏（订阅/分组头部） */
 .info-bar {
@@ -1016,3 +1306,4 @@ async function confirmSingleMove() {
 .sel-name { flex: 1; font-size: 13px; color: #262626; }
 .sel-addr { font-size: 11px; color: #bfbfbf; }
 </style>
+

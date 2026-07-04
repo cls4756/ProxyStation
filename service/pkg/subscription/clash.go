@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/ProxyStation/proxystation/db/configure"
 	"gopkg.in/yaml.v3"
@@ -31,8 +32,20 @@ type clashConfig struct {
 func (p *ClashParser) Parse(content []byte) ([]configure.ServerRaw, error) {
 	var cfg clashConfig
 	if err := yaml.Unmarshal(content, &cfg); err != nil {
+		if repaired, ok := tryRepairClashIndentation(content); ok {
+			if repairErr := yaml.Unmarshal(repaired, &cfg); repairErr == nil {
+				return p.parseConfig(cfg), nil
+			}
+		}
+		if hint := detectClashIndentationIssue(content); hint != "" {
+			return nil, fmt.Errorf("clash parse error: %w (%s)", err, hint)
+		}
 		return nil, fmt.Errorf("clash parse error: %w", err)
 	}
+	return p.parseConfig(cfg), nil
+}
+
+func (p *ClashParser) parseConfig(cfg clashConfig) []configure.ServerRaw {
 	var servers []configure.ServerRaw
 	for _, proxy := range cfg.Proxies {
 		s := clashProxyToServerRaw(proxy)
@@ -40,7 +53,133 @@ func (p *ClashParser) Parse(content []byte) ([]configure.ServerRaw, error) {
 			servers = append(servers, *s)
 		}
 	}
-	return servers, nil
+	return servers
+}
+
+func detectClashIndentationIssue(content []byte) string {
+	lines := strings.Split(string(content), "\n")
+	inProxies := false
+	for i, raw := range lines {
+		line := strings.TrimRight(raw, "\r")
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "proxies:" {
+			inProxies = true
+			continue
+		}
+		if !inProxies {
+			continue
+		}
+		if trimmed == "" {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "- ") {
+			continue
+		}
+		if !strings.HasPrefix(line, " ") {
+			inProxies = false
+			continue
+		}
+		if strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "  ") && strings.Contains(trimmed, ":") {
+			return fmt.Sprintf("likely invalid indentation under proxies near line %d; fields under each '- name' entry must be indented by two spaces", i+1)
+		}
+	}
+	return ""
+}
+
+func tryRepairClashIndentation(content []byte) ([]byte, bool) {
+	lines := strings.Split(string(content), "\n")
+	fixed := make([]string, 0, len(lines))
+	changed := false
+
+	inTopLevelProxies := false
+	inProxyGroups := false
+	inGroupItem := false
+	inNestedProxies := false
+
+	for _, raw := range lines {
+		line := strings.TrimRight(raw, "\r")
+		trimmed := strings.TrimSpace(line)
+
+		if trimmed == "proxies:" && !strings.HasPrefix(line, " ") {
+			inTopLevelProxies = true
+			inProxyGroups = false
+			inGroupItem = false
+			inNestedProxies = false
+			fixed = append(fixed, line)
+			continue
+		}
+		if trimmed == "proxy-groups:" && !strings.HasPrefix(line, " ") {
+			inTopLevelProxies = false
+			inProxyGroups = true
+			inGroupItem = false
+			inNestedProxies = false
+			fixed = append(fixed, line)
+			continue
+		}
+
+		if inTopLevelProxies {
+			switch {
+			case strings.HasPrefix(line, "- "):
+				fixed = append(fixed, line)
+				continue
+			case strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "  ") && strings.Contains(trimmed, ":"):
+				fixed = append(fixed, " "+line)
+				changed = true
+				continue
+			case trimmed == "":
+				fixed = append(fixed, line)
+				continue
+			case !strings.HasPrefix(line, " "):
+				inTopLevelProxies = false
+			}
+		}
+
+		if inProxyGroups {
+			switch {
+			case strings.HasPrefix(line, "- "):
+				inGroupItem = true
+				inNestedProxies = false
+				fixed = append(fixed, line)
+				continue
+			case inGroupItem && strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "  ") && strings.Contains(trimmed, ":"):
+				line = " " + line
+				changed = true
+				if strings.TrimSpace(line) == "proxies:" {
+					inNestedProxies = true
+				}
+				fixed = append(fixed, line)
+				continue
+			case inGroupItem && strings.TrimSpace(line) == "proxies:" && strings.HasPrefix(line, "  "):
+				inNestedProxies = true
+				fixed = append(fixed, line)
+				continue
+			case inGroupItem && inNestedProxies && strings.HasPrefix(line, " - "):
+				fixed = append(fixed, "   "+line)
+				changed = true
+				continue
+			case inGroupItem && inNestedProxies && strings.HasPrefix(line, "  - "):
+				fixed = append(fixed, "  "+line)
+				changed = true
+				continue
+			case trimmed == "":
+				fixed = append(fixed, line)
+				continue
+			case !strings.HasPrefix(line, " "):
+				inProxyGroups = false
+				inGroupItem = false
+				inNestedProxies = false
+			case inNestedProxies && strings.HasPrefix(line, "  ") && !strings.HasPrefix(line, "   "):
+				inNestedProxies = false
+			}
+		}
+
+		fixed = append(fixed, line)
+	}
+
+	if !changed {
+		return nil, false
+	}
+	return []byte(strings.Join(fixed, "\n")), true
 }
 
 func clashProxyToServerRaw(proxy map[string]interface{}) *configure.ServerRaw {

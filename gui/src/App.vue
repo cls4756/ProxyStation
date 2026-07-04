@@ -54,7 +54,7 @@
               :key="o.name"
               :class="['dropdown-item', o.name === currentOutbound ? 'active' : '']"
             >
-              <span @click="currentOutbound = o.name; showOutboundMenu = false" style="flex:1">
+              <span @click="selectOutbound(o)" style="flex:1">
                 {{ o.name }}
                 <span class="outbound-target-badge" v-if="o.target?.targetType">
                   <template v-if="o.target.targetType === 'group'">
@@ -81,7 +81,7 @@
         </div>
 
         <!-- 新建出站弹窗 -->
-        <div class="modal-overlay" v-if="showCreateOutbound" @click.self="showCreateOutbound = false">
+        <div class="modal-overlay" v-if="showCreateOutbound" @mousedown.self="showCreateOutbound = false">
           <div class="modal-box" style="width:360px">
             <div class="modal-header">
               <span class="modal-title">新建出站</span>
@@ -95,13 +95,15 @@
             </div>
             <div class="modal-footer">
               <button class="btn btn-light" @click="showCreateOutbound = false">取消</button>
-              <button class="btn btn-primary" @click="createOutbound">创建</button>
+              <button class="btn btn-primary" :disabled="creatingOutbound" @click="createOutbound">
+                {{ creatingOutbound ? '创建中...' : '创建' }}
+              </button>
             </div>
           </div>
         </div>
 
         <!-- 配置出站弹窗 -->
-        <div class="modal-overlay" v-if="editingOutbound" @click.self="editingOutbound = null">
+        <div class="modal-overlay" v-if="editingOutbound" @mousedown.self="editingOutbound = null">
           <div class="modal-box" style="width:480px">
             <div class="modal-header">
               <span class="modal-title">配置出站：{{ editingOutbound.name }}</span>
@@ -155,7 +157,7 @@
                   </select>
                 </div>
                 <div class="form-group">
-                  <label class="form-label">测速间隔</label>
+                  <label class="form-label">探测间隔</label>
                   <input class="input" v-model="outboundForm.probeInterval" placeholder="30s" />
                 </div>
               </template>
@@ -163,18 +165,18 @@
             <div class="modal-footer">
               <button class="btn btn-light" style="color:#f14668; margin-right:auto" @click="disconnectOutbound">断开</button>
               <button class="btn btn-light" @click="editingOutbound = null">取消</button>
-              <button class="btn btn-primary" @click="saveOutbound">确认</button>
+              <button class="btn btn-primary" :disabled="savingOutbound" @click="saveOutbound">
+                {{ savingOutbound ? '保存中...' : '确认' }}
+              </button>
             </div>
           </div>
         </div>
       </div>
 
       <div class="navbar-right">
-        <button class="btn btn-primary btn-sm navbar-import-btn" @click="showImport = true">导入</button>
         <router-link to="/" class="nav-btn" active-class="nav-btn-active">节点</router-link>
-        <router-link to="/rules" class="nav-btn" active-class="nav-btn-active">分流规则</router-link>
         <router-link to="/settings" class="nav-btn" active-class="nav-btn-active">设置</router-link>
-        <div class="user-menu" @mouseleave="showUserMenu = false">
+        <div class="user-menu" ref="userMenuRef">
           <button class="user-menu-trigger" @click="showUserMenu = !showUserMenu">
             <span class="auth-user">{{ authUsername }}</span>
             <span class="caret">▾</span>
@@ -200,7 +202,7 @@
           <span v-if="proxyTarget.activeNodeRef" style="color:#52c41a">
             当前：{{ getNodeName(proxyTarget.activeNodeRef) }}
           </span>
-          <span v-else style="color:#faad14">等待测速…</span>
+          <span v-else style="color:#faad14">等待探测…</span>
           <button class="gsb-btn" @click="openOutboundEdit(store.outbounds.find(o=>o.name===currentOutbound))">修改</button>
         </template>
         <template v-else-if="proxyTarget.targetType === 'node' && proxyTarget.nodeRef">
@@ -246,7 +248,7 @@
     <!-- 全局导入弹窗 -->
     <ImportModal v-if="showImport" @close="showImport = false" @done="onImportDone" />
 
-    <div class="modal-overlay" v-if="showAccountModal" @click.self="closeAccountModal">
+    <div class="modal-overlay" v-if="showAccountModal" @mousedown.self="closeAccountModal">
       <div class="modal-box" style="width:480px">
         <div class="modal-header">
           <span class="modal-title">账号设置</span>
@@ -298,12 +300,14 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, provide, watch } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount, provide, watch, nextTick } from 'vue'
+import { useRouter } from 'vue-router'
 import { useProxyStore } from './stores/proxy'
 import { api, setUnauthorizedHandler } from './api'
 import ImportModal from './components/ImportModal.vue'
 
 const store = useProxyStore()
+const router = useRouter()
 const authChecking = ref(true)
 const authenticated = ref(false)
 const authUsername = ref('')
@@ -313,12 +317,15 @@ const loginForm = ref({ username: 'admin', password: 'admin' })
 const appInitialized = ref(false)
 const showOutboundMenu = ref(false)
 const showUserMenu = ref(false)
+const userMenuRef = ref(null)
 const showImport = ref(false)
 const showAccountModal = ref(false)
 const currentOutbound = ref('proxy')
 const startError = ref('')
 const showCreateOutbound = ref(false)
 const newOutboundName = ref('')
+const creatingOutbound = ref(false)
+const savingOutbound = ref(false)
 const editingOutbound = ref(null)
 const outboundForm = ref({ targetType: 'node', nodeKey: '', groupId: '', mode: 'leastping', probeInterval: '30s' })
 const kernels = ref({})
@@ -428,7 +435,28 @@ onMounted(() => {
     authError.value = '登录已失效，请重新登录'
   })
   checkAuth()
+  document.addEventListener('click', handleGlobalClick)
 })
+
+onBeforeUnmount(() => {
+  document.removeEventListener('click', handleGlobalClick)
+})
+
+function handleGlobalClick(event) {
+  const el = userMenuRef.value
+  if (!el) return
+  if (!el.contains(event.target)) {
+    showUserMenu.value = false
+  }
+}
+
+async function selectOutbound(outbound) {
+  currentOutbound.value = outbound?.name || 'proxy'
+  showOutboundMenu.value = false
+  if (router.currentRoute.value.path !== '/') {
+    await router.push('/')
+  }
+}
 
 // 监听 showLogs 变化，收缩时清除高度样式，并保存状态
 watch(showLogs, (newVal) => {
@@ -530,15 +558,16 @@ async function initAuthenticatedApp() {
   api.getKernelStatus?.().then(r => { kernels.value = r.data.kernels || {} }).catch(() => {})
   await loadLogs()
   startLogsStream()
-  setTimeout(() => {
-    if (logsPanel.value && !logsPanelHeight.value) {
+  await nextTick()
+  if (logsPanel.value && showLogs.value) {
+    if (!logsPanelHeight.value) {
       const defaultHeight = Math.floor(window.innerHeight * 0.4)
       logsPanel.value.style.height = defaultHeight + 'px'
       logsPanelHeight.value = defaultHeight
-    } else if (logsPanel.value && logsPanelHeight.value && showLogs.value) {
+    } else {
       logsPanel.value.style.height = logsPanelHeight.value + 'px'
     }
-  }, 0)
+  }
 }
 
 async function saveAccountProfile() {
@@ -612,16 +641,30 @@ async function openOutboundEdit(o) {
     api.getSubscriptions(),
   ])
   editGroups.value = gRes.data.groups || []
-  editServers.value = sRes.data.servers || []
+  const ibRes = await api.getCustomInbounds()
+  const inbounds = ibRes.data.inbounds || []
+  const inboundIDSet = new Set(inbounds.map(ib => ib.id))
+  editServers.value = (sRes.data.servers || []).filter(s => {
+    if (typeof s.source !== 'string' || !s.source.startsWith('inbound:')) return true
+    const rest = s.source.slice('inbound:'.length)
+    const id = rest.split(':')[0]
+    return inboundIDSet.has(id)
+  })
   editSubscriptions.value = subRes.data.subscriptions || []
 }
 
 async function createOutbound() {
+  if (creatingOutbound.value) return
   if (!newOutboundName.value.trim()) return
-  await api.createOutbound({ name: newOutboundName.value.trim() })
-  showCreateOutbound.value = false
-  newOutboundName.value = ''
-  await store.fetchAll()
+  creatingOutbound.value = true
+  try {
+    await api.createOutbound({ name: newOutboundName.value.trim() })
+    showCreateOutbound.value = false
+    newOutboundName.value = ''
+    await store.fetchAll()
+  } finally {
+    creatingOutbound.value = false
+  }
 }
 
 async function deleteOutbound(name) {
@@ -631,6 +674,9 @@ async function deleteOutbound(name) {
 }
 
 async function saveOutbound() {
+  if (savingOutbound.value || !editingOutbound.value?.name) return
+  savingOutbound.value = true
+  try {
   const name = editingOutbound.value.name
   let target = {}
   if (outboundForm.value.targetType === 'node' && outboundForm.value.nodeKey) {
@@ -644,6 +690,9 @@ async function saveOutbound() {
   await store.fetchAll()
   // 刷新代理状态，因为 connectOutbound 可能会触发 Restart
   await store.fetchStatus()
+  } finally {
+    savingOutbound.value = false
+  }
 }
 
 async function disconnectOutbound() {
@@ -651,6 +700,7 @@ async function disconnectOutbound() {
   editingOutbound.value = null
   await store.fetchAll()
 }
+
 
 // 日志相关函数
 async function loadLogs() {
@@ -814,7 +864,6 @@ body {
 }
 .navbar-left { display: flex; align-items: center; gap: 10px; }
 .navbar-right { display: flex; align-items: center; gap: 4px; }
-.navbar-import-btn { margin-right: 8px; }
 
 .brand { display: flex; align-items: center; gap: 6px; margin-right: 4px; }
 .brand-icon { font-size: 20px; }
@@ -928,7 +977,7 @@ body {
 .user-menu-trigger:hover { background: #f5f5f5; border-color: #bfbfbf; }
 .user-dropdown-menu {
   position: absolute;
-  top: calc(100% + 8px);
+  top: calc(100% + 2px);
   right: 0;
   min-width: 148px;
   background: #fff;
@@ -1054,21 +1103,39 @@ body {
   width: 520px;
   max-width: 95vw;
   max-height: 90vh;
-  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 .modal-header {
   display: flex; align-items: center; justify-content: space-between;
   padding: 16px 20px;
   border-bottom: 1px solid #dbdbdb;
+  flex-shrink: 0;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: #fff;
+  box-shadow: 0 1px 0 rgba(0,0,0,.04);
 }
 .modal-title { font-size: 16px; font-weight: 600; }
 .modal-close { cursor: pointer; font-size: 18px; color: #7a7a7a; line-height: 1; }
 .modal-close:hover { color: #363636; }
-.modal-body { padding: 20px; }
+.modal-body {
+  padding: 20px;
+  overflow-y: auto;
+  min-height: 0;
+}
 .modal-footer {
   display: flex; justify-content: flex-end; gap: 8px;
   padding: 14px 20px;
   border-top: 1px solid #dbdbdb;
+  flex-shrink: 0;
+  position: sticky;
+  bottom: 0;
+  z-index: 1;
+  background: #fff;
+  box-shadow: 0 -1px 0 rgba(0,0,0,.04);
 }
 .account-divider {
   height: 1px;
@@ -1211,4 +1278,42 @@ body {
   background: #fafafa;
   flex-shrink: 0;
 }
+
+@media (max-width: 900px) {
+  #app { height: 100dvh; }
+  .navbar {
+    height: auto;
+    min-height: 52px;
+    padding: 8px 10px;
+    gap: 8px;
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  .navbar-left, .navbar-right {
+    width: 100%;
+    flex-wrap: wrap;
+    row-gap: 6px;
+  }
+  .navbar-right { justify-content: flex-start; }
+  .global-status-bar {
+    padding: 8px 10px;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  .gsb-btn { margin-left: 0; }
+  .main-content { min-height: 0; }
+  .modal-box {
+    width: calc(100vw - 20px) !important;
+    max-width: calc(100vw - 20px);
+    max-height: 85dvh;
+  }
+  .modal-body { padding: 14px; }
+  .modal-header, .modal-footer { padding: 12px 14px; }
+  .logs-header { padding: 0 10px; }
+  .logs-actions {
+    padding: 6px 10px;
+    flex-wrap: wrap;
+  }
+}
 </style>
+

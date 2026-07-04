@@ -201,13 +201,17 @@ func BuildSingboxConfig(setting *configure.Setting) (*SingboxConfig, error) {
 		Inbounds: []SingboxInbound{
 			buildSingboxInbound("socks", "socks-in", listenAddr, setting.Socks5Port, setting.Socks5AuthAccounts()),
 			buildSingboxInbound("http", "http-in", listenAddr, setting.HttpPort, setting.HTTPAuthAccounts()),
+			buildSingboxInbound("socks", ProbeInboundTag, ProbeInboundListen, ProbeInboundSocksPort, nil),
 		},
 		Outbounds: []SingboxOutbound{
+			{Type: "direct", Tag: ProbeOutboundName},
 			{Type: "direct", Tag: "direct"},
 			{Type: "block", Tag: "block"},
 		},
 		Route: &SingboxRoute{
-			Rules: routeRules,
+			Rules: append([]SingboxRouteRule{
+				{InboundTag: []string{ProbeInboundTag}, Outbound: ProbeOutboundName},
+			}, routeRules...),
 			RuleSet: []SingboxRuleSet{
 				makeRuleSet("geosite-cn", "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/cn.srs"),
 				makeRuleSet("geoip-cn", "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/cn.srs"),
@@ -220,6 +224,10 @@ func BuildSingboxConfig(setting *configure.Setting) (*SingboxConfig, error) {
 
 	// 添加自定义入站
 	for _, ci := range configure.GetCustomInbounds() {
+		p := strings.ToLower(strings.TrimSpace(ci.Protocol))
+		if p == "cfdo" || p == "cfgoodnet" {
+			continue
+		}
 		ib := buildSingboxInbound("", ci.Tag, ci.Listen, ci.Port, ci.AuthAccounts())
 		if ib.Listen == "" {
 			ib.Listen = "127.0.0.1"
@@ -254,11 +262,7 @@ func BuildSingboxConfig(setting *configure.Setting) (*SingboxConfig, error) {
 		if o == nil {
 			continue
 		}
-		ref := resolveActiveNode(o)
-		if ref == nil {
-			continue // 未绑定节点，跳过
-		}
-		s := getServerRaw(ref)
+		s := resolveOutboundServerRaw(name, o)
 		if s == nil {
 			continue
 		}
@@ -266,7 +270,24 @@ func BuildSingboxConfig(setting *configure.Setting) (*SingboxConfig, error) {
 		if err != nil {
 			return nil, fmt.Errorf("outbound %v: %w", name, err)
 		}
-		cfg.Outbounds = append([]SingboxOutbound{ob}, cfg.Outbounds...)
+		if LogCallback != nil {
+			LogCallback(fmt.Sprintf("📘 singbox outbound %s => type=%s server=%s port=%d", name, ob.Type, ob.Server, ob.ServerPort))
+		}
+		if name == ProbeOutboundName {
+			replaced := false
+			for i := range cfg.Outbounds {
+				if cfg.Outbounds[i].Tag == ProbeOutboundName {
+					cfg.Outbounds[i] = ob
+					replaced = true
+					break
+				}
+			}
+			if !replaced {
+				cfg.Outbounds = append([]SingboxOutbound{ob}, cfg.Outbounds...)
+			}
+		} else {
+			cfg.Outbounds = append([]SingboxOutbound{ob}, cfg.Outbounds...)
+		}
 		validOutboundTags[name] = true
 		if firstProxyOutbound == "" {
 			firstProxyOutbound = name
@@ -482,7 +503,7 @@ func singboxServerToOutbound(s *configure.ServerRaw, tag string) (SingboxOutboun
 		return sbWireguard(s, tag)
 	case "socks5", "socks", "socks4":
 		return sbSocks(s, tag)
-	case "http", "https":
+	case "http", "https", "cfgoodnet":
 		return sbHTTP(s, tag)
 	case "anytls":
 		return sbAnyTLS(s, tag)
@@ -547,30 +568,14 @@ func sbVless(s *configure.ServerRaw, tag string) (SingboxOutbound, error) {
 }
 
 func sbSS(s *configure.ServerRaw, tag string) (SingboxOutbound, error) {
-	link := s.Link
-	if idx := strings.Index(link, "#"); idx != -1 {
-		link = link[:idx]
-	}
-	link = strings.TrimPrefix(link, "ss://")
-	var method, password, host string
-	var port int
-	if atIdx := strings.LastIndex(link, "@"); atIdx != -1 {
-		userinfo := link[:atIdx]
-		hostport := link[atIdx+1:]
-		decoded, err := b64Decode(userinfo)
-		if err != nil {
-			decoded = userinfo
-		}
-		parts := strings.SplitN(decoded, ":", 2)
-		if len(parts) == 2 {
-			method, password = parts[0], parts[1]
-		}
-		host, port = splitHostPort(hostport)
+	ss, err := parseShadowsocksEndpoint(s)
+	if err != nil {
+		return SingboxOutbound{}, err
 	}
 	return SingboxOutbound{
 		Type: "shadowsocks", Tag: tag,
-		Server: host, ServerPort: port,
-		Method: method, Password: password,
+		Server: ss.Host, ServerPort: ss.Port,
+		Method: ss.Method, Password: ss.Password,
 	}, nil
 }
 
@@ -994,26 +999,34 @@ func sbHTTP(s *configure.ServerRaw, tag string) (SingboxOutbound, error) {
 	var port int
 	var username, password string
 
+	if strings.ToLower(s.Type) == "cfgoodnet" {
+		host = s.Host
+		port = s.Port
+	}
+
 	// 对于 clash:// 或 singbox:// 格式，需要从 Link 中提取凭证
-	if strings.HasPrefix(s.Link, "clash://") {
+	if host == "" && port == 0 && strings.HasPrefix(s.Link, "clash://") {
 		host = s.Host
 		port = s.Port
 		username, password = extractClashCredentialsForSingbox(s.Link)
-	} else if strings.HasPrefix(s.Link, "singbox://") {
+	} else if host == "" && port == 0 && strings.HasPrefix(s.Link, "singbox://") {
 		host = s.Host
 		port = s.Port
 		username, password = extractSingboxCredentialsForSingbox(s.Link)
-	} else {
+	} else if host == "" || port == 0 {
 		// 标准 URI 格式 - 直接使用 s.Link 而不是重新构建
 		u, err := url.Parse(s.Link)
-		if err != nil {
-			return SingboxOutbound{}, fmt.Errorf("invalid http link: %w", err)
+		if err == nil {
+			host = u.Hostname()
+			port = strToInt(u.Port())
+			if u.User != nil {
+				username = u.User.Username()
+				password, _ = u.User.Password()
+			}
 		}
-		host = u.Hostname()
-		port = strToInt(u.Port())
-		if u.User != nil {
-			username = u.User.Username()
-			password, _ = u.User.Password()
+		if host == "" || port == 0 {
+			host = s.Host
+			port = s.Port
 		}
 	}
 

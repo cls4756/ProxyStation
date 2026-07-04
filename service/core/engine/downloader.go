@@ -88,6 +88,51 @@ type githubRelease struct {
 	} `json:"assets"`
 }
 
+func stripMirrorURL(maybeMirroredURL, mirror string) string {
+	if mirror == "" {
+		return maybeMirroredURL
+	}
+	mirror = strings.TrimRight(mirror, "/")
+	prefix := mirror + "/"
+	if strings.HasPrefix(maybeMirroredURL, prefix) {
+		raw := strings.TrimPrefix(maybeMirroredURL, prefix)
+		if strings.HasPrefix(raw, "https://") || strings.HasPrefix(raw, "http://") {
+			return raw
+		}
+	}
+	return maybeMirroredURL
+}
+
+func appendUniqueURL(urls []string, seen map[string]struct{}, u string) []string {
+	u = strings.TrimSpace(u)
+	if u == "" {
+		return urls
+	}
+	if _, ok := seen[u]; ok {
+		return urls
+	}
+	seen[u] = struct{}{}
+	return append(urls, u)
+}
+
+func buildDataDownloadCandidates(dataType, primaryURL string) []string {
+	setting := configure.GetSettingNotNil()
+	seen := map[string]struct{}{}
+	candidates := make([]string, 0, 8)
+
+	// 1) 当前选择的 URL
+	candidates = appendUniqueURL(candidates, seen, primaryURL)
+	// 2) 镜像 URL 的原始 GitHub URL（用于镜像 403/限流时回退）
+	candidates = appendUniqueURL(candidates, seen, stripMirrorURL(primaryURL, setting.GithubMirror))
+
+	// 3) 兜底列表：镜像版 + 原始版
+	for _, fb := range dataDownloadFallbacks[dataType] {
+		candidates = appendUniqueURL(candidates, seen, applyMirrorURL(fb.URL, setting.GithubMirror))
+		candidates = appendUniqueURL(candidates, seen, fb.URL)
+	}
+	return candidates
+}
+
 type selectedAsset struct {
 	Name        string
 	DownloadURL string
@@ -108,10 +153,39 @@ var kernelRepos = map[string]string{
 	"v2ray":   "v2fly/v2ray-core",
 }
 
-// 数据文件的 GitHub 仓库信息
-var dataRepos = map[string]string{
-	"geoip":   "v2fly/geoip",
-	"geosite": "v2fly/domain-list-community",
+type dataReleaseSource struct {
+	Repo       string
+	AssetNames []string
+}
+
+type dataDownloadFallback struct {
+	Version string
+	URL     string
+}
+
+// 数据文件下载来源：
+// 1) 先走 GitHub release API（支持获取真实版本号）
+// 2) geosite 增加 latest/download 直链兜底，避免上游资产名或发布方式变化导致无法下载
+var dataReleaseSources = map[string][]dataReleaseSource{
+	"geoip": {
+		{Repo: "v2fly/geoip", AssetNames: []string{"geoip.dat"}},
+		{Repo: "Loyalsoldier/v2ray-rules-dat", AssetNames: []string{"geoip.dat"}},
+	},
+	"geosite": {
+		{Repo: "Loyalsoldier/v2ray-rules-dat", AssetNames: []string{"geosite.dat"}},
+		{Repo: "v2fly/domain-list-community", AssetNames: []string{"geosite.dat", "dlc.dat"}},
+	},
+}
+
+var dataDownloadFallbacks = map[string][]dataDownloadFallback{
+	"geoip": {
+		{Version: "latest", URL: "https://github.com/v2fly/geoip/releases/latest/download/geoip.dat"},
+		{Version: "latest", URL: "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"},
+	},
+	"geosite": {
+		{Version: "latest", URL: "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"},
+		{Version: "latest", URL: "https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat"},
+	},
 }
 
 // rule-set 文件列表（sing-box 格式）
@@ -162,66 +236,60 @@ func GetLatestRelease(kernel string) (string, string, error) {
 
 	// 应用 GitHub 镜像加速
 	downloadURL := applyMirrorURL(asset.DownloadURL, setting.GithubMirror)
-	if LogCallback != nil {
-		LogCallback(fmt.Sprintf("📦 选择 %s 版本资产: %s (%s/%s)", kernel, asset.Name, runtime.GOOS, runtime.GOARCH))
-	}
 
 	return release.TagName, downloadURL, nil
 }
 
 // GetLatestDataRelease 获取数据文件的最新 release 信息
 func GetLatestDataRelease(dataType string) (string, string, error) {
-	repo, ok := dataRepos[dataType]
+	sources, ok := dataReleaseSources[dataType]
 	if !ok {
 		return "", "", fmt.Errorf("unknown data type: %v", dataType)
 	}
 
 	setting := configure.GetSettingNotNil()
-	url := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", repo)
 	client := newHTTPClient(30 * time.Second)
-	resp, err := client.Get(url)
-	if err != nil {
-		return "", "", fmt.Errorf("fetch release info failed (network error or timeout): %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return "", "", fmt.Errorf("fetch release info failed (HTTP %d)", resp.StatusCode)
-	}
-	defer resp.Body.Close()
+	var errs []string
 
-	var release githubRelease
-	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
-		return "", "", fmt.Errorf("parse release: %w", err)
-	}
+	for _, source := range sources {
+		url := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", source.Repo)
+		resp, err := client.Get(url)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", source.Repo, err))
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			_ = resp.Body.Close()
+			errs = append(errs, fmt.Sprintf("%s: HTTP %d", source.Repo, resp.StatusCode))
+			continue
+		}
 
-	// 选择合适的资产
-	var downloadURL string
-	switch dataType {
-	case "geoip":
-		// geoip.dat 文件
+		var release githubRelease
+		decodeErr := json.NewDecoder(resp.Body).Decode(&release)
+		_ = resp.Body.Close()
+		if decodeErr != nil {
+			errs = append(errs, fmt.Sprintf("%s: parse release: %v", source.Repo, decodeErr))
+			continue
+		}
+
 		for _, asset := range release.Assets {
-			if strings.EqualFold(asset.Name, "geoip.dat") {
-				downloadURL = asset.BrowserDownloadURL
-				break
+			for _, name := range source.AssetNames {
+				if strings.EqualFold(asset.Name, name) {
+					downloadURL := applyMirrorURL(asset.BrowserDownloadURL, setting.GithubMirror)
+					return release.TagName, downloadURL, nil
+				}
 			}
 		}
-	case "geosite":
-		// geosite.dat 文件
-		for _, asset := range release.Assets {
-			if strings.EqualFold(asset.Name, "geosite.dat") {
-				downloadURL = asset.BrowserDownloadURL
-				break
-			}
+		errs = append(errs, fmt.Sprintf("%s: no suitable asset (%s)", source.Repo, strings.Join(source.AssetNames, ",")))
+	}
+
+	for _, fb := range dataDownloadFallbacks[dataType] {
+		if strings.TrimSpace(fb.URL) != "" {
+			return fb.Version, applyMirrorURL(fb.URL, setting.GithubMirror), nil
 		}
 	}
 
-	if downloadURL == "" {
-		return "", "", fmt.Errorf("no suitable asset found for %s", dataType)
-	}
-
-	// 应用 GitHub 镜像加速
-	downloadURL = applyMirrorURL(downloadURL, setting.GithubMirror)
-
-	return release.TagName, downloadURL, nil
+	return "", "", fmt.Errorf("fetch data release failed for %s: %s", dataType, strings.Join(errs, " | "))
 }
 
 // selectAsset 根据当前系统选择合适的下载资产
@@ -310,6 +378,10 @@ func DownloadKernel(kernel string, progressCh chan<- DownloadProgress) error {
 	version, downloadURL, err := GetLatestRelease(kernel)
 	if err != nil {
 		return fail("下载失败", fmt.Errorf("获取版本信息失败: %w", err))
+	}
+	assetName := filepath.Base(strings.Split(downloadURL, "?")[0])
+	if LogCallback != nil {
+		LogCallback(fmt.Sprintf("📦 选择 %s 版本资产: %s (%s/%s)", kernel, assetName, runtime.GOOS, runtime.GOARCH))
 	}
 	localVersion := GetKernelVersion(kernel)
 	if localVersion != "" && CompareVersions(version, localVersion) <= 0 {
@@ -418,12 +490,8 @@ func DownloadData(dataType string, progressCh chan<- DownloadProgress) error {
 		return fail(fmt.Errorf("获取版本信息失败: %w", err))
 	}
 
-	// 注意：GetLatestDataRelease 已经应用了镜像，不需要再次应用
 	progressCh <- DownloadProgress{Kernel: dataType, Status: "downloading",
 		Message: fmt.Sprintf("下载 %s %s…", dataType, version), Percent: 5}
-	if LogCallback != nil {
-		LogCallback(fmt.Sprintf("📥 开始下载 %s %s: %s", dataType, version, downloadURL))
-	}
 
 	tmpFile, err := os.CreateTemp("", "proxystation-data-*")
 	if err != nil {
@@ -433,38 +501,76 @@ func DownloadData(dataType string, progressCh chan<- DownloadProgress) error {
 	defer tmpFile.Close()
 
 	client := newDownloadClient()
-	resp, err := client.Get(downloadURL)
-	if err != nil {
-		return fail(fmt.Errorf("下载失败（网络错误）: %w\nURL: %s", err, downloadURL))
-	}
-	defer resp.Body.Close()
+	var lastErr error
+	candidates := buildDataDownloadCandidates(dataType, downloadURL)
+	for idx, u := range candidates {
+		if LogCallback != nil {
+			LogCallback(fmt.Sprintf("📥 开始下载 %s %s (%d/%d): %s", dataType, version, idx+1, len(candidates), u))
+		}
+		if idx > 0 {
+			progressCh <- DownloadProgress{Kernel: dataType, Status: "downloading",
+				Message: fmt.Sprintf("主链接失败，正在尝试备用源（%d/%d）…", idx+1, len(candidates)), Percent: 8}
+		}
+		if e := tmpFile.Truncate(0); e != nil {
+			return fail(fmt.Errorf("重置临时文件失败: %w", e))
+		}
+		if _, e := tmpFile.Seek(0, 0); e != nil {
+			return fail(fmt.Errorf("重置临时文件偏移失败: %w", e))
+		}
 
-	if resp.StatusCode != http.StatusOK {
-		return fail(fmt.Errorf("下载失败（HTTP %d）\nURL: %s", resp.StatusCode, downloadURL))
-	}
+		resp, e := client.Get(u)
+		if e != nil {
+			lastErr = fmt.Errorf("下载失败（网络错误）: %w\nURL: %s", e, u)
+			continue
+		}
 
-	total := resp.ContentLength
-	var downloaded int64
-	buf := make([]byte, 32*1024)
-	for {
-		n, readErr := resp.Body.Read(buf)
-		if n > 0 {
-			if _, we := tmpFile.Write(buf[:n]); we != nil {
-				return fail(fmt.Errorf("写入失败: %w", we))
+		if resp.StatusCode != http.StatusOK {
+			lastErr = fmt.Errorf("下载失败（HTTP %d）\nURL: %s", resp.StatusCode, u)
+			_ = resp.Body.Close()
+			continue
+		}
+
+		total := resp.ContentLength
+		var downloaded int64
+		buf := make([]byte, 32*1024)
+		ok := true
+		for {
+			n, readErr := resp.Body.Read(buf)
+			if n > 0 {
+				if _, we := tmpFile.Write(buf[:n]); we != nil {
+					lastErr = fmt.Errorf("写入失败: %w", we)
+					ok = false
+					break
+				}
+				downloaded += int64(n)
+				if total > 0 {
+					pct := float64(downloaded) / float64(total) * 90
+					progressCh <- DownloadProgress{Kernel: dataType, Status: "downloading",
+						Message: fmt.Sprintf("下载中 %.1f MB / %.1f MB", float64(downloaded)/1e6, float64(total)/1e6),
+						Percent: 5 + pct}
+				}
 			}
-			downloaded += int64(n)
-			if total > 0 {
-				pct := float64(downloaded) / float64(total) * 90
-				progressCh <- DownloadProgress{Kernel: dataType, Status: "downloading",
-					Message: fmt.Sprintf("下载中 %.1f MB / %.1f MB", float64(downloaded)/1e6, float64(total)/1e6),
-					Percent: 5 + pct}
+			if readErr == io.EOF {
+				break
+			}
+			if readErr != nil {
+				lastErr = fmt.Errorf("读取失败: %w\nURL: %s", readErr, u)
+				ok = false
+				break
 			}
 		}
-		if readErr == io.EOF {
+		_ = resp.Body.Close()
+		if ok {
+			lastErr = nil
 			break
 		}
-		if readErr != nil {
-			return fail(fmt.Errorf("读取失败: %w\nURL: %s", readErr, downloadURL))
+	}
+
+	if lastErr != nil {
+		if fi, statErr := tmpFile.Stat(); statErr == nil && fi.Size() > 0 {
+			// 至少有一次成功写入内容，继续后续流程
+		} else {
+			return fail(lastErr)
 		}
 	}
 
@@ -666,12 +772,18 @@ func parseKernelVersion(output string) string {
 		for _, part := range parts {
 			part = strings.TrimSpace(strings.Trim(part, ",;()"))
 			if strings.HasPrefix(part, "v") || (len(part) > 0 && part[0] >= '0' && part[0] <= '9') {
-				return part
+				if hasNumericVersion(part) {
+					return part
+				}
 			}
 		}
-		return versionLine
+		return ""
 	}
 	return ""
+}
+
+func hasNumericVersion(v string) bool {
+	return len(versionSegments(v)) > 0
 }
 
 func CompareVersions(v1, v2 string) int {
@@ -737,7 +849,9 @@ func GetKernelMeta(kernel string) KernelMeta {
 		return meta
 	}
 	meta.LatestVersion = latestVersion
-	meta.HasUpdate = CompareVersions(latestVersion, meta.LocalVersion) > 0
+	if hasNumericVersion(latestVersion) && hasNumericVersion(meta.LocalVersion) {
+		meta.HasUpdate = CompareVersions(latestVersion, meta.LocalVersion) > 0
+	}
 	return meta
 }
 

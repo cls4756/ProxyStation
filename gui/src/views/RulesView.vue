@@ -1,7 +1,11 @@
 <template>
   <div class="rules-page">
-    <!-- 左侧：路由规则 -->
-    <div class="rules-section">
+    <div class="page-tabs" v-if="showModeTabs">
+      <button :class="['page-tab', activeTab === 'inbounds' ? 'page-tab-active' : '']" @click="activeTab = 'inbounds'">出入站</button>
+      <button :class="['page-tab', activeTab === 'rules' ? 'page-tab-active' : '']" @click="activeTab = 'rules'">分流规则</button>
+    </div>
+
+    <div class="rules-section" v-if="activeTab === 'rules'">
       <div class="section-header">
         <span class="section-title">🔀 路由规则</span>
         <div class="section-actions">
@@ -66,8 +70,7 @@
       </div>
     </div>
 
-    <!-- 右侧：入站 -->
-    <div class="inbounds-section">
+    <div class="inbounds-section" v-else>
       <div class="section-header">
         <span class="section-title">📥 入站</span>
         <button class="action-btn action-btn-primary" @click="openAddInbound">＋ 添加入站</button>
@@ -99,7 +102,7 @@
           </div>
         </div>
         <!-- 自定义入站 -->
-        <div v-for="(ib, i) in inbounds" :key="ib.id" class="inbound-row">
+        <div v-for="(ib, i) in pureInbounds" :key="ib.id" class="inbound-row">
           <div class="inbound-info">
             <span class="inbound-name">{{ ib.name || ib.tag }}</span>
             <span class="inbound-proto-badge">{{ ib.protocol }}</span>
@@ -112,14 +115,43 @@
             <button class="icon-btn icon-btn-danger" @click="deleteInbound(i)" title="删除">✕</button>
           </div>
         </div>
-        <div v-if="!inbounds.length" class="empty-hint" style="padding:12px 16px;font-size:12px;color:#bfbfbf;border-top:1px solid #f5f5f5">
+        <div v-if="!pureInbounds.length" class="empty-hint" style="padding:12px 16px;font-size:12px;color:#bfbfbf;border-top:1px solid #f5f5f5">
           暂无自定义入站
+        </div>
+      </div>
+
+      <div class="section-header" style="margin-top:10px">
+        <span class="section-title">⚙ 代理出站节点</span>
+        <button class="action-btn action-btn-primary" @click="openAddBuiltinProxy">＋ 添加代理节点</button>
+      </div>
+      <div class="inbounds-list">
+        <div v-for="(ib, i) in builtinOutbounds" :key="'bo-' + ib.id" class="inbound-row">
+          <div class="inbound-info">
+            <span class="inbound-name">{{ ib.name || ib.protocol }}</span>
+            <span class="inbound-proto-badge">{{ ib.protocol }}</span>
+            <span class="inbound-addr">127.0.0.1:{{ ib.port || ib.cfdo?.port || ib.cfgoodnet?.listenPort || 0 }}</span>
+            <span :class="['builtin-status-badge', builtinStatusClass(ib.id)]">{{ builtinStatusText(ib.id) }}</span>
+            <span v-if="builtinStatusMap[ib.id]?.error" class="builtin-status-error" :title="builtinStatusMap[ib.id]?.error">
+              {{ builtinStatusMap[ib.id]?.error }}
+            </span>
+          </div>
+          <div class="rule-ops">
+            <button class="icon-btn" @click="restartBuiltinProxy(ib)" :disabled="builtinRestarting[ib.id]" title="重启">
+              {{ builtinRestarting[ib.id] ? '…' : '↻' }}
+            </button>
+            <button class="icon-btn" @click="createRuleOutboundForProxy(ib)" title="创建/更新分流出站">⇄</button>
+            <button class="icon-btn" @click="editBuiltinProxy(i)" title="编辑">✏</button>
+            <button class="icon-btn icon-btn-danger" @click="deleteBuiltinProxy(i)" title="删除">✕</button>
+          </div>
+        </div>
+        <div v-if="!builtinOutbounds.length" class="empty-hint" style="padding:12px 16px;font-size:12px;color:#bfbfbf;border-top:1px solid #f5f5f5">
+          暂无代理出站节点。添加 CFDO 后，可用“⇄”按钮创建分流规则可选择的出站。
         </div>
       </div>
     </div>
 
     <!-- 编辑内置入站弹窗 -->
-    <div class="modal-overlay" v-if="showBuiltinModal" @click.self="showBuiltinModal = false">
+    <div class="modal-overlay" v-if="showBuiltinModal" @mousedown.self="showBuiltinModal = false">
       <div class="modal-box" style="width:440px">
         <div class="modal-header">
           <span class="modal-title">编辑{{ builtinEditType === 'socks' ? ' SOCKS5' : ' HTTP' }} 入站</span>
@@ -153,7 +185,7 @@
     </div>
 
     <!-- 添加/编辑规则弹窗 -->
-    <div class="modal-overlay" v-if="showRuleModal" @click.self="showRuleModal = false">
+    <div class="modal-overlay" v-if="showRuleModal" @mousedown.self="showRuleModal = false">
       <div class="modal-box" style="width:600px">
         <div class="modal-header">
           <span class="modal-title">{{ editingRuleIdx >= 0 ? '编辑规则' : '添加规则' }}</span>
@@ -196,9 +228,9 @@
                 @keydown.enter.prevent="addInboundTag" />
             </div>
             <div class="quick-tags">
-              <span class="quick-tag" @click="addTagIfAbsent(ruleForm.inboundTags, 'socks')">socks</span>
-              <span class="quick-tag" @click="addTagIfAbsent(ruleForm.inboundTags, 'http')">http</span>
-              <span v-for="ib in inbounds" :key="ib.tag" class="quick-tag"
+              <span class="quick-tag" @click="addTagIfAbsent(ruleForm.inboundTags, 'socks-in')">socks-in</span>
+              <span class="quick-tag" @click="addTagIfAbsent(ruleForm.inboundTags, 'http-in')">http-in</span>
+              <span v-for="ib in taggedInbounds" :key="ib.tag" class="quick-tag"
                 @click="addTagIfAbsent(ruleForm.inboundTags, ib.tag)">{{ ib.tag }}</span>
             </div>
           </div>
@@ -260,10 +292,10 @@
     </div>
 
     <!-- 添加/编辑入站弹窗 -->
-    <div class="modal-overlay" v-if="showInboundModal" @click.self="showInboundModal = false">
+    <div class="modal-overlay" v-if="showInboundModal" @mousedown.self="showInboundModal = false">
       <div class="modal-box" style="width:480px">
         <div class="modal-header">
-          <span class="modal-title">{{ editingInboundIdx >= 0 ? '编辑入站' : '添加入站' }}</span>
+          <span class="modal-title">{{ inboundModalTitle }}</span>
           <span class="modal-close" @click="showInboundModal = false">✕</span>
         </div>
         <div class="modal-body">
@@ -275,13 +307,15 @@
             <div class="form-group" style="width:160px">
               <label class="form-label">协议</label>
               <select class="input" v-model="inboundForm.protocol">
-                <option value="socks">SOCKS5</option>
-                <option value="http">HTTP</option>
-                <option value="dokodemo-door">透明代理</option>
+                <option v-if="editorMode === 'inbound'" value="socks">SOCKS5</option>
+                <option v-if="editorMode === 'inbound'" value="http">HTTP</option>
+                <option v-if="editorMode === 'inbound'" value="dokodemo-door">透明代理</option>
+                <option v-if="editorMode === 'builtin'" value="cfdo">CFDO</option>
+                <option v-if="editorMode === 'builtin'" value="cfgoodnet">CFGoodNet</option>
               </select>
             </div>
           </div>
-          <div class="form-row">
+          <div class="form-row" v-if="inboundForm.protocol !== 'cfdo' && inboundForm.protocol !== 'cfgoodnet'">
             <div class="form-group" style="flex:1">
               <label class="form-label">监听地址</label>
               <input class="input" v-model="inboundForm.listen" placeholder="127.0.0.1" />
@@ -291,7 +325,7 @@
               <input class="input" type="number" v-model.number="inboundForm.port" placeholder="1080" />
             </div>
           </div>
-          <div class="form-group">
+          <div class="form-group" v-if="editorMode === 'inbound'">
             <label class="form-label">入站标签（用于路由规则匹配）</label>
             <input class="input" v-model="inboundForm.tag" placeholder="my-inbound" />
           </div>
@@ -338,7 +372,103 @@
               </div>
             </div>
           </template>
-          <div class="form-group">
+          <template v-if="inboundForm.protocol === 'cfdo'">
+            <div class="form-group">
+              <label class="form-label">Worker 域名</label>
+              <input class="input" v-model="inboundForm.cfdo.workerDomain" placeholder="your-worker.workers.dev" />
+            </div>
+            <div class="form-group">
+              <label class="form-label">访问密钥</label>
+              <input class="input" v-model="inboundForm.cfdo.secret" placeholder="与 Worker SECRET_KEY 一致" />
+            </div>
+            <div class="form-group">
+              <label class="form-label">监听端口列表（每项可独立优选IP/域名）</label>
+              <div class="cfdo-listener-list">
+                <div v-for="(listener, idx) in inboundForm.cfdo.listeners" :key="idx" class="cfdo-listener-row">
+                  <input class="input cfdo-port-input" type="number" v-model.number="listener.listenPort" placeholder="端口，0=自动分配" />
+                  <input class="input" v-model="listener.workerIp" placeholder="优选IP/域名，留空=该端口不使用优选" />
+                  <button class="btn btn-light btn-sm icon-btn" type="button" title="复制上一行" @click="copyCfdoListener(idx)" :disabled="idx === 0">⧉</button>
+                  <button class="btn btn-light btn-sm icon-btn icon-btn-danger" type="button" title="删除该行" @click="removeCfdoListener(idx)">✕</button>
+                </div>
+              </div>
+              <button class="btn btn-light btn-sm" type="button" @click="addCfdoListener">＋ 添加监听端口</button>
+              <div class="form-tip">建议至少保留一项监听。端口写 0 表示自动分配。</div>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Path（可选）</label>
+              <input class="input" v-model="inboundForm.cfdo.path" placeholder="/api/tcp" />
+            </div>
+            <div class="form-group">
+              <label class="form-label">DO 复用分片数</label>
+              <input class="input" type="number" min="0" v-model.number="inboundForm.cfdo.doPoolSize" placeholder="32" />
+              <div class="form-tip">仅在命中 DO fallback 规则时生效。0 表示关闭分片复用；建议 16~128。</div>
+            </div>
+            <div class="form-group">
+              <label class="form-label" style="display:flex;align-items:center;gap:8px">
+                <input type="checkbox" v-model="inboundForm.cfdo.alwaysUseDo" />
+                始终走 DO（忽略 fallback 规则）
+              </label>
+              <div class="form-tip">开启后所有请求都走 DO；关闭后仅命中域名/后缀规则才走 DO。</div>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Reject 域名（HTTP/HTTPS/SOCKS）</label>
+              <textarea
+                class="input textarea"
+                v-model="inboundForm.cfdo.rejectDomainsText"
+                placeholder="ads.example.com&#10;*.tracker.example&#10;.telemetry.example"
+                rows="3" />
+              <div class="form-tip">命中目标域名时直接拒绝。支持精确域名、*.example.com 和 .example.com 后缀规则。</div>
+            </div>
+            <div class="form-group">
+              <label class="form-label">DO fallback 域名（HTTP/HTTPS/SOCKS）</label>
+              <textarea
+                class="input textarea"
+                v-model="inboundForm.cfdo.doFallbackDomainsText"
+                placeholder="download.example.com&#10;*.githubusercontent.com&#10;.example-cdn.com"
+                rows="3" />
+              <div class="form-tip">命中目标域名时直接走 DO。支持精确域名、*.example.com 和 .example.com 后缀规则。</div>
+            </div>
+            <div class="form-group">
+              <label class="form-label">DO fallback 文件后缀（明文 HTTP）</label>
+              <textarea
+                class="input textarea"
+                v-model="inboundForm.cfdo.doFallbackExtensionsText"
+                placeholder=".zip, .7z, .rar, .iso, .exe, .msi"
+                rows="2" />
+              <div class="form-tip">仅对代理可见完整 URL 的明文 HTTP 请求生效；HTTPS CONNECT/SOCKS 无法识别路径。</div>
+            </div>
+          </template>
+          <template v-if="inboundForm.protocol === 'cfgoodnet'">
+            <div class="form-group">
+              <label class="form-label">CF Proxy 地址（可选）</label>
+              <input class="input" v-model="inboundForm.cfgoodnet.cfProxy" placeholder="https://example.workers.dev" />
+            </div>
+            <div class="form-row">
+              <div class="form-group" style="flex:1">
+                <label class="form-label">CF 优选 IP（可选）</label>
+                <input class="input" v-model="inboundForm.cfgoodnet.cfGoodIp" placeholder="1.1.1.1" />
+              </div>
+              <div class="form-group" style="width:160px">
+                <label class="form-label">监听端口（可选）</label>
+                <input class="input" type="number" v-model.number="inboundForm.cfgoodnet.listenPort" placeholder="自动分配" />
+              </div>
+              <div class="form-group" style="width:180px">
+                <label class="form-label" style="display:flex;align-items:center;gap:8px">
+                  <input type="checkbox" v-model="inboundForm.cfgoodnet.enableXff" />
+                  启用 XFF
+                </label>
+              </div>
+            </div>
+            <div class="form-group">
+              <label class="form-label">规则（每行：pattern,action）</label>
+              <textarea class="input textarea" v-model="inboundForm.cfgoodnet.rulesText" placeholder="*.openai.com,cf_proxy&#10;*.example.com,reject" rows="4" />
+            </div>
+            <div class="form-group" style="display:flex; gap:8px; flex-wrap:wrap">
+              <button class="btn btn-light btn-sm" type="button" @click="downloadCfgoodnetCA">下载 CA 证书</button>
+              <button class="btn btn-light btn-sm" type="button" @click="importCfgoodnetCA">导入系统信任（Windows）</button>
+            </div>
+          </template>
+          <div class="form-group" v-if="editorMode === 'inbound'">
             <label class="form-label" style="display:flex;align-items:center;gap:8px">
               <input type="checkbox" v-model="inboundForm.sniffEnabled" />
               启用流量嗅探
@@ -353,7 +483,7 @@
     </div>
 
     <!-- 数据文件下载弹窗 -->
-    <div class="modal-overlay" v-if="showDataModal" @click.self="showDataModal = false">
+    <div class="modal-overlay" v-if="showDataModal" @mousedown.self="showDataModal = false">
       <div class="modal-box" style="width:560px">
         <div class="modal-header">
           <span class="modal-title">数据文件管理</span>
@@ -442,10 +572,20 @@ import { ref, reactive, onMounted, computed } from 'vue'
 import { useProxyStore } from '../stores/proxy'
 import { api } from '../api'
 
+const props = defineProps({
+  mode: {
+    type: String,
+    default: 'all',
+  },
+})
+
 const store = useProxyStore()
 
 const rules = ref([])
+const activeTab = ref(props.mode === 'rules' ? 'rules' : 'inbounds')
+const showModeTabs = computed(() => props.mode === 'all')
 const inbounds = ref([])
+const editorMode = ref('inbound') // inbound | builtin
 const showRuleModal = ref(false)
 const showInboundModal = ref(false)
 const showDataModal = ref(false)
@@ -465,6 +605,8 @@ const builtinHttp = reactive({ port: 20261, username: '', password: '', accounts
 const showBuiltinModal = ref(false)
 const builtinEditType = ref('socks')
 const builtinForm = reactive({ port: 20260, accounts: [] })
+const builtinStatusMap = reactive({})
+const builtinRestarting = reactive({})
 
 const dataFiles = ref([
   { type: 'geoip', label: 'geoip.dat', desc: 'IP 地理位置数据（geoip:cn 等）', exists: false },
@@ -498,14 +640,63 @@ function appendToTextarea(field, value) {
     ruleForm.value[field] = [...lines, value].join('\n')
   }
 }
+
+function parseExtensionList(text) {
+  const seen = new Set()
+  return String(text || '')
+    .split(/[\s,;]+/)
+    .map(s => s.trim().toLowerCase())
+    .filter(Boolean)
+    .map(s => s.startsWith('.') ? s : `.${s}`)
+    .filter(s => {
+      if (seen.has(s)) return false
+      seen.add(s)
+      return true
+    })
+}
+
+function parseDomainList(text) {
+  const seen = new Set()
+  return String(text || '')
+    .split(/[\s,;]+/)
+    .map(s => s.trim().toLowerCase())
+    .filter(Boolean)
+    .map(s => s.replace(/^https?:\/\//, '').split(/[/:]/)[0])
+    .map(s => s.replace(/^\*\./, '.'))
+    .map(s => s.replace(/\.+$/, ''))
+    .filter(Boolean)
+    .filter(s => {
+      if (seen.has(s)) return false
+      seen.add(s)
+      return true
+    })
+}
+
 const defaultInboundForm = () => ({
   id: '', name: '', tag: '', protocol: 'socks', listen: '127.0.0.1', port: 1080,
   udpEnabled: true, network: 'tcp,udp', followRedirect: false, sniffEnabled: true, sniffDest: [],
   username: '', password: '', accounts: [],
+  cfdo: { workerDomain: '', secret: '', workerIp: '', path: '/api/tcp', port: 0, listeners: [], doPoolSize: 32, alwaysUseDo: false, rejectDomainsText: '', doFallbackDomainsText: '', doFallbackExtensionsText: '' },
+  cfgoodnet: { listenHost: '127.0.0.1', listenPort: 0, cfProxy: '', cfGoodIp: '', enableXff: false, rulesText: '' },
 })
 
 const ruleForm = ref(defaultRuleForm())
 const inboundForm = ref(defaultInboundForm())
+const pureInbounds = computed(() => inbounds.value.filter(ib => {
+  const p = String(ib.protocol || '').toLowerCase()
+  return p !== 'cfdo' && p !== 'cfgoodnet'
+}))
+const taggedInbounds = computed(() => pureInbounds.value.filter(ib => String(ib.tag || '').trim()))
+const builtinOutbounds = computed(() => inbounds.value.filter(ib => {
+  const p = String(ib.protocol || '').toLowerCase()
+  return p === 'cfdo' || p === 'cfgoodnet'
+}))
+const inboundModalTitle = computed(() => {
+  if (editorMode.value === 'builtin') {
+    return editingInboundIdx.value >= 0 ? '编辑代理出站节点' : '添加代理出站节点'
+  }
+  return editingInboundIdx.value >= 0 ? '编辑入站' : '添加入站'
+})
 
 onMounted(async () => {
   await Promise.all([loadRules(), loadInbounds(), checkDataFiles()])
@@ -533,6 +724,19 @@ async function loadRules() {
 async function loadInbounds() {
   const { data } = await api.getCustomInbounds()
   inbounds.value = (data.inbounds || []).map(normalizeInbound)
+  await loadBuiltinProxyStatuses().catch(() => {})
+}
+
+async function loadBuiltinProxyStatuses() {
+  const { data } = await api.getBuiltinProxyStatuses()
+  const next = {}
+  ;(data.statuses || []).forEach(s => {
+    next[s.id] = s
+  })
+  Object.keys(builtinStatusMap).forEach(key => {
+    if (!next[key]) delete builtinStatusMap[key]
+  })
+  Object.assign(builtinStatusMap, next)
 }
 
 async function checkDataFiles() {
@@ -708,15 +912,39 @@ async function saveBuiltinInbound() {
 }
 
 function openAddInbound() {
+  editorMode.value = 'inbound'
   editingInboundIdx.value = -1
   inboundForm.value = defaultInboundForm()
   addInboundAccount()
   showInboundModal.value = true
 }
 
+function openAddBuiltinProxy() {
+  editorMode.value = 'builtin'
+  editingInboundIdx.value = -1
+  inboundForm.value = defaultInboundForm()
+  inboundForm.value.protocol = 'cfdo'
+  inboundForm.value.name = 'CFDO'
+  inboundForm.value.listen = '127.0.0.1'
+  showInboundModal.value = true
+}
+
 function editInbound(i) {
-  editingInboundIdx.value = i
-  inboundForm.value = normalizeInbound({ ...inbounds.value[i] })
+  editorMode.value = 'inbound'
+  const target = pureInbounds.value[i]
+  const idx = inbounds.value.findIndex(x => x.id === target.id)
+  editingInboundIdx.value = idx
+  inboundForm.value = normalizeInbound({ ...inbounds.value[idx] })
+  if (!inboundForm.value.accounts.length) addInboundAccount()
+  showInboundModal.value = true
+}
+
+function editBuiltinProxy(i) {
+  editorMode.value = 'builtin'
+  const target = builtinOutbounds.value[i]
+  const idx = inbounds.value.findIndex(x => x.id === target.id)
+  editingInboundIdx.value = idx
+  inboundForm.value = normalizeInbound({ ...inbounds.value[idx] })
   if (!inboundForm.value.accounts.length) addInboundAccount()
   showInboundModal.value = true
 }
@@ -736,6 +964,64 @@ async function saveInbound() {
     ib.username = ''
     ib.password = ''
   }
+  if (String(ib.protocol || '').toLowerCase() === 'cfdo') {
+    if (!String(ib.cfdo?.workerDomain || '').trim() || !String(ib.cfdo?.secret || '').trim()) {
+      alert('请填写 CFDO 的 Worker 域名和访问密钥')
+      return
+    }
+    ib.listen = '127.0.0.1'
+    ib.tag = ''
+    ib.sniffEnabled = false
+    const listeners = Array.isArray(ib.cfdo?.listeners) ? ib.cfdo.listeners : []
+    let cleanedListeners = listeners
+      .map(l => ({
+        listenPort: Number(l?.listenPort || 0),
+        workerIp: String(l?.workerIp || '').trim(),
+      }))
+      .filter(l => l.listenPort >= 0)
+      .filter((l, i, arr) => arr.findIndex(x => x.listenPort === l.listenPort) === i)
+    if (!cleanedListeners.length) {
+      cleanedListeners = [{ listenPort: 0, workerIp: '' }]
+    }
+    const primary = cleanedListeners[0] || { listenPort: 0, workerIp: '' }
+    ib.port = Number(primary.listenPort || 0)
+    ib.cfdo = {
+      workerDomain: ib.cfdo?.workerDomain || '',
+      secret: ib.cfdo?.secret || '',
+      workerIp: primary.workerIp || '',
+      path: ib.cfdo?.path || '/api/tcp',
+      port: Number(primary.listenPort || 0),
+      listeners: cleanedListeners,
+      doPoolSize: Math.max(0, Number(ib.cfdo?.doPoolSize || 0)),
+      alwaysUseDo: !!ib.cfdo?.alwaysUseDo,
+      rejectDomains: parseDomainList(ib.cfdo?.rejectDomainsText || ''),
+      doFallbackDomains: parseDomainList(ib.cfdo?.doFallbackDomainsText || ''),
+      doFallbackExtensions: parseExtensionList(ib.cfdo?.doFallbackExtensionsText || ''),
+    }
+  }
+  if (String(ib.protocol || '').toLowerCase() === 'cfgoodnet') {
+    ib.listen = '127.0.0.1'
+    ib.tag = ''
+    ib.sniffEnabled = false
+    ib.port = Number(ib.cfgoodnet?.listenPort || 0)
+    const rules = String(ib.cfgoodnet?.rulesText || '')
+      .split('\n')
+      .map(s => s.trim())
+      .filter(Boolean)
+      .map(line => {
+        const i = line.lastIndexOf(',')
+        if (i < 0) return { pattern: line, action: 'direct' }
+        return { pattern: line.slice(0, i).trim(), action: line.slice(i + 1).trim() || 'direct' }
+      })
+    ib.cfgoodnet = {
+      listenHost: '127.0.0.1',
+      listenPort: Number(ib.cfgoodnet?.listenPort || 0),
+      cfProxy: ib.cfgoodnet?.cfProxy || '',
+      cfGoodIp: ib.cfgoodnet?.cfGoodIp || '',
+      enableXff: !!ib.cfgoodnet?.enableXff,
+      rules,
+    }
+  }
   if (editingInboundIdx.value >= 0) {
     inbounds.value[editingInboundIdx.value] = ib
   } else {
@@ -744,11 +1030,89 @@ async function saveInbound() {
   await api.setCustomInbounds(inbounds.value)
   showInboundModal.value = false
   await loadInbounds()
+  await store.fetchAll()
 }
 
 async function deleteInbound(i) {
-  inbounds.value.splice(i, 1)
+  const target = pureInbounds.value[i]
+  const idx = inbounds.value.findIndex(x => x.id === target.id)
+  if (idx >= 0) inbounds.value.splice(idx, 1)
   await api.setCustomInbounds(inbounds.value)
+  await loadInbounds()
+  await store.fetchAll()
+}
+
+async function deleteBuiltinProxy(i) {
+  const target = builtinOutbounds.value[i]
+  const idx = inbounds.value.findIndex(x => x.id === target.id)
+  if (idx >= 0) inbounds.value.splice(idx, 1)
+  await api.setCustomInbounds(inbounds.value)
+  await loadInbounds()
+  await store.fetchAll()
+}
+
+function builtinStatusText(id) {
+  const s = builtinStatusMap[id]
+  if (!s) return '状态未知'
+  if (s.healthy) return '运行正常'
+  if (s.running) return '监听异常'
+  return '未运行'
+}
+
+function builtinStatusClass(id) {
+  const s = builtinStatusMap[id]
+  if (!s) return 'builtin-status-unknown'
+  if (s.healthy) return 'builtin-status-ok'
+  if (s.running) return 'builtin-status-warn'
+  return 'builtin-status-down'
+}
+
+async function restartBuiltinProxy(ib) {
+  if (!ib?.id) return
+  builtinRestarting[ib.id] = true
+  try {
+    await api.restartBuiltinProxy(ib.id)
+    await loadInbounds()
+    await store.fetchAll()
+  } catch (e) {
+    alert('重启失败: ' + (e?.response?.data?.error || e.message))
+  } finally {
+    delete builtinRestarting[ib.id]
+  }
+}
+
+function suggestedProxyOutboundName(ib) {
+  const proto = String(ib?.protocol || 'proxy').toLowerCase()
+  const suffix = String(ib?.id || ib?.name || proto).slice(0, 8)
+  return `${proto}-${suffix}`
+}
+
+async function createRuleOutboundForProxy(ib) {
+  if (!ib?.id) return
+  try {
+    await loadInbounds()
+    const { data } = await api.getServers()
+    const servers = data.servers || []
+    const sourcePrefix = `inbound:${ib.id}`
+    const index = servers.findIndex(s => s.source === sourcePrefix || String(s.source || '').startsWith(sourcePrefix + ':'))
+    if (index < 0) {
+      alert('未找到该代理节点，请先保存并确认状态为运行正常')
+      return
+    }
+    const outboundName = suggestedProxyOutboundName(ib)
+    await store.fetchAll()
+    if (!store.outbounds.some(o => o.name === outboundName)) {
+      await api.createOutbound({ name: outboundName })
+    }
+    await api.connectOutbound(outboundName, {
+      targetType: 'node',
+      nodeRef: { type: 'server', index, sub: 0 },
+    })
+    await store.fetchAll()
+    alert(`已创建/更新出站「${outboundName}」，分流规则中可选择该出站`)
+  } catch (e) {
+    alert('创建分流出站失败: ' + (e?.response?.data?.error || e.message))
+  }
 }
 
 function normalizeInbound(ib) {
@@ -765,9 +1129,44 @@ function normalizeInbound(ib) {
       password: String(ib.password || ''),
     })
   }
+  const legacyCfdoPort = Number(ib.cfdo?.port || 0)
+  const legacyCfdoWorkerIP = String(ib.cfdo?.workerIp || '')
+  const cfdoListeners = Array.isArray(ib.cfdo?.listeners)
+    ? ib.cfdo.listeners.map(l => ({
+        listenPort: Number(l?.listenPort || 0),
+        workerIp: String(l?.workerIp || ''),
+      }))
+    : []
+  if (!cfdoListeners.length) {
+    cfdoListeners.push({
+      listenPort: legacyCfdoPort >= 0 ? legacyCfdoPort : 0,
+      workerIp: legacyCfdoWorkerIP,
+    })
+  }
   return {
     ...defaultInboundForm(),
     ...ib,
+    cfdo: {
+      workerDomain: ib.cfdo?.workerDomain || '',
+      secret: ib.cfdo?.secret || '',
+      workerIp: legacyCfdoWorkerIP,
+      path: ib.cfdo?.path || '/api/tcp',
+      port: legacyCfdoPort,
+      listeners: cfdoListeners,
+      doPoolSize: Number(ib.cfdo?.doPoolSize || 32),
+      alwaysUseDo: !!ib.cfdo?.alwaysUseDo,
+      rejectDomainsText: Array.isArray(ib.cfdo?.rejectDomains) ? ib.cfdo.rejectDomains.join('\n') : '',
+      doFallbackDomainsText: Array.isArray(ib.cfdo?.doFallbackDomains) ? ib.cfdo.doFallbackDomains.join('\n') : '',
+      doFallbackExtensionsText: Array.isArray(ib.cfdo?.doFallbackExtensions) ? ib.cfdo.doFallbackExtensions.join(', ') : '',
+    },
+    cfgoodnet: {
+      listenHost: ib.cfgoodnet?.listenHost || '127.0.0.1',
+      listenPort: Number(ib.cfgoodnet?.listenPort || 0),
+      cfProxy: ib.cfgoodnet?.cfProxy || '',
+      cfGoodIp: ib.cfgoodnet?.cfGoodIp || '',
+      enableXff: !!ib.cfgoodnet?.enableXff,
+      rulesText: Array.isArray(ib.cfgoodnet?.rules) ? ib.cfgoodnet.rules.map(r => `${r.pattern || ''},${r.action || 'direct'}`).join('\n') : '',
+    },
     accounts: normalized,
   }
 }
@@ -784,6 +1183,29 @@ function addInboundAccount() {
 
 function removeInboundAccount(idx) {
   inboundForm.value.accounts.splice(idx, 1)
+}
+
+function addCfdoListener() {
+  if (!Array.isArray(inboundForm.value.cfdo.listeners)) inboundForm.value.cfdo.listeners = []
+  inboundForm.value.cfdo.listeners.push({ listenPort: 0, workerIp: '' })
+}
+
+function removeCfdoListener(idx) {
+  if (!Array.isArray(inboundForm.value.cfdo.listeners)) return
+  inboundForm.value.cfdo.listeners.splice(idx, 1)
+  if (!inboundForm.value.cfdo.listeners.length) {
+    inboundForm.value.cfdo.listeners.push({ listenPort: 0, workerIp: '' })
+  }
+}
+
+function copyCfdoListener(idx) {
+  if (!Array.isArray(inboundForm.value.cfdo.listeners)) return
+  if (idx <= 0 || idx >= inboundForm.value.cfdo.listeners.length) return
+  const prev = inboundForm.value.cfdo.listeners[idx - 1] || { listenPort: 0, workerIp: '' }
+  inboundForm.value.cfdo.listeners[idx] = {
+    listenPort: Number(prev.listenPort || 0),
+    workerIp: String(prev.workerIp || ''),
+  }
 }
 
 function normalizeAccounts(accounts, fallbackUser, fallbackPass) {
@@ -840,12 +1262,28 @@ async function downloadData(type) {
   }
   delete downloading[type]
 }
+
+function downloadCfgoodnetCA() {
+  api.downloadCfGoodNetCA()
+}
+
+async function importCfgoodnetCA() {
+  try {
+    const { data } = await api.importCfGoodNetCA()
+    alert(data?.message || '导入成功')
+  } catch (e) {
+    const detail = e?.response?.data?.detail || ''
+    const err = e?.response?.data?.error || e?.message || '导入失败'
+    alert(detail ? `${err}\n\n${detail}` : err)
+  }
+}
 </script>
 
 <style scoped>
 .rules-page {
   display: flex;
-  gap: 20px;
+  flex-direction: column;
+  gap: 12px;
   padding: 20px 24px;
   height: 100%;
   overflow-y: auto;
@@ -855,8 +1293,53 @@ async function downloadData(type) {
   width: 100%;
 }
 
-.rules-section { flex: 1.5; min-width: 0; display: flex; flex-direction: column; gap: 12px; }
-.inbounds-section { flex: 1; min-width: 280px; display: flex; flex-direction: column; gap: 12px; }
+.page-tabs {
+  display: inline-flex;
+  gap: 6px;
+  background: #fff;
+  border: 1px solid #e8e8e8;
+  border-radius: 8px;
+  padding: 6px;
+  width: fit-content;
+}
+.page-tab {
+  border: 1px solid transparent;
+  background: #fff;
+  color: #595959;
+  border-radius: 6px;
+  font-size: 13px;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+.page-tab-active {
+  background: #e6f4ff;
+  border-color: #91caff;
+  color: #1677ff;
+  font-weight: 600;
+}
+
+.rules-section, .inbounds-section { min-width: 0; display: flex; flex-direction: column; gap: 12px; }
+.builtin-status-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 18px;
+  border: 1px solid transparent;
+}
+.builtin-status-ok { color: #237804; background: #f6ffed; border-color: #b7eb8f; }
+.builtin-status-warn { color: #ad6800; background: #fffbe6; border-color: #ffe58f; }
+.builtin-status-down { color: #a8071a; background: #fff1f0; border-color: #ffa39e; }
+.builtin-status-unknown { color: #595959; background: #f5f5f5; border-color: #d9d9d9; }
+.builtin-status-error {
+  max-width: 240px;
+  color: #8c8c8c;
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 .section-header {
   display: flex; align-items: center; justify-content: space-between;
@@ -991,6 +1474,7 @@ async function downloadData(type) {
   flex-direction: column;
   gap: 8px;
 }
+
 .auth-account-row {
   display: grid;
   grid-template-columns: 1fr 1fr auto;
@@ -1031,6 +1515,41 @@ async function downloadData(type) {
 .dl-bar { height: 4px; background: #f0f0f0; border-radius: 2px; overflow: hidden; }
 .dl-fill { height: 100%; background: #1677ff; border-radius: 2px; transition: width .3s; }
 .dl-msg { font-size: 11px; color: #8c8c8c; }
+.cfdo-listener-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.cfdo-listener-row {
+  display: grid;
+  grid-template-columns: 170px 1fr auto auto;
+  gap: 8px;
+  align-items: center;
+}
+.cfdo-listener-row .btn {
+  white-space: nowrap;
+}
+.icon-btn {
+  width: 30px;
+  min-width: 30px;
+  height: 28px;
+  padding: 0;
+  justify-content: center;
+  font-size: 14px;
+}
+.icon-btn-danger {
+  color: #ff4d4f;
+  border-color: #ffccc7;
+}
+.icon-btn-danger:hover {
+  color: #fff;
+  background: #ff4d4f;
+  border-color: #ff4d4f;
+}
+.cfdo-port-input {
+  min-width: 0;
+}
 
 .action-btn {
   display: inline-flex; align-items: center; gap: 4px;
@@ -1040,4 +1559,55 @@ async function downloadData(type) {
 .action-btn:hover { border-color: #1677ff; color: #1677ff; background: #f5f8ff; }
 .action-btn-primary { background: #1677ff; color: #fff; border-color: #1677ff; }
 .action-btn-primary:hover { background: #0958d9; border-color: #0958d9; color: #fff; }
+
+@media (max-width: 900px) {
+  .rules-page {
+    padding: 12px 10px;
+    gap: 10px;
+  }
+  .page-tabs {
+    width: 100%;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+  }
+  .section-header {
+    gap: 8px;
+    flex-wrap: wrap;
+    align-items: flex-start;
+  }
+  .section-actions {
+    width: 100%;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .data-files-bar {
+    flex-wrap: wrap;
+  }
+  .inbound-info {
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .inbound-row {
+    align-items: flex-start;
+    gap: 8px;
+  }
+  .rule-row {
+    align-items: flex-start;
+  }
+  .rule-ops {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+  .form-row {
+    flex-direction: column;
+    gap: 0;
+  }
+  .auth-account-row {
+    grid-template-columns: 1fr;
+  }
+  .cfdo-listener-row {
+    grid-template-columns: 1fr;
+  }
+}
 </style>
+

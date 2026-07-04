@@ -9,16 +9,17 @@ gui/node_modules/
 gui/dist/
 
 # Go build outputs
+service/dist/
 service/.gocache/
 service/.gomodcache/
 service/*.exe
+service/*.exe~
 service/*.dll
 service/*.so
 service/*.dylib
 service/*.test
 service/*.out
-proxystation-*.exe
-*.exe~
+service/cf-proxy-src/cf-proxy-poc/*.exe
 
 # Runtime data / secrets
 data/

@@ -11,7 +11,7 @@ type SelectionMode string
 
 const (
 	// ModeManual 手动指定某个节点
-	ModeManual    SelectionMode = "manual"
+	ModeManual SelectionMode = "manual"
 	// ModeLeastPing 自动选择分组内延迟最低的节点
 	ModeLeastPing SelectionMode = "leastping"
 	// ModeRoundRobin 轮询分组内节点
@@ -20,7 +20,7 @@ const (
 
 // OutboundTarget 出站绑定的目标，可以是单个节点或一个分组
 type OutboundTarget struct {
-	// "node" 或 "group"
+	// "node" | "group" | "special"
 	TargetType string `json:"targetType"`
 
 	// TargetType == "node" 时有效
@@ -32,6 +32,40 @@ type OutboundTarget struct {
 
 	// 当前实际使用的节点（group 模式下由 observatory 维护）
 	ActiveNodeRef *NodeRef `json:"activeNodeRef,omitempty"`
+
+	// TargetType == "special" 时有效
+	SpecialType string             `json:"specialType,omitempty"` // "cfgoodnet" | "cfdo"
+	CfGoodNet   *CfGoodNetOutbound `json:"cfgoodnet,omitempty"`
+	CfDO        *CfDOOutbound      `json:"cfdo,omitempty"`
+}
+
+type CfGoodNetRule struct {
+	Pattern string `json:"pattern"`
+	Action  string `json:"action"` // "direct" | "reject" | "cf_proxy"
+}
+
+type CfGoodNetOutbound struct {
+	InboundID  string          `json:"inboundId,omitempty"` // 可选：引用 cfgoodnet 自定义入站
+	ListenHost string          `json:"listenHost,omitempty"`
+	ListenPort int             `json:"listenPort,omitempty"`
+	CfProxy    string          `json:"cfProxy,omitempty"`
+	CfGoodIP   string          `json:"cfGoodIp,omitempty"`
+	EnableXFF  bool            `json:"enableXff,omitempty"`
+	Rules      []CfGoodNetRule `json:"rules,omitempty"`
+}
+
+type CfDOOutbound struct {
+	// 可选：引用已有的 cfdo 类型自定义入站 ID
+	InboundID string `json:"inboundId,omitempty"`
+
+	ListenHost   string `json:"listenHost,omitempty"` // 强制归一到 127.0.0.1
+	ListenPort   int    `json:"listenPort,omitempty"` // 0 表示自动选端口
+	Listeners    []CfDOListener `json:"listeners,omitempty"` // 多监听端口与独立优选地址
+	WorkerDomain string `json:"workerDomain,omitempty"`
+	Secret       string `json:"secret,omitempty"`
+	Path         string `json:"path,omitempty"` // 默认 /api/tcp
+	WorkerIP     string `json:"workerIp,omitempty"`
+	UseBareWS    bool   `json:"useBareWs,omitempty"`
 }
 
 // NodeRef 指向一个具体节点

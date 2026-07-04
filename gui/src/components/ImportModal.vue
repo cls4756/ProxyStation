@@ -1,5 +1,5 @@
 <template>
-  <div class="modal-overlay" @click.self="$emit('close')">
+  <div class="modal-overlay" @mousedown.self="$emit('close')">
     <div class="modal-box">
       <div class="modal-header">
         <span class="modal-title">导入</span>
@@ -113,3 +113,4 @@ async function doImport() {
 .result-ok  { background: #effaf5; color: #257953; border: 1px solid #48c774; }
 .result-error { background: #fff5f7; color: #cc0f35; border: 1px solid #f14668; }
 </style>
+

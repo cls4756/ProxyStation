@@ -79,4 +79,4 @@ These values are applied at startup and stored in hashed form where applicable.
 
 ## License
 
-This project is licensed under GNU GPL v3.0. See `LICENSE` for details.
+This project is licensed under the Apache License 2.0. See `LICENSE` for details.

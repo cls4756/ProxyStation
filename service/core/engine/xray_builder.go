@@ -36,8 +36,13 @@ func BuildXrayConfig(setting *configure.Setting) (*coreObj.Config, error) {
 				Tag: "http", Port: setting.HttpPort, Listen: listenAddr, Protocol: "http",
 				Sniffing: builtinHTTPSniffing,
 			},
+			{
+				Tag: ProbeInboundTag, Port: ProbeInboundSocksPort, Listen: ProbeInboundListen, Protocol: "socks",
+				Settings: &coreObj.InboundSettings{UDP: false},
+			},
 		},
 		Outbounds: []coreObj.OutboundObject{
+			{Tag: ProbeOutboundName, Protocol: "freedom"},
 			{Tag: "direct", Protocol: "freedom"},
 			{Tag: "block", Protocol: "blackhole"},
 		},
@@ -55,7 +60,7 @@ func BuildXrayConfig(setting *configure.Setting) (*coreObj.Config, error) {
 	httpAccounts := setting.HTTPAuthAccounts()
 	if len(httpAccounts) > 0 {
 		cfg.Inbounds[1].Settings = &coreObj.InboundSettings{
-			Auth: "basic",
+			Auth:     "basic",
 			Accounts: make([]coreObj.InboundAccount, 0, len(httpAccounts)),
 		}
 		for _, a := range httpAccounts {
@@ -67,6 +72,11 @@ func BuildXrayConfig(setting *configure.Setting) (*coreObj.Config, error) {
 
 	// 添加自定义入站
 	for _, ci := range configure.GetCustomInbounds() {
+		p := strings.ToLower(strings.TrimSpace(ci.Protocol))
+		if p == "cfdo" || p == "cfgoodnet" {
+			// CFDO/cfgoodnet 入站由内置 sidecar 托管，不写入 xray inbounds。
+			continue
+		}
 		ib := coreObj.Inbound{
 			Tag:      ci.Tag,
 			Port:     ci.Port,
@@ -97,6 +107,7 @@ func BuildXrayConfig(setting *configure.Setting) (*coreObj.Config, error) {
 
 	// 基础路由规则：私有 IP 直连
 	cfg.Routing.Rules = []coreObj.RoutingRule{
+		{Type: "field", OutboundTag: ProbeOutboundName, InboundTag: []string{ProbeInboundTag}},
 		{Type: "field", OutboundTag: "direct", IP: []string{
 			"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
 			"127.0.0.0/8", "169.254.0.0/16", "224.0.0.0/4", "240.0.0.0/4",
@@ -113,11 +124,7 @@ func BuildXrayConfig(setting *configure.Setting) (*coreObj.Config, error) {
 		if o == nil {
 			continue
 		}
-		ref := resolveActiveNode(o)
-		if ref == nil {
-			continue
-		}
-		s := getServerRaw(ref)
+		s := resolveOutboundServerRaw(name, o)
 		if s == nil {
 			continue
 		}
@@ -125,7 +132,33 @@ func BuildXrayConfig(setting *configure.Setting) (*coreObj.Config, error) {
 		if err != nil {
 			return nil, fmt.Errorf("outbound %v: %w", name, err)
 		}
-		cfg.Outbounds = append([]coreObj.OutboundObject{ob}, cfg.Outbounds...)
+		if LogCallback != nil {
+			port := 0
+			server := ""
+			if len(ob.Settings.Servers) > 0 {
+				server = ob.Settings.Servers[0].Address
+				port = ob.Settings.Servers[0].Port
+			} else if len(ob.Settings.Vnext) > 0 {
+				server = ob.Settings.Vnext[0].Address
+				port = ob.Settings.Vnext[0].Port
+			}
+			LogCallback(fmt.Sprintf("📘 xray outbound %s => protocol=%s server=%s port=%d", name, ob.Protocol, server, port))
+		}
+		if name == ProbeOutboundName {
+			replaced := false
+			for i := range cfg.Outbounds {
+				if cfg.Outbounds[i].Tag == ProbeOutboundName {
+					cfg.Outbounds[i] = ob
+					replaced = true
+					break
+				}
+			}
+			if !replaced {
+				cfg.Outbounds = append([]coreObj.OutboundObject{ob}, cfg.Outbounds...)
+			}
+		} else {
+			cfg.Outbounds = append([]coreObj.OutboundObject{ob}, cfg.Outbounds...)
+		}
 		validOutboundTags[name] = true
 		if name == "proxy" {
 			cfg.Routing.Rules = append(cfg.Routing.Rules,
@@ -186,7 +219,7 @@ func xrayServerToOutbound(s *configure.ServerRaw, tag string) (coreObj.OutboundO
 		return xrayTrojan(s, tag)
 	case "socks5", "socks", "socks4":
 		return xraySocks(s, tag)
-	case "http", "https", "naive":
+	case "http", "https", "naive", "cfgoodnet":
 		return xrayHTTP(s, tag)
 	default:
 		return coreObj.OutboundObject{}, fmt.Errorf("xray does not support: %v", s.Type)
@@ -267,30 +300,16 @@ func xrayVless(s *configure.ServerRaw, tag string) (coreObj.OutboundObject, erro
 }
 
 func xraySS(s *configure.ServerRaw, tag string) (coreObj.OutboundObject, error) {
-	link := s.Link
-	if idx := strings.Index(link, "#"); idx != -1 {
-		link = link[:idx]
-	}
-	link = strings.TrimPrefix(link, "ss://")
-	var method, password, host string
-	var port int
-	if atIdx := strings.LastIndex(link, "@"); atIdx != -1 {
-		userinfo := link[:atIdx]
-		hostport := link[atIdx+1:]
-		decoded, err := b64Decode(userinfo)
-		if err != nil {
-			decoded = userinfo
-		}
-		parts := strings.SplitN(decoded, ":", 2)
-		if len(parts) == 2 {
-			method, password = parts[0], parts[1]
-		}
-		host, port = splitHostPort(hostport)
+	ss, err := parseShadowsocksEndpoint(s)
+	if err != nil {
+		return coreObj.OutboundObject{}, err
 	}
 	return coreObj.OutboundObject{
 		Tag: tag, Protocol: "shadowsocks",
 		Settings: coreObj.OutboundSettings{
-			Servers: []coreObj.ServerObject{{Address: host, Port: port, Password: password, Method: method}},
+			Servers: []coreObj.ServerObject{{
+				Address: ss.Host, Port: ss.Port, Password: ss.Password, Method: ss.Method,
+			}},
 		},
 	}, nil
 }
@@ -414,8 +433,11 @@ func xrayHTTP(s *configure.ServerRaw, tag string) (coreObj.OutboundObject, error
 			s.Type, s.Host, s.Port, s.Link[:min(len(s.Link), 100)]))
 	}
 
-	// 对于 clash:// 或 singbox:// 格式，需要从 Link 中提取凭证
-	if strings.HasPrefix(s.Link, "clash://") {
+	if strings.ToLower(s.Type) == "cfgoodnet" {
+		host = s.Host
+		port = s.Port
+	} else if strings.HasPrefix(s.Link, "clash://") {
+		// 对于 clash:// 或 singbox:// 格式，需要从 Link 中提取凭证
 		host = s.Host
 		port = s.Port
 		username, password = extractClashCredentials(s.Link)

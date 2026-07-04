@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -9,18 +10,24 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/ProxyStation/proxystation/core/cfdo"
+	"github.com/ProxyStation/proxystation/core/cfgoodnet"
 	"github.com/ProxyStation/proxystation/core/engine"
 	"github.com/ProxyStation/proxystation/db/configure"
 	"github.com/ProxyStation/proxystation/pkg/observatory"
+	"github.com/ProxyStation/proxystation/pkg/probe"
 	"github.com/ProxyStation/proxystation/pkg/subscription"
 	"github.com/gin-gonic/gin"
 	gonanoid "github.com/matoous/go-nanoid"
+	xproxy "golang.org/x/net/proxy"
 )
 
 // 日志缓冲区和订阅者管理
@@ -34,6 +41,7 @@ var (
 	logQueue              = make(chan queuedLogEntry, 1024)
 	logDroppedCount int
 	logWorkerOnce   sync.Once
+	probeCoreMu     sync.Mutex
 )
 
 type queuedLogEntry struct {
@@ -204,6 +212,17 @@ func importAuto(c *gin.Context) {
 			subURLs = append(subURLs, line)
 		} else if isNodeLink(line) {
 			nodeLinks = append(nodeLinks, line)
+		}
+	}
+
+	if len(subURLs) == 0 && len(nodeLinks) == 0 {
+		if servers, _, err := subscription.Parse([]byte(strings.TrimSpace(req.Content)), configure.FormatAuto); err == nil && len(servers) > 0 {
+			for _, s := range servers {
+				if strings.TrimSpace(s.Link) == "" {
+					continue
+				}
+				nodeLinks = append(nodeLinks, s.Link)
+			}
 		}
 	}
 
@@ -484,6 +503,58 @@ func deleteServers(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+func downloadCfGoodNetCA(c *gin.Context) {
+	dataDir := engine.DataDir()
+	if strings.TrimSpace(dataDir) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "data directory not initialized"})
+		return
+	}
+	certPath, err := cfgoodnet.EnsureCA(dataDir)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if _, err := os.Stat(certPath); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "ca certificate not found"})
+		return
+	}
+	c.Header("Content-Type", "application/x-x509-ca-cert")
+	c.Header("Content-Disposition", "attachment; filename=cfgoodnet-ca.crt")
+	c.File(certPath)
+}
+
+func importCfGoodNetCAToSystem(c *gin.Context) {
+	if runtime.GOOS != "windows" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "only supported on windows"})
+		return
+	}
+	dataDir := engine.DataDir()
+	if strings.TrimSpace(dataDir) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "data directory not initialized"})
+		return
+	}
+	certPath, err := cfgoodnet.EnsureCA(dataDir)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	cmd := exec.Command("certutil", "-user", "-addstore", "Root", certPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":  "import failed",
+			"detail": string(out),
+		})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"ok":      true,
+		"message": "CA imported to CurrentUser Root store",
+		"detail":  string(out),
+	})
 }
 
 // editServer 修改手动节点的名称或链接
@@ -911,6 +982,7 @@ func fetchSubscription(index int, sub *configure.SubscriptionRaw) {
 	}
 
 	// 为每个节点标记来源
+	configure.PreserveServerProbeResults(sub.Servers, servers)
 	for i := range servers {
 		servers[i].Source = sub.ID
 	}
@@ -936,6 +1008,7 @@ func fetchSubscription(index int, sub *configure.SubscriptionRaw) {
 			group.Servers = refs
 			_ = configure.SetGroup(groupIndex, group)
 		}
+		observatory.OnGroupUpdated(sub.GroupID)
 	}
 }
 
@@ -1093,12 +1166,20 @@ func getOutbounds(c *gin.Context) {
 	names := configure.GetOutboundNames()
 	var outbounds []*configure.Outbound
 	for _, name := range names {
+		if name == engine.ProbeOutboundName {
+			continue
+		}
 		o := configure.GetOutbound(name)
 		if o == nil {
 			o = &configure.Outbound{
 				Name:   name,
 				Target: configure.OutboundTarget{},
 			}
+		}
+		if o.Target.TargetType == "special" {
+			o.Target = configure.OutboundTarget{}
+			_ = configure.SetOutbound(name, o)
+			observatory.OnOutboundUpdated(name)
 		}
 		outbounds = append(outbounds, o)
 	}
@@ -1198,13 +1279,20 @@ func disconnectOutbound(c *gin.Context) {
 func pingNodes(c *gin.Context) {
 	var req struct {
 		Refs []configure.NodeRef `json:"refs"`
+		Mode string              `json:"mode"` // "fast" | "real"
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	addLog(fmt.Sprintf("⚡ 开始测速 %d 个节点...", len(req.Refs)))
+	mode := strings.ToLower(strings.TrimSpace(req.Mode))
+	strictProbeMode := mode == "real"
+	if strictProbeMode {
+		addLog(fmt.Sprintf("⚡ 开始真连接探测 %d 个节点...", len(req.Refs)))
+	} else {
+		addLog(fmt.Sprintf("⚡ 开始快速探测 %d 个节点...", len(req.Refs)))
+	}
 
 	type result struct {
 		Ref     configure.NodeRef `json:"ref"`
@@ -1222,7 +1310,10 @@ func pingNodes(c *gin.Context) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			lat := probeNodeLatency(ref)
+			lat := probeNodeLatency(ref, strictProbeMode)
+			if strictProbeMode {
+				lat = probeNodeLatencyViaCore(ref)
+			}
 			mu.Lock()
 			results = append(results, result{Ref: ref, Latency: lat})
 			mu.Unlock()
@@ -1231,7 +1322,11 @@ func pingNodes(c *gin.Context) {
 		}()
 	}
 	wg.Wait()
-	addLog(fmt.Sprintf("✅ 测速完成"))
+	if strictProbeMode {
+		addLog("✅ 真连接探测完成")
+	} else {
+		addLog("✅ 快速探测完成")
+	}
 	c.JSON(http.StatusOK, gin.H{"results": results})
 }
 
@@ -1247,6 +1342,9 @@ func pingGroup(c *gin.Context) {
 		return
 	}
 
+	mode := strings.ToLower(strings.TrimSpace(c.Query("mode")))
+	strictProbeMode := mode == "real"
+
 	type result struct {
 		Ref     configure.ServerRef `json:"ref"`
 		Latency int                 `json:"latency"`
@@ -1257,14 +1355,16 @@ func pingGroup(c *gin.Context) {
 		mu      sync.Mutex
 		results []result
 	)
-
 	for _, ref := range group.Servers {
 		ref := ref
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			nodeRef := configure.NodeRef{Type: ref.Type, Index: ref.Index, Sub: ref.Sub}
-			lat := probeNodeLatency(nodeRef)
+			lat := probeNodeLatency(nodeRef, strictProbeMode)
+			if strictProbeMode {
+				lat = probeNodeLatencyViaCore(nodeRef)
+			}
 			mu.Lock()
 			results = append(results, result{Ref: ref, Latency: lat})
 			mu.Unlock()
@@ -1275,63 +1375,177 @@ func pingGroup(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"results": results})
 }
 
-// probeNodeLatency 测速，先尝试 HTTP，失败则用 TCP，返回 ms，-1 表示超时
-func probeNodeLatency(ref configure.NodeRef) int {
-	var host string
-	var port int
+// probeNodeLatency 协议级可用性探测，返回延迟 ms，-1 表示失败
+func probeNodeLatency(ref configure.NodeRef, strictProbeMode bool) int {
+	const fastProbeTimeout = 1200 * time.Millisecond
 	switch ref.Type {
 	case "server":
 		s := configure.GetServer(ref.Index)
 		if s == nil {
 			return -1
 		}
-		host, port = s.Host, s.Port
+		// 两阶段：先快速连通探测，失败则快速返回；成功再进入严格验证。
+		if strictProbeMode && !probe.FastReachable(s, fastProbeTimeout) {
+			return -1
+		}
+		if strictProbeMode && probe.SupportsRealProbe(s.Type) {
+			return probe.ProbeServer(s)
+		}
+		return probe.ProbeServer(s)
 	case "sub_server":
 		sub := configure.GetSubscription(ref.Sub)
 		if sub == nil || ref.Index >= len(sub.Servers) {
 			return -1
 		}
 		s := sub.Servers[ref.Index]
-		host, port = s.Host, s.Port
+		if strictProbeMode && !probe.FastReachable(&s, fastProbeTimeout) {
+			return -1
+		}
+		if strictProbeMode && probe.SupportsRealProbe(s.Type) {
+			return probe.ProbeServer(&s)
+		}
+		return probe.ProbeServer(&s)
 	default:
 		return -1
 	}
-	if host == "" || port == 0 {
-		return -1
-	}
-
-	// 先尝试 HTTP 测试（更准确）
-	latency := probeHTTP(host, port)
-	if latency > 0 {
-		return latency
-	}
-
-	// HTTP 失败则用 TCP 测试
-	return probeTCP(host, port)
 }
 
-// probeHTTP 通过 HTTP 请求测试延迟
-func probeHTTP(host string, port int) int {
-	url := fmt.Sprintf("http://%s:%d/", host, port)
+func probeNodeLatencyViaCore(ref configure.NodeRef) int {
+	probeCoreMu.Lock()
+	defer probeCoreMu.Unlock()
+
+	if !engine.Manager.IsRunning() {
+		return -1
+	}
+	// 先快速预筛，避免无意义重启内核
+	if !fastReachableRef(ref) {
+		return -1
+	}
+	if err := ensureProbeOutboundForNode(ref); err != nil {
+		return -1
+	}
+	targets := parseProbeTargets(configure.GetSettingNotNil().ProbeTargets)
+	if len(targets) == 0 {
+		targets = []string{"www.gstatic.com", "www.google.com", "www.youtube.com", "cp.cloudflare.com", "example.com"}
+	}
+	for _, host := range targets {
+		if ms := probeViaCoreSocks(host, 4500*time.Millisecond); ms > 0 {
+			return ms
+		}
+	}
+	return -1
+}
+
+func fastReachableRef(ref configure.NodeRef) bool {
+	const fastProbeTimeout = 1200 * time.Millisecond
+	switch ref.Type {
+	case "server":
+		s := configure.GetServer(ref.Index)
+		if s == nil {
+			return false
+		}
+		return probe.FastReachable(s, fastProbeTimeout)
+	case "sub_server":
+		sub := configure.GetSubscription(ref.Sub)
+		if sub == nil || ref.Index < 0 || ref.Index >= len(sub.Servers) {
+			return false
+		}
+		s := sub.Servers[ref.Index]
+		return probe.FastReachable(&s, fastProbeTimeout)
+	default:
+		return false
+	}
+}
+
+func ensureProbeOutboundForNode(ref configure.NodeRef) error {
+	_ = configure.AddOutbound(engine.ProbeOutboundName)
+	if cur := configure.GetOutbound(engine.ProbeOutboundName); cur != nil &&
+		cur.Target.TargetType == "node" && nodeRefEqual(cur.Target.NodeRef, &ref) {
+		return nil
+	}
+	o := &configure.Outbound{
+		Name: engine.ProbeOutboundName,
+		Target: configure.OutboundTarget{
+			TargetType: "node",
+			NodeRef:    &ref,
+		},
+	}
+	if err := configure.SetOutbound(engine.ProbeOutboundName, o); err != nil {
+		return err
+	}
+	observatory.OnOutboundUpdated(engine.ProbeOutboundName)
+	return engine.Manager.Restart()
+}
+
+func nodeRefEqual(a, b *configure.NodeRef) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	return a.Type == b.Type && a.Index == b.Index && a.Sub == b.Sub
+}
+
+func parseProbeTargets(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	parts := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ';' || r == '\n' || r == '\r' || r == '\t' || r == ' '
+	})
+	out := make([]string, 0, len(parts))
+	seen := map[string]struct{}{}
+	for _, p := range parts {
+		h := strings.ToLower(strings.TrimSpace(p))
+		h = strings.TrimPrefix(h, "https://")
+		h = strings.TrimPrefix(h, "http://")
+		if i := strings.Index(h, "/"); i >= 0 {
+			h = h[:i]
+		}
+		if h == "" {
+			continue
+		}
+		if _, ok := seen[h]; ok {
+			continue
+		}
+		seen[h] = struct{}{}
+		out = append(out, h)
+	}
+	return out
+}
+
+func probeViaCoreSocks(host string, timeout time.Duration) int {
 	start := time.Now()
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(url)
+	dialSocksProxy, err := xproxy.SOCKS5("tcp", net.JoinHostPort(engine.ProbeInboundListen, strconv.Itoa(engine.ProbeInboundSocksPort)), nil, xproxy.Direct)
+	if err != nil {
+		return -1
+	}
+	dialContext := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return dialSocksProxy.Dial(network, addr)
+	}
+	transport := &http.Transport{
+		DialContext:         dialContext,
+		TLSHandshakeTimeout: timeout,
+	}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   timeout,
+	}
+	u := "https://" + host + "/generate_204?_=" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	req, _ := http.NewRequest(http.MethodGet, u, nil)
+	req.Header.Set("User-Agent", "ProxyStation-CoreProbe/1.0")
+	resp, err := client.Do(req)
 	if err != nil {
 		return -1
 	}
 	defer resp.Body.Close()
-	return int(time.Since(start).Milliseconds())
-}
-
-// probeTCP 通过 TCP 连接测试延迟
-func probeTCP(host string, port int) int {
-	start := time.Now()
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", host, port), 5*time.Second)
-	if err != nil {
+	if resp.StatusCode != 204 && resp.StatusCode != 200 {
 		return -1
 	}
-	_ = conn.Close()
-	return int(time.Since(start).Milliseconds())
+	ms := int(time.Since(start).Milliseconds())
+	if ms <= 0 {
+		return 1
+	}
+	return ms
 }
 
 // saveLatency 将测速结果写回存储
@@ -1394,6 +1608,23 @@ func setSetting(c *gin.Context) {
 	if s.DNSMode == "" {
 		s.DNSMode = "lightweight"
 	}
+	if s.GroupRealProbeIntervalSec <= 0 {
+		s.GroupRealProbeIntervalSec = 300
+	}
+	switch s.GroupProbeMode {
+	case "", "real":
+		s.GroupProbeMode = "real"
+	case "fast":
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"error": "groupProbeMode 非法"})
+		return
+	}
+	if s.GroupSwitchThresholdMs < 0 {
+		s.GroupSwitchThresholdMs = 100
+	}
+	if s.GroupSwitchCooldownSec < 0 {
+		s.GroupSwitchCooldownSec = 600
+	}
 	current := configure.GetSettingNotNil()
 	if s.WebPassword == "" {
 		s.WebPassword = current.WebPassword
@@ -1418,6 +1649,8 @@ func setSetting(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	// 设置更新后重载分组出站自动探测任务（间隔/阈值等立即生效）
+	observatory.Reload()
 	// 设置变更后，若内核正在运行则自动重启使配置生效
 	if engine.Manager.IsRunning() {
 		if err := engine.Manager.Restart(); err != nil {
@@ -1447,7 +1680,12 @@ func getKernelStatus(c *gin.Context) {
 	kernels := engine.KernelStatus()
 	kernelMeta := gin.H{}
 	for _, name := range []string{"singbox", "xray", "v2ray"} {
-		kernelMeta[name] = engine.GetKernelMeta(name)
+		// 快速返回本地状态，避免每次请求都阻塞在 GitHub release 检查上
+		kernelMeta[name] = engine.KernelMeta{
+			Path:         kernels[name],
+			LocalVersion: engine.GetKernelVersion(name),
+			HasUpdate:    false,
+		}
 	}
 	// 检查数据文件是否存在
 	kernels["geoip"] = engine.DataFileStatus("geoip")
@@ -1675,8 +1913,13 @@ func checkKernelUpdate(c *gin.Context) {
 	// 获取本地版本
 	localVersion := engine.GetKernelVersion(kernel)
 
-	// 比较版本
-	hasUpdate := engine.CompareVersions(latestVersion, localVersion) > 0
+	// 仅当本地/远端都能解析出有效版本号时才比较，避免 "version" 之类文本误判
+	hasUpdate := false
+	if len(strings.TrimSpace(localVersion)) > 0 && len(strings.TrimSpace(latestVersion)) > 0 {
+		if len(engineVersionSegments(localVersion)) > 0 && len(engineVersionSegments(latestVersion)) > 0 {
+			hasUpdate = engine.CompareVersions(latestVersion, localVersion) > 0
+		}
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"kernel":        kernel,
@@ -1684,6 +1927,30 @@ func checkKernelUpdate(c *gin.Context) {
 		"latestVersion": latestVersion,
 		"hasUpdate":     hasUpdate,
 	})
+}
+
+func engineVersionSegments(v string) []int {
+	v = strings.TrimSpace(strings.TrimPrefix(strings.ToLower(v), "v"))
+	var segments []int
+	var current int
+	inNumber := false
+	for i := 0; i < len(v); i++ {
+		ch := v[i]
+		if ch >= '0' && ch <= '9' {
+			current = current*10 + int(ch-'0')
+			inNumber = true
+			continue
+		}
+		if inNumber {
+			segments = append(segments, current)
+			current = 0
+			inNumber = false
+		}
+	}
+	if inNumber {
+		segments = append(segments, current)
+	}
+	return segments
 }
 
 // ===== 路由规则 =====
@@ -1775,7 +2042,70 @@ func getCustomInbounds(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"inbounds": inbounds})
 }
 
+type builtinProxyStatus struct {
+	ID        string `json:"id"`
+	Protocol  string `json:"protocol"`
+	Running   bool   `json:"running"`
+	Reachable bool   `json:"reachable"`
+	Healthy   bool   `json:"healthy"`
+	Addr      string `json:"addr,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+func getBuiltinProxyStatuses(c *gin.Context) {
+	inbounds := configure.GetCustomInbounds()
+	statuses := make([]builtinProxyStatus, 0, len(inbounds))
+	for _, ib := range inbounds {
+		if status, ok := getBuiltinProxyStatus(ib); ok {
+			statuses = append(statuses, status)
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"statuses": statuses})
+}
+
+func restartBuiltinProxy(c *gin.Context) {
+	id := strings.TrimSpace(c.Param("id"))
+	if id == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing id"})
+		return
+	}
+	inbounds := configure.GetCustomInbounds()
+	found := false
+	for i := range inbounds {
+		if inbounds[i].ID != id {
+			continue
+		}
+		proto := strings.ToLower(strings.TrimSpace(inbounds[i].Protocol))
+		if proto != "cfdo" && proto != "cfgoodnet" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "not a builtin proxy"})
+			return
+		}
+		stopBuiltinProxy("inbound:"+inbounds[i].ID, proto)
+		restarted, err := ensureBuiltinProxyRunning(inbounds[i])
+		if err != nil {
+			addLog(fmt.Sprintf("❌ 重启内置出站失败 id=%s proto=%s: %v", inbounds[i].ID, proto, err))
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		inbounds[i] = restarted
+		found = true
+		break
+	}
+	if !found {
+		c.JSON(http.StatusNotFound, gin.H{"error": "builtin proxy not found"})
+		return
+	}
+	if err := configure.SetCustomInbounds(inbounds); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	rebuildInboundProxyServers(inbounds)
+	status, _ := getBuiltinProxyStatus(findBuiltinProxyByID(inbounds, id))
+	c.JSON(http.StatusOK, gin.H{"ok": true, "status": status})
+}
+
 func setCustomInbounds(c *gin.Context) {
+	oldInbounds := configure.GetCustomInbounds()
 	var inbounds []configure.CustomInbound
 	if err := c.ShouldBindJSON(&inbounds); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -1787,19 +2117,473 @@ func setCustomInbounds(c *gin.Context) {
 			id, _ := gonanoid.Nanoid()
 			inbounds[i].ID = id
 		}
-		if inbounds[i].Tag == "" {
+		proto := strings.ToLower(strings.TrimSpace(inbounds[i].Protocol))
+		if inbounds[i].Tag == "" && proto != "cfdo" && proto != "cfgoodnet" {
 			inbounds[i].Tag = "inbound-" + inbounds[i].ID[:8]
+		}
+		if proto == "cfdo" {
+			inbounds[i].Tag = ""
+			inbounds[i].Listen = "127.0.0.1"
+			if inbounds[i].CfDO != nil {
+				inbounds[i].Port = inbounds[i].CfDO.Port
+			}
+		}
+		if proto == "cfgoodnet" {
+			inbounds[i].Tag = ""
+			inbounds[i].Listen = "127.0.0.1"
+			if inbounds[i].CfGoodNet != nil {
+				inbounds[i].Port = inbounds[i].CfGoodNet.ListenPort
+				inbounds[i].CfGoodNet.ListenHost = "127.0.0.1"
+			}
 		}
 	}
 	if err := configure.SetCustomInbounds(inbounds); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	restartIndependentProxySidecars(oldInbounds, inbounds)
+	inbounds = ensureInboundProxySidecars(inbounds)
+	_ = configure.SetCustomInbounds(inbounds)
+	rebuildInboundProxyServers(inbounds)
 	// 重启代理使入站生效
 	if engine.Manager.IsRunning() {
 		_ = engine.Manager.Restart()
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+func restartIndependentProxySidecars(oldInbounds, newInbounds []configure.CustomInbound) {
+	oldHasCfdo := false
+	oldHasCfgoodnet := false
+	for _, ib := range oldInbounds {
+		switch strings.ToLower(strings.TrimSpace(ib.Protocol)) {
+		case "cfdo":
+			oldHasCfdo = true
+		case "cfgoodnet":
+			oldHasCfgoodnet = true
+		}
+	}
+	newHasCfdo := false
+	newHasCfgoodnet := false
+	for _, ib := range newInbounds {
+		switch strings.ToLower(strings.TrimSpace(ib.Protocol)) {
+		case "cfdo":
+			newHasCfdo = true
+		case "cfgoodnet":
+			newHasCfgoodnet = true
+		}
+	}
+	if oldHasCfdo || newHasCfdo {
+		cfdo.StopAll()
+	}
+	if oldHasCfgoodnet || newHasCfgoodnet {
+		cfgoodnet.StopAll()
+	}
+}
+
+func ensureInboundProxySidecars(inbounds []configure.CustomInbound) []configure.CustomInbound {
+	for i := range inbounds {
+		restarted, err := ensureBuiltinProxyRunning(inbounds[i])
+		if err != nil {
+			proto := strings.ToLower(strings.TrimSpace(inbounds[i].Protocol))
+			if proto == "cfdo" {
+				addLog("⚠ 启动 CFDO 入站失败: " + err.Error())
+			} else if proto == "cfgoodnet" {
+				addLog("⚠ 启动 cfgoodnet 入站失败: " + err.Error())
+			}
+			continue
+		}
+		inbounds[i] = restarted
+	}
+	return inbounds
+}
+
+func ensureBuiltinProxyRunning(ib configure.CustomInbound) (configure.CustomInbound, error) {
+	proto := strings.ToLower(strings.TrimSpace(ib.Protocol))
+	switch proto {
+	case "cfdo":
+		if ib.CfDO == nil {
+			return ib, nil
+		}
+		cfg := &cfdo.Config{
+			ListenHost:           "127.0.0.1",
+			ListenPort:           ib.CfDO.Port,
+			Listeners:            toCFDOListenerConfigs(ib.CfDO.Listeners),
+			WorkerDomain:         ib.CfDO.WorkerDomain,
+			Secret:               ib.CfDO.Secret,
+			Path:                 ib.CfDO.Path,
+			WorkerIP:             ib.CfDO.WorkerIP,
+			UseBareWS:            ib.CfDO.UseBareWS,
+			AlwaysUseDO:          ib.CfDO.AlwaysUseDO,
+			DOPoolSize:           ib.CfDO.DOPoolSize,
+			RejectDomains:        ib.CfDO.RejectDomains,
+			DOFallbackDomains:    ib.CfDO.DOFallbackDomains,
+			DOFallbackExtensions: ib.CfDO.DOFallbackExtensions,
+		}
+		addr, err := cfdo.EnsureRunning("inbound:"+ib.ID, cfg, addLog)
+		if err != nil {
+			return ib, err
+		}
+		if _, p, err := net.SplitHostPort(addr); err == nil {
+			if port, e := strconv.Atoi(p); e == nil && port > 0 {
+				ib.Port = port
+				ib.CfDO.Port = port
+			}
+		}
+		return ib, nil
+	case "cfgoodnet":
+		if ib.CfGoodNet == nil {
+			return ib, nil
+		}
+		cfg := &cfgoodnet.Config{
+			ListenHost: "127.0.0.1",
+			ListenPort: ib.CfGoodNet.ListenPort,
+			CfProxy:    ib.CfGoodNet.CfProxy,
+			CfGoodIP:   ib.CfGoodNet.CfGoodIP,
+			EnableXFF:  ib.CfGoodNet.EnableXFF,
+			DataDir:    engine.DataDir(),
+		}
+		for _, r := range ib.CfGoodNet.Rules {
+			cfg.Rules = append(cfg.Rules, cfgoodnet.Rule{Pattern: r.Pattern, Action: r.Action})
+		}
+		addr, err := cfgoodnet.EnsureRunning("inbound:"+ib.ID, cfg, addLog)
+		if err != nil {
+			return ib, err
+		}
+		if _, p, err := net.SplitHostPort(addr); err == nil {
+			if port, e := strconv.Atoi(p); e == nil && port > 0 {
+				ib.Port = port
+				ib.CfGoodNet.ListenPort = port
+				ib.CfGoodNet.ListenHost = "127.0.0.1"
+			}
+		}
+		return ib, nil
+	default:
+		return ib, nil
+	}
+}
+
+func toCFDOListenerConfigs(listeners []configure.CfDOListener) []cfdo.ListenerConfig {
+	if len(listeners) == 0 {
+		return nil
+	}
+	out := make([]cfdo.ListenerConfig, 0, len(listeners))
+	for _, l := range listeners {
+		out = append(out, cfdo.ListenerConfig{
+			ListenPort: l.ListenPort,
+			WorkerIP:   l.WorkerIP,
+		})
+	}
+	return out
+}
+
+func stopBuiltinProxy(key, protocol string) {
+	switch strings.ToLower(strings.TrimSpace(protocol)) {
+	case "cfdo":
+		cfdo.Stop(key)
+	case "cfgoodnet":
+		cfgoodnet.Stop(key)
+	}
+}
+
+func getBuiltinProxyStatus(ib configure.CustomInbound) (builtinProxyStatus, bool) {
+	proto := strings.ToLower(strings.TrimSpace(ib.Protocol))
+	if proto != "cfdo" && proto != "cfgoodnet" {
+		return builtinProxyStatus{}, false
+	}
+	key := "inbound:" + ib.ID
+	addr := ""
+	switch proto {
+	case "cfdo":
+		addr = cfdo.Addr(key)
+	case "cfgoodnet":
+		addr = cfgoodnet.Addr(key)
+	}
+	status := builtinProxyStatus{
+		ID:       ib.ID,
+		Protocol: proto,
+		Addr:     addr,
+		Running:  addr != "",
+	}
+	if addr == "" {
+		status.Error = "sidecar not running"
+		return status, true
+	}
+	conn, err := net.DialTimeout("tcp", addr, 1500*time.Millisecond)
+	if err != nil {
+		status.Error = err.Error()
+		return status, true
+	}
+	_ = conn.Close()
+	status.Reachable = true
+	status.Healthy = true
+	return status, true
+}
+
+func findBuiltinProxyByID(inbounds []configure.CustomInbound, id string) configure.CustomInbound {
+	for _, ib := range inbounds {
+		if ib.ID == id {
+			return ib
+		}
+	}
+	return configure.CustomInbound{}
+}
+
+// EnsureIndependentProxyInbounds 在服务启动时确保 cfdo/cfgoodnet 独立代理就绪。
+func EnsureIndependentProxyInbounds() {
+	inbounds := configure.GetCustomInbounds()
+	restartIndependentProxySidecars(inbounds, inbounds)
+	inbounds = ensureInboundProxySidecars(inbounds)
+	_ = configure.SetCustomInbounds(inbounds)
+	rebuildInboundProxyServers(inbounds)
+}
+
+func rebuildInboundProxyServers(inbounds []configure.CustomInbound) {
+	cleanupLegacyInboundRefsInGroups()
+	groups := configure.GetGroups()
+	serverGroupIndex := -1
+	for i := range groups {
+		if !groups[i].FromSub && strings.EqualFold(strings.TrimSpace(groups[i].Name), "SERVER") {
+			serverGroupIndex = i
+			break
+		}
+	}
+	if serverGroupIndex < 0 {
+		id, _ := gonanoid.Nanoid()
+		g := &configure.Group{
+			ID:        id,
+			Name:      "SERVER",
+			FromSub:   false,
+			Servers:   []configure.ServerRef{},
+			CreatedAt: time.Now(),
+		}
+		if err := configure.AppendGroup(g); err != nil {
+			return
+		}
+		groups = configure.GetGroups()
+		serverGroupIndex = len(groups) - 1
+	}
+
+	oldServers := configure.GetServers()
+	oldToNewIndex := map[int]int{}
+	newServers := make([]configure.ServerRaw, 0, len(oldServers))
+	serverIndexBySource := map[string]int{}
+	for i, s := range oldServers {
+		if strings.HasPrefix(s.Source, "inbound:") {
+			continue
+		}
+		oldToNewIndex[i] = len(newServers)
+		newServers = append(newServers, s)
+	}
+	for _, ib := range inbounds {
+		p := strings.ToLower(strings.TrimSpace(ib.Protocol))
+		if p != "cfdo" && p != "cfgoodnet" {
+			continue
+		}
+		host := "127.0.0.1"
+		name := ib.Name
+		if strings.TrimSpace(name) == "" {
+			name = ib.Tag
+		}
+		if p == "cfdo" {
+			ports := cfdoListenPortsForInbound(ib)
+			for _, port := range ports {
+				if port <= 0 {
+					continue
+				}
+				source := fmt.Sprintf("inbound:%s:cfdo:%d", ib.ID, port)
+				serverName := name
+				if len(ports) > 1 {
+					serverName = fmt.Sprintf("%s [%d]", name, port)
+				}
+				serverIndexBySource[source] = len(newServers)
+				newServers = append(newServers, configure.ServerRaw{
+					Link:    fmt.Sprintf("socks5://%s:%d#%s", host, port, url.QueryEscape(serverName)),
+					Name:    serverName,
+					Host:    host,
+					Port:    port,
+					Type:    "socks5",
+					Latency: -1,
+					Source:  source,
+				})
+			}
+		} else {
+			port := ib.Port
+			if ib.CfGoodNet != nil && ib.CfGoodNet.ListenPort > 0 {
+				port = ib.CfGoodNet.ListenPort
+			}
+			if port <= 0 {
+				continue
+			}
+			source := "inbound:" + ib.ID
+			serverIndexBySource[source] = len(newServers)
+			newServers = append(newServers, configure.ServerRaw{
+				Link:    fmt.Sprintf("http://%s:%d#%s", host, port, url.QueryEscape(name)),
+				Name:    name,
+				Host:    host,
+				Port:    port,
+				Type:    "http",
+				Latency: -1,
+				Source:  source,
+			})
+		}
+	}
+
+	if err := configure.SetServers(newServers); err != nil {
+		return
+	}
+
+	for i := range groups {
+		g := groups[i]
+		if len(g.Servers) == 0 {
+			continue
+		}
+		filtered := make([]configure.ServerRef, 0, len(g.Servers))
+		seen := map[string]struct{}{}
+		changed := false
+		for _, ref := range g.Servers {
+			if ref.Type != "server" {
+				key := fmt.Sprintf("%s:%d:%d", ref.Type, ref.Index, ref.Sub)
+				if _, ok := seen[key]; ok {
+					changed = true
+					continue
+				}
+				seen[key] = struct{}{}
+				filtered = append(filtered, ref)
+				continue
+			}
+			if ref.Index < 0 || ref.Index >= len(oldServers) {
+				changed = true
+				continue
+			}
+			oldServer := oldServers[ref.Index]
+			newIndex := -1
+			if strings.HasPrefix(oldServer.Source, "inbound:") {
+				var ok bool
+				newIndex, ok = serverIndexBySource[oldServer.Source]
+				if !ok {
+					changed = true
+					continue
+				}
+			} else {
+				var ok bool
+				newIndex, ok = oldToNewIndex[ref.Index]
+				if !ok {
+					changed = true
+					continue
+				}
+			}
+			if newIndex != ref.Index {
+				changed = true
+			}
+			ref.Index = newIndex
+			key := fmt.Sprintf("%s:%d:%d", ref.Type, ref.Index, ref.Sub)
+			if _, ok := seen[key]; ok {
+				changed = true
+				continue
+			}
+			seen[key] = struct{}{}
+			filtered = append(filtered, ref)
+		}
+		if i == serverGroupIndex {
+			for _, ib := range inbounds {
+				p := strings.ToLower(strings.TrimSpace(ib.Protocol))
+				if p != "cfdo" && p != "cfgoodnet" {
+					continue
+				}
+				if p == "cfdo" {
+					for _, port := range cfdoListenPortsForInbound(ib) {
+						source := fmt.Sprintf("inbound:%s:cfdo:%d", ib.ID, port)
+						serverIndex, ok := serverIndexBySource[source]
+						if !ok {
+							continue
+						}
+						ref := configure.ServerRef{Type: "server", Index: serverIndex, Sub: 0}
+						key := fmt.Sprintf("%s:%d:%d", ref.Type, ref.Index, ref.Sub)
+						if _, exists := seen[key]; exists {
+							continue
+						}
+						seen[key] = struct{}{}
+						filtered = append(filtered, ref)
+						changed = true
+					}
+					continue
+				}
+				source := "inbound:" + ib.ID
+				serverIndex, ok := serverIndexBySource[source]
+				if !ok {
+					continue
+				}
+				ref := configure.ServerRef{Type: "server", Index: serverIndex, Sub: 0}
+				key := fmt.Sprintf("%s:%d:%d", ref.Type, ref.Index, ref.Sub)
+				if _, exists := seen[key]; exists {
+					continue
+				}
+				seen[key] = struct{}{}
+				filtered = append(filtered, ref)
+				changed = true
+			}
+		}
+		if changed {
+			g.Servers = filtered
+			_ = configure.SetGroup(i, &g)
+		}
+	}
+}
+
+func cfdoListenPortsForInbound(ib configure.CustomInbound) []int {
+	if ib.CfDO == nil {
+		if ib.Port > 0 {
+			return []int{ib.Port}
+		}
+		return nil
+	}
+	seen := map[int]struct{}{}
+	var out []int
+	for _, l := range ib.CfDO.Listeners {
+		if l.ListenPort <= 0 {
+			continue
+		}
+		if _, ok := seen[l.ListenPort]; ok {
+			continue
+		}
+		seen[l.ListenPort] = struct{}{}
+		out = append(out, l.ListenPort)
+	}
+	if len(out) > 0 {
+		return out
+	}
+	port := ib.CfDO.Port
+	if port <= 0 {
+		port = ib.Port
+	}
+	if port > 0 {
+		return []int{port}
+	}
+	return nil
+}
+
+func cleanupLegacyInboundRefsInGroups() {
+	groups := configure.GetGroups()
+	for i := range groups {
+		g := groups[i]
+		if len(g.Servers) == 0 {
+			continue
+		}
+		filtered := make([]configure.ServerRef, 0, len(g.Servers))
+		changed := false
+		for _, ref := range g.Servers {
+			if strings.EqualFold(strings.TrimSpace(ref.Type), "inbound") {
+				changed = true
+				continue
+			}
+			filtered = append(filtered, ref)
+		}
+		if changed {
+			g.Servers = filtered
+			_ = configure.SetGroup(i, &g)
+		}
+	}
 }
 
 func getRuleSetInfos(c *gin.Context) {

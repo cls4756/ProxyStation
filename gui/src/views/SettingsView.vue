@@ -1,151 +1,198 @@
 <template>
   <div class="settings-page">
-
-    <!-- 内核文件状态栏 -->
-    <div class="data-files-bar">
-      <span class="data-label">内核文件：</span>
-      <span v-for="k in kernelFiles" :key="k.id" :class="['data-badge', k.installed ? 'data-ok' : 'data-missing']" :title="kernelBarTitle(k)">
-        {{ k.label }} {{ kernelBarText(k) }}
-      </span>
-      <button class="action-btn" style="margin-left:auto" @click="showKernelModal = true">⬇ 下载/更新内核</button>
-    </div>
-
-    <!-- 常规设置 -->
-    <div class="settings-block">
-      <div class="block-header">
-        <span class="block-title">日志</span>
-      </div>
-      <div class="field-row">
-        <label class="field-label">日志级别</label>
-        <select class="input field-input" v-model="form.logLevel">
-          <option value="debug">Debug</option>
-          <option value="info">Info</option>
-          <option value="warn">Warn</option>
-          <option value="error">Error</option>
-        </select>
-      </div>
-      <div class="field-row">
-        <label class="field-label">最大日志行数</label>
-        <input type="number" class="input field-input" v-model.number="form.maxLogLines" />
-      </div>
-      <div class="field-row">
-        <label class="field-label">最大日志文件（MB）</label>
-        <input type="number" class="input field-input" v-model.number="form.maxLogFileSizeMB" step="0.1" />
+    <div class="tab-bar-outer">
+      <div class="tab-bar">
+        <div class="tabs-wrap">
+          <span :class="['tab', activeTab === 'kernel' ? 'tab-active' : '']" @click="activeTab = 'kernel'">内核和代理</span>
+          <span :class="['tab', activeTab === 'inbounds' ? 'tab-active' : '']" @click="activeTab = 'inbounds'">出入站</span>
+          <span :class="['tab', activeTab === 'rules' ? 'tab-active' : '']" @click="activeTab = 'rules'">分流规则</span>
+          <span :class="['tab', activeTab === 'other' ? 'tab-active' : '']" @click="activeTab = 'other'">其他设置</span>
+        </div>
       </div>
     </div>
 
-    <div class="settings-block">
-      <div class="block-header">
-        <span class="block-title">代理</span>
+    <div class="settings-content">
+      <div v-if="activeTab === 'kernel'" class="data-files-bar">
+        <span class="data-label">内核文件：</span>
+        <span v-for="k in kernelFiles" :key="k.id" :class="['data-badge', k.installed ? 'data-ok' : 'data-missing']" :title="kernelBarTitle(k)">
+          {{ k.label }} {{ kernelBarText(k) }}
+        </span>
+        <button class="action-btn" style="margin-left:auto" @click="showKernelModal = true">⬇ 下载/更新内核</button>
       </div>
-      <div class="field-row">
-        <label class="field-label">内核模式</label>
-        <select class="input field-input" v-model="form.kernelMode">
-          <option value="auto">自动选择</option>
-          <option value="singbox">强制 sing-box</option>
-          <option value="xray">强制 Xray</option>
-          <option value="v2ray">强制 V2Ray</option>
-        </select>
-      </div>
-      <div class="field-row field-row-tip">
-        <label class="field-label"></label>
-        <div class="field-tip">
-          自动模式下，支持高级协议时优先使用 sing-box；若未安装 sing-box，则回退到 Xray。手动模式会严格使用你选择的内核。
+
+      <div class="settings-block" v-if="activeTab === 'other'">
+        <div class="block-header">
+          <span class="block-title">日志</span>
+        </div>
+        <div class="field-row">
+          <label class="field-label">日志级别</label>
+          <select class="input field-input" v-model="form.logLevel">
+            <option value="debug">Debug</option>
+            <option value="info">Info</option>
+            <option value="warn">Warn</option>
+            <option value="error">Error</option>
+          </select>
+        </div>
+        <div class="field-row">
+          <label class="field-label">最大日志行数</label>
+          <input type="number" class="input field-input" v-model.number="form.maxLogLines" />
+        </div>
+        <div class="field-row">
+          <label class="field-label">最大日志文件（MB）</label>
+          <input type="number" class="input field-input" v-model.number="form.maxLogFileSizeMB" step="0.1" />
         </div>
       </div>
-      <div class="field-row">
-        <label class="field-label">全局流量探测</label>
-        <label class="toggle-wrap">
-          <input type="checkbox" v-model="form.enableSniff" />
-          <span>{{ form.enableSniff ? '已开启，按需识别 SNI/Host' : '已关闭，减少首包处理开销' }}</span>
-        </label>
-      </div>
-      <div class="field-row">
-        <label class="field-label">DNS 劫持</label>
-        <label class="toggle-wrap">
-          <input type="checkbox" v-model="form.enableHijackDNS" />
-          <span>{{ form.enableHijackDNS ? '已开启，代理接管 DNS' : '已关闭，更多依赖系统/应用 DNS' }}</span>
-        </label>
-      </div>
-      <div class="field-row">
-        <label class="field-label">DNS 模式</label>
-        <select class="input field-input" v-model="form.dnsMode">
-          <option value="lightweight">轻量模式</option>
-          <option value="compatible">兼容模式</option>
-        </select>
-      </div>
-      <div class="field-row field-row-tip">
-        <label class="field-label"></label>
-        <div class="field-tip">
-          轻量模式使用更直接的 UDP DNS，首包更快，适合浏览器代理等常见场景。兼容模式保留远端 DoH、bootstrap 和自动接口检测，DNS 接管更完整，但启动和访问首包会更重，更适合透明代理或复杂分流环境。
+
+      <div class="settings-block" v-if="activeTab === 'kernel'">
+        <div class="block-header">
+          <span class="block-title">代理</span>
         </div>
-      </div>
-      <div class="field-row">
-        <label class="field-label">透明代理模式</label>
-        <select class="input field-input" v-model="form.transparentMode">
-          <option value="close">关闭</option>
-          <option value="open">开启</option>
-        </select>
-      </div>
-      <div class="field-row">
-        <label class="field-label">局域网共享</label>
-        <label class="toggle-wrap">
-          <input type="checkbox" v-model="form.lanSharingEnabled" />
-          <span>{{ form.lanSharingEnabled ? '已开启，监听 0.0.0.0' : '已关闭，仅监听 127.0.0.1' }}</span>
-        </label>
-      </div>
-      <div class="field-row field-row-tip">
-        <label class="field-label"></label>
-        <div class="field-tip">
-          开启后，局域网设备可通过宿主机地址访问代理端口。建议同时配置 SOCKS5 / HTTP 认证，避免未授权使用。
+        <div class="field-row">
+          <label class="field-label">内核模式</label>
+          <select class="input field-input" v-model="form.kernelMode">
+            <option value="auto">自动选择</option>
+            <option value="singbox">强制 sing-box</option>
+            <option value="xray">强制 Xray</option>
+            <option value="v2ray">强制 V2Ray</option>
+          </select>
         </div>
-      </div>
-      <div class="field-row field-row-tip">
-        <label class="field-label">当前监听</label>
-        <div class="listen-summary">
-          <div class="listen-item">
-            <span class="listen-label">SOCKS5</span>
-            <code class="listen-code">{{ builtinListenHost }}:{{ form.socks5Port }}</code>
-          </div>
-          <div class="listen-item">
-            <span class="listen-label">HTTP</span>
-            <code class="listen-code">{{ builtinListenHost }}:{{ form.httpPort }}</code>
+        <div class="field-row field-row-tip">
+          <label class="field-label"></label>
+          <div class="field-tip">
+            自动模式下，支持高级协议时优先使用 sing-box；若未安装 sing-box，则回退到 Xray。手动模式会严格使用你选择的内核。
           </div>
         </div>
+        <div class="field-row">
+          <label class="field-label">全局流量探测</label>
+          <label class="toggle-wrap">
+            <input type="checkbox" v-model="form.enableSniff" />
+            <span>{{ form.enableSniff ? '已开启，按需识别 SNI/Host' : '已关闭，减少首包处理开销' }}</span>
+          </label>
+        </div>
+        <div class="field-row">
+          <label class="field-label">DNS 劫持</label>
+          <label class="toggle-wrap">
+            <input type="checkbox" v-model="form.enableHijackDNS" />
+            <span>{{ form.enableHijackDNS ? '已开启，代理接管 DNS' : '已关闭，更多依赖系统/应用 DNS' }}</span>
+          </label>
+        </div>
+        <div class="field-row">
+          <label class="field-label">DNS 模式</label>
+          <select class="input field-input" v-model="form.dnsMode">
+            <option value="lightweight">轻量模式</option>
+            <option value="compatible">兼容模式</option>
+          </select>
+        </div>
+        <div class="field-row field-row-tip">
+          <label class="field-label"></label>
+          <div class="field-tip">
+            轻量模式使用更直接的 UDP DNS，首包更快，适合浏览器代理等常见场景。兼容模式保留远端 DoH、bootstrap 和自动接口检测，DNS 接管更完整，但启动和访问首包会更重，更适合透明代理或复杂分流环境。
+          </div>
+        </div>
+        <div class="field-row">
+          <label class="field-label">透明代理模式</label>
+          <select class="input field-input" v-model="form.transparentMode">
+            <option value="close">关闭</option>
+            <option value="open">开启</option>
+          </select>
+        </div>
+        <div class="field-row">
+          <label class="field-label">局域网共享</label>
+          <label class="toggle-wrap">
+            <input type="checkbox" v-model="form.lanSharingEnabled" />
+            <span>{{ form.lanSharingEnabled ? '已开启，监听 0.0.0.0' : '已关闭，仅监听 127.0.0.1' }}</span>
+          </label>
+        </div>
+        <div class="field-row field-row-tip">
+          <label class="field-label"></label>
+          <div class="field-tip">
+            开启后，局域网设备可通过宿主机地址访问代理端口。建议同时配置 SOCKS5 / HTTP 认证，避免未授权使用。
+          </div>
+        </div>
+        <div class="field-row field-row-tip">
+          <label class="field-label">探测目标</label>
+          <div style="flex:1; max-width:520px">
+            <textarea class="input" v-model="form.probeTargets" rows="4" placeholder="每行一个域名，如&#10;www.gstatic.com&#10;www.google.com"></textarea>
+            <div class="field-tip" style="margin-top:6px">严格探测模式下用于真实连接验证，支持逗号/空格/换行分隔。</div>
+          </div>
+        </div>
+        <div class="field-row">
+          <label class="field-label">分组测速间隔（秒）</label>
+          <input type="number" class="input field-input" v-model.number="form.groupRealProbeIntervalSec" min="10" />
+        </div>
+        <div class="field-row">
+          <label class="field-label">默认测速方式</label>
+          <select class="input field-input" v-model="form.groupProbeMode">
+            <option value="real">真连测试</option>
+            <option value="fast">快速测试</option>
+          </select>
+        </div>
+        <div class="field-row field-row-tip">
+          <label class="field-label"></label>
+          <div class="field-tip">用于分组周期测速和订阅更新后的自动测速；手动点击检测按钮不受影响。</div>
+        </div>
+        <div class="field-row">
+          <label class="field-label">切换阈值（ms）</label>
+          <input type="number" class="input field-input" v-model.number="form.groupSwitchThresholdMs" min="0" />
+        </div>
+        <div class="field-row">
+          <label class="field-label">切换冷却时间（秒）</label>
+          <input type="number" class="input field-input" v-model.number="form.groupSwitchCooldownSec" min="0" />
+        </div>
+        <div class="field-row field-row-tip">
+          <label class="field-label">当前监听</label>
+          <div class="listen-summary">
+            <div class="listen-item">
+              <span class="listen-label">SOCKS5</span>
+              <code class="listen-code">{{ builtinListenHost }}:{{ form.socks5Port }}</code>
+            </div>
+            <div class="listen-item">
+              <span class="listen-label">HTTP</span>
+              <code class="listen-code">{{ builtinListenHost }}:{{ form.httpPort }}</code>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="settings-block" v-if="activeTab === 'other'">
+        <div class="block-header">
+          <span class="block-title">订阅更新</span>
+        </div>
+        <div class="field-row">
+          <label class="field-label">自动更新</label>
+          <select class="input field-input" v-model="form.subscriptionAutoUpdateMode">
+            <option value="off">关闭</option>
+            <option value="on">开启</option>
+          </select>
+        </div>
+        <div class="field-row" v-if="form.subscriptionAutoUpdateMode === 'on'">
+          <label class="field-label">更新间隔（小时）</label>
+          <input type="number" class="input field-input" v-model.number="form.subscriptionAutoUpdateIntervalHour" />
+        </div>
+      </div>
+
+      <div v-if="activeTab === 'inbounds'" class="settings-rules-host">
+        <RulesView mode="inbounds" />
+      </div>
+
+      <div v-if="activeTab === 'rules'" class="settings-rules-host">
+        <RulesView mode="rules" />
+      </div>
+
+      <!-- 保存按钮 -->
+      <div class="save-bar" v-if="activeTab !== 'rules'">
+        <button class="action-btn action-btn-primary" :disabled="saving" @click="saveSettings">
+          {{ saving ? '保存中...' : '保存设置' }}
+        </button>
+        <span v-if="saveMsg" :class="['save-msg', saveMsg.error ? 'msg-error' : 'msg-success']">
+          {{ saveMsg.text }}
+        </span>
       </div>
     </div>
-
-    <div class="settings-block">
-      <div class="block-header">
-        <span class="block-title">订阅更新</span>
-      </div>
-      <div class="field-row">
-        <label class="field-label">自动更新</label>
-        <select class="input field-input" v-model="form.subscriptionAutoUpdateMode">
-          <option value="off">关闭</option>
-          <option value="on">开启</option>
-        </select>
-      </div>
-      <div class="field-row" v-if="form.subscriptionAutoUpdateMode === 'on'">
-        <label class="field-label">更新间隔（小时）</label>
-        <input type="number" class="input field-input" v-model.number="form.subscriptionAutoUpdateIntervalHour" />
-      </div>
-    </div>
-
-    <!-- 保存按钮 -->
-    <div class="save-bar">
-      <button class="action-btn action-btn-primary" :disabled="saving" @click="saveSettings">
-        {{ saving ? '保存中...' : '保存设置' }}
-      </button>
-      <span v-if="saveMsg" :class="['save-msg', saveMsg.error ? 'msg-error' : 'msg-success']">
-        {{ saveMsg.text }}
-      </span>
-    </div>
-
   </div>
 
   <!-- 内核下载弹窗 -->
-  <div class="modal-overlay" v-if="showKernelModal" @click.self="showKernelModal = false">
+  <div class="modal-overlay" v-if="showKernelModal" @mousedown.self="showKernelModal = false">
     <div class="modal-box" style="width:560px">
       <div class="modal-header">
         <span class="modal-title">内核管理</span>
@@ -201,10 +248,12 @@
 import { ref, reactive, onMounted, computed } from 'vue'
 import { api } from '../api'
 import { useProxyStore } from '../stores/proxy'
+import RulesView from './RulesView.vue'
 
 const saving = ref(false)
 const saveMsg = ref(null)
 const showKernelModal = ref(false)
+const activeTab = ref('kernel')
 const proxyStore = useProxyStore()
 
 const form = reactive({
@@ -217,6 +266,11 @@ const form = reactive({
   subscriptionAutoUpdateIntervalHour: 12,
   transparentMode: 'close',
   lanSharingEnabled: false,
+  probeTargets: '',
+  groupRealProbeIntervalSec: 300,
+  groupProbeMode: 'real',
+  groupSwitchThresholdMs: 100,
+  groupSwitchCooldownSec: 600,
   socks5Port: 20260,
   httpPort: 20261,
   maxLogLines: 500,
@@ -249,6 +303,11 @@ onMounted(async () => {
       subscriptionAutoUpdateIntervalHour: s.subscriptionAutoUpdateIntervalHour || 12,
       transparentMode: s.transparentMode || 'close',
       lanSharingEnabled: !!s.lanSharingEnabled,
+      probeTargets: s.probeTargets || '',
+      groupRealProbeIntervalSec: s.groupRealProbeIntervalSec || 300,
+      groupProbeMode: s.groupProbeMode || 'real',
+      groupSwitchThresholdMs: typeof s.groupSwitchThresholdMs === 'number' ? s.groupSwitchThresholdMs : 100,
+      groupSwitchCooldownSec: typeof s.groupSwitchCooldownSec === 'number' ? s.groupSwitchCooldownSec : 600,
       socks5Port: s.socks5Port || 20260,
       httpPort: s.httpPort || 20261,
       maxLogLines: s.maxLogLines || 500,
@@ -341,6 +400,11 @@ async function saveSettings() {
       subscriptionAutoUpdateIntervalHour: form.subscriptionAutoUpdateIntervalHour,
       transparentMode: form.transparentMode,
       lanSharingEnabled: form.lanSharingEnabled,
+      probeTargets: form.probeTargets,
+      groupRealProbeIntervalSec: form.groupRealProbeIntervalSec,
+      groupProbeMode: form.groupProbeMode,
+      groupSwitchThresholdMs: form.groupSwitchThresholdMs,
+      groupSwitchCooldownSec: form.groupSwitchCooldownSec,
       maxLogLines: form.maxLogLines,
       maxLogFileSize: Math.round(form.maxLogFileSizeMB * 1024 * 1024),
       githubMirror: form.githubMirror,
@@ -358,6 +422,11 @@ async function saveSettings() {
       subscriptionAutoUpdateIntervalHour: form.subscriptionAutoUpdateIntervalHour,
       transparentMode: form.transparentMode,
       lanSharingEnabled: form.lanSharingEnabled,
+      probeTargets: form.probeTargets,
+      groupRealProbeIntervalSec: form.groupRealProbeIntervalSec,
+      groupProbeMode: form.groupProbeMode,
+      groupSwitchThresholdMs: form.groupSwitchThresholdMs,
+      groupSwitchCooldownSec: form.groupSwitchCooldownSec,
       maxLogLines: form.maxLogLines,
       maxLogFileSize: Math.round(form.maxLogFileSizeMB * 1024 * 1024),
       githubMirror: form.githubMirror,
@@ -378,13 +447,63 @@ async function saveSettings() {
 
 <style scoped>
 .settings-page {
-  padding: 20px 24px;
-  max-width: 800px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.settings-content {
+  max-width: 1200px;
   margin: 0 auto;
+  padding: 0 24px;
   width: 100%;
   display: flex;
   flex-direction: column;
   gap: 12px;
+}
+.tab-bar-outer {
+  background: #fff;
+  border-bottom: 1px solid #e8e8e8;
+  box-shadow: 0 1px 4px rgba(0,0,0,.04);
+  flex-shrink: 0;
+}
+.tab-bar {
+  display: flex;
+  align-items: stretch;
+  justify-content: space-between;
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 0 24px;
+  min-height: 46px;
+}
+.tabs-wrap {
+  display: flex;
+  align-items: stretch;
+  overflow-x: auto;
+  flex: 1;
+  gap: 0;
+}
+.tabs-wrap::-webkit-scrollbar { height: 3px; }
+.tabs-wrap::-webkit-scrollbar-thumb { background: #d9d9d9; border-radius: 2px; }
+.tab {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 20px;
+  height: 46px;
+  cursor: pointer;
+  font-size: 13px;
+  color: #595959;
+  border-bottom: 3px solid transparent;
+  white-space: nowrap;
+  transition: color .15s;
+  flex-shrink: 0;
+  letter-spacing: .01em;
+}
+.tab:hover { color: #1677ff; background: #f5f8ff; }
+.tab-active {
+  color: #1677ff;
+  font-weight: 600;
+  border-bottom-color: #1677ff;
 }
 
 /* 内核状态栏 - 完全复用 RulesView 的 data-files-bar */
@@ -541,4 +660,47 @@ async function saveSettings() {
 .btn-light { background: #fff; color: #363636; border-color: #dbdbdb; }
 .btn-light:hover { background: #f5f5f5; }
 .btn-sm { padding: 3px 9px; font-size: 12px; }
+
+@media (max-width: 900px) {
+  .settings-page {
+    gap: 10px;
+  }
+  .settings-content {
+    padding: 0 10px;
+    gap: 10px;
+  }
+  .tab-bar {
+    padding: 0 10px;
+  }
+  .tab {
+    padding: 0 14px;
+  }
+  .data-files-bar {
+    flex-wrap: wrap;
+  }
+  .field-row {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .field-label {
+    width: 100%;
+  }
+  .field-input {
+    max-width: 100%;
+    width: 100%;
+  }
+  .data-file-row {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+  }
+}
+
+.settings-rules-host :deep(.rules-page) {
+  padding: 0;
+  max-width: 100%;
+  margin: 0;
+}
 </style>
+

@@ -54,7 +54,7 @@ func (p *V2rayParser) Parse(content []byte) ([]configure.ServerRaw, error) {
 }
 
 func tryBase64Decode(content []byte) ([]byte, error) {
-	s := strings.TrimSpace(string(content))
+	s := stripASCIIWhitespace(strings.TrimSpace(string(content)))
 	for _, enc := range []*base64.Encoding{
 		base64.StdEncoding,
 		base64.URLEncoding,
@@ -66,6 +66,17 @@ func tryBase64Decode(content []byte) ([]byte, error) {
 		}
 	}
 	return nil, base64.CorruptInputError(0)
+}
+
+func stripASCIIWhitespace(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case ' ', '\t', '\r', '\n':
+			return -1
+		default:
+			return r
+		}
+	}, s)
 }
 
 // 所有已知代理节点协议前缀（小写）

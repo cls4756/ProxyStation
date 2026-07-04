@@ -1,0 +1,25 @@
+{
+    "name": "tcp",
+    "main": "src/index.js",
+    "compatibility_date": "2026-02-11",
+    "compatibility_flags": ["nodejs_compat"],
+    "observability": { "enabled": true },
+
+    "durable_objects": {
+      "bindings": [
+        { "name": "TCP_PROXY", "class_name": "TcpProxy" }
+      ]
+    },
+
+    "migrations": [
+      { "tag": "v1", "new_sqlite_classes": ["TcpProxy"] }
+    ],
+
+    "d1_databases": [
+      {
+        "binding": "DB",
+        "database_name": "tcp_proxy_db",
+        "database_id": "efbe3f64-0772-4f2c-bd53-88271d54aa3c"
+      }
+    ]
+  }

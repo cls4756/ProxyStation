@@ -69,6 +69,9 @@ func main() {
 
 	// 初始化引擎管理器
 	engine.Init(*dataDir)
+	// 提前绑定引擎日志回调，确保启动阶段日志可见
+	engine.LogCallback = server.AddLog
+	observatory.SetLogCallback(server.AddLog)
 
 	// 初始化日志文件路径
 	server.InitLogFile(*dataDir)
@@ -88,6 +91,8 @@ func main() {
 
 	// 确保 SERVER 内置分组存在
 	ensureServerGroup()
+	// 启动独立于内核的 cfdo/cfgoodnet 代理
+	server.EnsureIndependentProxyInbounds()
 
 	// 启动 observatory（分组测速）
 	observatory.Start()
@@ -125,7 +130,7 @@ func main() {
 
 func resolveDataDir(configured string) string {
 	if pathExists(configured) {
-		return configured
+		return toAbsPath(configured)
 	}
 
 	exeDir := executableDir()
@@ -135,10 +140,10 @@ func resolveDataDir(configured string) string {
 	}
 	for _, candidate := range candidates {
 		if pathExists(candidate) {
-			return candidate
+			return toAbsPath(candidate)
 		}
 	}
-	return configured
+	return toAbsPath(configured)
 }
 
 func resolveGUIDir(configured string) string {
@@ -150,7 +155,10 @@ func resolveGUIDir(configured string) string {
 	candidates := []string{
 		filepath.Join(exeDir, "gui", "dist"),
 		filepath.Join(exeDir, "..", "gui", "dist"),
+		filepath.Join(exeDir, "..", "..", "gui", "dist"),
+		filepath.Join(exeDir, "..", "dist"),
 		filepath.Join(exeDir, "dist"),
+		filepath.Join("gui", "dist"),
 	}
 	for _, candidate := range candidates {
 		if dirHasIndex(candidate) {
@@ -166,6 +174,16 @@ func executableDir() string {
 		return "."
 	}
 	return filepath.Dir(exePath)
+}
+
+func toAbsPath(path string) string {
+	if path == "" || filepath.IsAbs(path) {
+		return path
+	}
+	if abs, err := filepath.Abs(path); err == nil {
+		return abs
+	}
+	return path
 }
 
 func pathExists(path string) bool {

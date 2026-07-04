@@ -3,6 +3,7 @@ package configure
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/ProxyStation/proxystation/db"
@@ -20,14 +21,14 @@ const (
 
 // SubscriptionRaw 代表一个订阅源
 type SubscriptionRaw struct {
-	ID          string             `json:"id"`
-	Name        string             `json:"name"`
-	URL         string             `json:"url"`
-	Format      SubscriptionFormat `json:"format"`
-	Servers     []ServerRaw        `json:"servers"`
-	UpdatedAt   time.Time          `json:"updatedAt"`
+	ID        string             `json:"id"`
+	Name      string             `json:"name"`
+	URL       string             `json:"url"`
+	Format    SubscriptionFormat `json:"format"`
+	Servers   []ServerRaw        `json:"servers"`
+	UpdatedAt time.Time          `json:"updatedAt"`
 	// 对应自动创建的 Group ID
-	GroupID     string             `json:"groupId"`
+	GroupID string `json:"groupId"`
 }
 
 func Bytes2SubscriptionRaw(b []byte) (*SubscriptionRaw, error) {
@@ -86,4 +87,44 @@ func GetLenSubscriptionServers(index int) int {
 		return 0
 	}
 	return len(sub.Servers)
+}
+
+// PreserveServerProbeResults copies latency metadata from old subscription nodes
+// to newly parsed nodes when they represent the same server.
+func PreserveServerProbeResults(oldServers, newServers []ServerRaw) {
+	if len(oldServers) == 0 || len(newServers) == 0 {
+		return
+	}
+	byKey := make(map[string]ServerRaw, len(oldServers)*2)
+	for _, old := range oldServers {
+		for _, key := range serverProbeKeys(old) {
+			if _, ok := byKey[key]; !ok {
+				byKey[key] = old
+			}
+		}
+	}
+	for i := range newServers {
+		for _, key := range serverProbeKeys(newServers[i]) {
+			if old, ok := byKey[key]; ok {
+				newServers[i].Latency = old.Latency
+				newServers[i].LastProbeTime = old.LastProbeTime
+				break
+			}
+		}
+	}
+}
+
+func serverProbeKeys(server ServerRaw) []string {
+	keys := make([]string, 0, 2)
+	if link := strings.TrimSpace(server.Link); link != "" {
+		keys = append(keys, "link:"+link)
+	}
+	serverKey := strings.ToLower(strings.TrimSpace(server.Type)) + "|" +
+		strings.ToLower(strings.TrimSpace(server.Host)) + "|" +
+		fmt.Sprintf("%d", server.Port) + "|" +
+		strings.TrimSpace(server.Name)
+	if serverKey != "||0|" {
+		keys = append(keys, "server:"+serverKey)
+	}
+	return keys
 }
