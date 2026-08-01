@@ -50,6 +50,8 @@ var global = &Observatory{
 var probeCoreMu sync.Mutex
 var switchStateMu sync.Mutex
 var lastSwitchAt = map[string]time.Time{}
+var pendingBestCopyMu sync.Mutex
+var pendingBestCopyGroups = map[string]bool{}
 var logCallback func(string)
 
 func SetLogCallback(cb func(string)) {
@@ -125,6 +127,7 @@ func OnGroupUpdated(groupID string) {
 			continue
 		}
 		triggered = true
+		markPendingBestCopy(groupID)
 		OnOutboundUpdated(name)
 	}
 	if !triggered {
@@ -225,6 +228,9 @@ func probeAndUpdate(outboundName string) {
 			available = append(available, r)
 		}
 	}
+	if shouldCopyBestNodeForGroup(o.Target.GroupID) {
+		copyNodesByRules(o.Target.GroupID, results)
+	}
 	if len(available) == 0 {
 		addLog(fmt.Sprintf("🔎 [%s] 分组测速完成：无可用节点，保持当前节点", outboundName))
 		return
@@ -263,11 +269,172 @@ func probeGroupLatency(groupID string) {
 	if group == nil {
 		return
 	}
+	results := make([]probeResult, 0, len(group.Servers))
 	for _, ref := range group.Servers {
 		nodeRef := configure.NodeRef{Type: ref.Type, Index: ref.Index, Sub: ref.Sub}
 		latency := probeNodeByDefaultMode(nodeRef)
 		saveLatency(nodeRef, latency)
+		results = append(results, probeResult{ref: nodeRef, latency: latency})
 	}
+	copyNodesByRules(groupID, results)
+}
+
+func markPendingBestCopy(groupID string) {
+	groupID = strings.TrimSpace(groupID)
+	if groupID == "" {
+		return
+	}
+	pendingBestCopyMu.Lock()
+	pendingBestCopyGroups[groupID] = true
+	pendingBestCopyMu.Unlock()
+}
+
+func shouldCopyBestNodeForGroup(groupID string) bool {
+	groupID = strings.TrimSpace(groupID)
+	if groupID == "" {
+		return false
+	}
+	pendingBestCopyMu.Lock()
+	defer pendingBestCopyMu.Unlock()
+	if !pendingBestCopyGroups[groupID] {
+		return false
+	}
+	delete(pendingBestCopyGroups, groupID)
+	return true
+}
+
+func copyNodesByRules(sourceGroupID string, results []probeResult) {
+	sourceGroupID = strings.TrimSpace(sourceGroupID)
+	if sourceGroupID == "" || len(results) == 0 {
+		return
+	}
+
+	available := make([]probeResult, 0, len(results))
+	for _, r := range results {
+		if r.latency > 0 {
+			available = append(available, r)
+		}
+	}
+	if len(available) == 0 {
+		return
+	}
+	sort.Slice(available, func(i, j int) bool {
+		return available[i].latency < available[j].latency
+	})
+
+	setting := configure.GetSettingNotNil()
+	for _, rule := range setting.SubscriptionBestNodeCopyRules {
+		if !containsGroupID(rule.SourceGroupIDs, sourceGroupID) {
+			continue
+		}
+		// 每条规则的复制数量可以不同，故在规则内取候选
+		picked := available
+		if n := rule.CopyCount(); n > 0 && n < len(picked) {
+			picked = picked[:n]
+		}
+		for _, targetGroupID := range uniqueGroupIDs(rule.TargetGroupIDs) {
+			if targetGroupID == sourceGroupID {
+				continue
+			}
+			copyNodesToGroup(sourceGroupID, targetGroupID, picked)
+		}
+	}
+}
+
+// copyNodesToGroup 把候选节点复制进目标分组，已存在的跳过。
+// 每个节点单独判重，因此重复调用是幂等的。
+func copyNodesToGroup(sourceGroupID, targetGroupID string, picked []probeResult) {
+	groupIndex, targetGroup := configure.GetGroupByID(targetGroupID)
+	if targetGroup == nil || targetGroup.FromSub {
+		return
+	}
+
+	copied := 0
+	for _, r := range picked {
+		server := serverRawByRef(r.ref)
+		if server == nil {
+			continue
+		}
+		if groupHasServer(targetGroup.Servers, *server) {
+			continue
+		}
+		localRef, ok := ensureLocalCopy(*server)
+		if !ok {
+			continue
+		}
+		targetGroup.Servers = append(targetGroup.Servers, localRef)
+		copied++
+	}
+	if copied == 0 {
+		return
+	}
+	if err := configure.SetGroup(groupIndex, targetGroup); err != nil {
+		addLog(fmt.Sprintf("⚠️ 复制节点到分组失败：%s -> %s: %v", sourceGroupID, targetGroupID, err))
+		return
+	}
+	addLog(fmt.Sprintf("📋 已复制 %d 个节点到分组：%s -> %s", copied, sourceGroupID, targetGroup.Name))
+}
+
+func containsGroupID(ids []string, target string) bool {
+	for _, id := range ids {
+		if strings.TrimSpace(id) == target {
+			return true
+		}
+	}
+	return false
+}
+
+func ensureLocalCopy(server configure.ServerRaw) (configure.ServerRef, bool) {
+	servers := configure.GetServers()
+	for i, existing := range servers {
+		if sameServer(existing, server) {
+			return configure.ServerRef{Type: "server", Index: i, Sub: 0}, true
+		}
+	}
+
+	server.Source = "manual"
+	server.Latency = -1
+	server.LastProbeTime = 0
+	index := len(servers)
+	if err := configure.AppendServers([]*configure.ServerRaw{&server}); err != nil {
+		addLog(fmt.Sprintf("⚠️ 创建本地节点副本失败：%v", err))
+		return configure.ServerRef{}, false
+	}
+	return configure.ServerRef{Type: "server", Index: index, Sub: 0}, true
+}
+
+func groupHasServer(refs []configure.ServerRef, server configure.ServerRaw) bool {
+	for _, ref := range refs {
+		existing := serverRawByRef(configure.NodeRef{Type: ref.Type, Index: ref.Index, Sub: ref.Sub})
+		if existing != nil && sameServer(*existing, server) {
+			return true
+		}
+	}
+	return false
+}
+
+func uniqueGroupIDs(ids []string) []string {
+	seen := make(map[string]bool, len(ids))
+	result := make([]string, 0, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		result = append(result, id)
+	}
+	return result
+}
+
+func sameServer(a, b configure.ServerRaw) bool {
+	if strings.TrimSpace(a.Link) != "" && strings.TrimSpace(a.Link) == strings.TrimSpace(b.Link) {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(a.Type), strings.TrimSpace(b.Type)) &&
+		strings.EqualFold(strings.TrimSpace(a.Host), strings.TrimSpace(b.Host)) &&
+		a.Port == b.Port &&
+		strings.TrimSpace(a.Name) == strings.TrimSpace(b.Name)
 }
 
 func resolveProbeInterval() time.Duration {
@@ -450,6 +617,10 @@ func fastReachableRef(ref configure.NodeRef) bool {
 		if s == nil {
 			return false
 		}
+		// 需经前置代理才能连通的节点，直连预检必然失败，交给内核走链路测
+		if s.FrontProxy != "" {
+			return true
+		}
 		return probe.FastReachable(s, fastProbeTimeout)
 	case "sub_server":
 		sub := configure.GetSubscription(ref.Sub)
@@ -457,6 +628,9 @@ func fastReachableRef(ref configure.NodeRef) bool {
 			return false
 		}
 		s := sub.Servers[ref.Index]
+		if s.FrontProxy != "" || sub.ProxyOutbound != "" {
+			return true
+		}
 		return probe.FastReachable(&s, fastProbeTimeout)
 	default:
 		return false

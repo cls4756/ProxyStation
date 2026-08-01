@@ -107,6 +107,7 @@ func updateSub(index int, sub *configure.SubscriptionRaw) {
 	for i := range servers {
 		servers[i].Source = sub.ID
 	}
+	servers = configure.PreserveActiveSubscriptionServers(index, sub.Servers, servers)
 	sub.Servers = servers
 	sub.UpdatedAt = time.Now()
 	_ = configure.SetSubscription(index, sub)

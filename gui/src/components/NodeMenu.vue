@@ -17,6 +17,16 @@
           <textarea class="input" v-model="editLink" rows="4"
             style="font-family:monospace; font-size:12px; resize:vertical" />
         </div>
+        <div class="form-group">
+          <label class="form-label">前置代理</label>
+          <select class="input" v-model="editFrontProxy">
+            <option value="">无前置（直连）</option>
+            <option v-for="ob in store.outbounds" :key="ob.name" :value="ob.name">
+              {{ ob.name }}
+            </option>
+          </select>
+          <div class="form-hint">前置代理用于链式代理，流量会先经过指定出站再访问此节点</div>
+        </div>
       </div>
       <div class="modal-footer">
         <button class="btn btn-light" @click="close">取消</button>
@@ -87,6 +97,7 @@ const emit = defineEmits(['close', 'updated'])
 const store = useProxyStore()
 const editName = ref('')
 const editLink = ref('')
+const editFrontProxy = ref('')
 const shareLink = ref('')
 const qrCanvas = ref(null)
 const copied = ref(false)
@@ -99,6 +110,7 @@ watch(() => props.mode, async (m) => {
   if (m === 'edit' && props.server) {
     editName.value = props.server.name || ''
     editLink.value = props.server.link || ''
+    editFrontProxy.value = props.server.frontProxy || ''
   }
   if (m === 'share' && props.refObj) {
     const { data } = await api.getServerLink(props.refObj.type, props.refObj.index, props.refObj.sub || 0)
@@ -124,7 +136,11 @@ function close() {
 
 async function saveEdit() {
   if (!props.refObj || props.refObj.type !== 'server') return
-  await api.editServer(props.refObj.index, { name: editName.value, link: editLink.value })
+  await api.editServer(props.refObj.index, {
+    name: editName.value,
+    link: editLink.value,
+    frontProxy: editFrontProxy.value,
+  })
   await store.fetchAll()
   emit('updated')
   close()
@@ -145,4 +161,13 @@ async function doCopy() {
   close()
 }
 </script>
+
+<style scoped>
+.form-hint {
+  font-size: 11px;
+  color: #8c8c8c;
+  margin-top: 4px;
+  line-height: 1.5;
+}
+</style>
 

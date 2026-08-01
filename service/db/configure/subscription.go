@@ -29,6 +29,8 @@ type SubscriptionRaw struct {
 	UpdatedAt time.Time          `json:"updatedAt"`
 	// 对应自动创建的 Group ID
 	GroupID string `json:"groupId"`
+	// 拉取订阅时使用的代理出站名，为空表示直连拉取
+	ProxyOutbound string `json:"proxyOutbound,omitempty"`
 }
 
 func Bytes2SubscriptionRaw(b []byte) (*SubscriptionRaw, error) {
@@ -108,10 +110,91 @@ func PreserveServerProbeResults(oldServers, newServers []ServerRaw) {
 			if old, ok := byKey[key]; ok {
 				newServers[i].Latency = old.Latency
 				newServers[i].LastProbeTime = old.LastProbeTime
+				// 订阅刷新会整体覆盖节点，用户手动设的前置代理需要跟着保留
+				newServers[i].FrontProxy = old.FrontProxy
 				break
 			}
 		}
 	}
+}
+
+// PreserveActiveSubscriptionServers keeps subscription nodes that are currently
+// selected by an outbound when a refreshed subscription no longer contains them.
+// It also remaps active outbound references when the same node moves index.
+func PreserveActiveSubscriptionServers(subIndex int, oldServers, newServers []ServerRaw) []ServerRaw {
+	if subIndex < 0 || len(oldServers) == 0 {
+		return newServers
+	}
+	oldToNew := matchOldServerIndexes(oldServers, newServers)
+	appended := map[int]int{}
+
+	for _, name := range GetOutboundNames() {
+		o := GetOutbound(name)
+		if o == nil {
+			continue
+		}
+		changed := false
+		if remapActiveSubscriptionRef(o.Target.NodeRef, subIndex, oldServers, &newServers, oldToNew, appended) {
+			changed = true
+		}
+		if remapActiveSubscriptionRef(o.Target.ActiveNodeRef, subIndex, oldServers, &newServers, oldToNew, appended) {
+			changed = true
+		}
+		if changed {
+			_ = SetOutbound(name, o)
+		}
+	}
+
+	return newServers
+}
+
+func remapActiveSubscriptionRef(ref *NodeRef, subIndex int, oldServers []ServerRaw, newServers *[]ServerRaw, oldToNew map[int]int, appended map[int]int) bool {
+	if ref == nil || ref.Type != "sub_server" || ref.Sub != subIndex {
+		return false
+	}
+	if ref.Index < 0 || ref.Index >= len(oldServers) {
+		return false
+	}
+	if newIndex, ok := oldToNew[ref.Index]; ok {
+		if ref.Index == newIndex {
+			return false
+		}
+		ref.Index = newIndex
+		return true
+	}
+	if newIndex, ok := appended[ref.Index]; ok {
+		if ref.Index == newIndex {
+			return false
+		}
+		ref.Index = newIndex
+		return true
+	}
+	newIndex := len(*newServers)
+	*newServers = append(*newServers, oldServers[ref.Index])
+	appended[ref.Index] = newIndex
+	ref.Index = newIndex
+	return true
+}
+
+func matchOldServerIndexes(oldServers, newServers []ServerRaw) map[int]int {
+	newIndexByKey := make(map[string]int, len(newServers)*2)
+	for i, server := range newServers {
+		for _, key := range serverProbeKeys(server) {
+			if _, ok := newIndexByKey[key]; !ok {
+				newIndexByKey[key] = i
+			}
+		}
+	}
+	result := map[int]int{}
+	for i, server := range oldServers {
+		for _, key := range serverProbeKeys(server) {
+			if newIndex, ok := newIndexByKey[key]; ok {
+				result[i] = newIndex
+				break
+			}
+		}
+	}
+	return result
 }
 
 func serverProbeKeys(server ServerRaw) []string {

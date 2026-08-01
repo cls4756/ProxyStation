@@ -3,24 +3,51 @@
     <!-- Tab 栏 -->
     <div class="tab-bar-outer">
       <div class="tab-bar">
-        <div class="tabs-wrap">
-          <span
-            v-for="(group, gi) in manualGroups" :key="'group-' + group.id"
-            :class="['tab', activeTab === 'group-' + gi ? 'tab-active' : '']"
-            @click="activeTab = 'group-' + gi"
+        <button
+          v-if="tabsOverflow"
+          class="tab-scroll-btn"
+          :disabled="!canScrollLeft"
+          title="向左滚动（双击到最左）"
+          @click="scrollTabs(-1)"
+          @dblclick="scrollTabsToEdge(-1)"
+        >‹</button>
+        <div
+          :class="['tabs-viewport', canScrollLeft ? 'has-left' : '', canScrollRight ? 'has-right' : '']"
+        >
+          <div
+            class="tabs-wrap"
+            ref="tabsWrapEl"
+            @wheel.prevent="onTabsWheel"
+            @scroll.passive="updateTabScrollState"
           >
-            {{ group.name }}
-            <span class="tab-badge">{{ group.servers?.length || 0 }}</span>
-          </span>
-          <span
-            v-for="(sub, si) in store.subscriptions" :key="'sub-' + sub.id"
-            :class="['tab', activeTab === 'sub-' + si ? 'tab-active' : '']"
-            @click="activeTab = 'sub-' + si"
-          >
-            {{ sub.name || sub.host }}
-            <span class="tab-badge">{{ sub.servers?.length || 0 }}</span>
-          </span>
+            <span
+              v-for="(group, gi) in manualGroups" :key="'group-' + group.id"
+              :data-tab-key="'group-' + gi"
+              :class="['tab', activeTab === 'group-' + gi ? 'tab-active' : '']"
+              @click="activeTab = 'group-' + gi"
+            >
+              {{ group.name }}
+              <span class="tab-badge">{{ group.servers?.length || 0 }}</span>
+            </span>
+            <span
+              v-for="(sub, si) in store.subscriptions" :key="'sub-' + sub.id"
+              :data-tab-key="'sub-' + si"
+              :class="['tab', activeTab === 'sub-' + si ? 'tab-active' : '']"
+              @click="activeTab = 'sub-' + si"
+            >
+              {{ sub.name || sub.host }}
+              <span class="tab-badge">{{ sub.servers?.length || 0 }}</span>
+            </span>
+          </div>
         </div>
+        <button
+          v-if="tabsOverflow"
+          class="tab-scroll-btn"
+          :disabled="!canScrollRight"
+          title="向右滚动（双击到最右）"
+          @click="scrollTabs(1)"
+          @dblclick="scrollTabsToEdge(1)"
+        >›</button>
         <div class="tab-actions">
           <button class="action-btn action-btn-primary" @click="openImport">＋ 导入</button>
           <button class="action-btn" @click="showNewGroup = true">📁 新建分组</button>
@@ -308,6 +335,19 @@
               <option value="singbox">sing-box JSON</option>
             </select>
           </div>
+          <div class="form-group">
+            <label class="form-label">更新方式</label>
+            <select class="input" v-model="editSubForm.proxyOutbound">
+              <option value="">直连更新</option>
+              <option v-for="ob in store.outbounds" :key="ob.name" :value="ob.name">
+                通过代理更新（{{ ob.name }}）
+              </option>
+            </select>
+            <div class="form-hint">
+              订阅地址需要代理才能访问时选择「通过代理更新」，需内核处于运行状态。
+              该订阅下的节点会自动以此出站作为前置代理（节点单独设置的前置代理优先）。
+            </div>
+          </div>
         </div>
         <div class="modal-footer">
           <button class="btn btn-light" @click="editSubIdx = -1">取消</button>
@@ -415,7 +455,7 @@
 </template>
 
 <script setup>
-import { ref, computed, inject, watch } from 'vue'
+import { ref, computed, inject, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { useProxyStore } from '../stores/proxy'
 import { api } from '../api'
 import ServerRow from '../components/ServerRow.vue'
@@ -448,7 +488,7 @@ const pingAborted = ref(false)
 
 // 订阅编辑状态
 const editSubIdx = ref(-1)
-const editSubForm = ref({ name: '', url: '', format: 'auto' })
+const editSubForm = ref({ name: '', url: '', format: 'auto', proxyOutbound: '' })
 
 // 批量复制到分组
 const showBulkCopyModal = ref(false)
@@ -461,6 +501,63 @@ const nodeMenuServer = ref(null)
 
 // 多选状态
 const selectedRefs = ref([])
+
+// ===== Tab 栏横向滚动 =====
+const tabsWrapEl = ref(null)
+const tabsOverflow = ref(false)
+const canScrollLeft = ref(false)
+const canScrollRight = ref(false)
+let tabsResizeObserver = null
+
+function updateTabScrollState() {
+  const el = tabsWrapEl.value
+  if (!el) return
+  // 亚像素误差会让「已经到底」被误判成还能滚，留 1px 容差
+  const maxScroll = el.scrollWidth - el.clientWidth
+  tabsOverflow.value = maxScroll > 1
+  canScrollLeft.value = el.scrollLeft > 1
+  canScrollRight.value = el.scrollLeft < maxScroll - 1
+}
+
+function scrollTabs(dir) {
+  const el = tabsWrapEl.value
+  if (!el) return
+  el.scrollBy({ left: dir * el.clientWidth * 0.8, behavior: 'smooth' })
+}
+
+function scrollTabsToEdge(dir) {
+  const el = tabsWrapEl.value
+  if (!el) return
+  el.scrollTo({ left: dir < 0 ? 0 : el.scrollWidth, behavior: 'smooth' })
+}
+
+// 竖向滚轮转成横向滚动，触控板的横向分量优先
+function onTabsWheel(e) {
+  const el = tabsWrapEl.value
+  if (!el) return
+  el.scrollLeft += Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY
+}
+
+function scrollActiveTabIntoView() {
+  const el = tabsWrapEl.value
+  if (!el) return
+  const target = el.querySelector(`[data-tab-key="${activeTab.value}"]`)
+  target?.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'nearest' })
+}
+
+onMounted(() => {
+  updateTabScrollState()
+  if (typeof ResizeObserver !== 'undefined' && tabsWrapEl.value) {
+    tabsResizeObserver = new ResizeObserver(updateTabScrollState)
+    tabsResizeObserver.observe(tabsWrapEl.value)
+  }
+  window.addEventListener('resize', updateTabScrollState)
+})
+
+onBeforeUnmount(() => {
+  tabsResizeObserver?.disconnect()
+  window.removeEventListener('resize', updateTabScrollState)
+})
 
 function refKey(ref) {
   return `${ref.type}:${ref.index}:${ref.sub || 0}`
@@ -505,7 +602,12 @@ function selectAll() {
 }
 
 // 切换 tab 时清空选择
-watch(activeTab, () => { selectedRefs.value = []; showSelectAll.value = false })
+watch(activeTab, async () => {
+  selectedRefs.value = []
+  showSelectAll.value = false
+  await nextTick()
+  scrollActiveTabIntoView()
+})
 
 watch(
 	() => [currentOutbound?.value, manualGroups.value.map(g => g.id).join(','), store.outbounds],
@@ -738,6 +840,15 @@ const manualGroups = computed(() => {
   return serverGroup ? [serverGroup, ...otherGroups] : otherGroups
 })
 
+// tab 数量变化后要重算溢出状态（须在 manualGroups 定义之后注册，watch 的 getter 会立即求值）
+watch(
+  () => [manualGroups.value.length, store.subscriptions.length],
+  async () => {
+    await nextTick()
+    updateTabScrollState()
+  }
+)
+
 const proxyOutbound = computed(() => store.outbounds.find(o => o.name === 'proxy'))
 
 // 当前 tab 对应的分组（如果是分组 tab）
@@ -894,7 +1005,12 @@ function openEditSub(si) {
   const sub = store.subscriptions[si]
   if (!sub) return
   editSubIdx.value = si
-  editSubForm.value = { name: sub.name || '', url: sub.url || '', format: sub.format || 'auto' }
+  editSubForm.value = {
+    name: sub.name || '',
+    url: sub.url || '',
+    format: sub.format || 'auto',
+    proxyOutbound: sub.proxyOutbound || '',
+  }
 }
 
 async function saveEditSub() {
@@ -986,7 +1102,7 @@ async function confirmBulkMove() {
   if (!bulkMoveGroupId.value || !selectedRefs.value.length) return
   // 先复制到目标分组
   for (const ref of selectedRefs.value) {
-    await api.copyServerToGroup(ref, bulkMoveGroupId.value)
+    await api.copyServerToGroup(ref, bulkMoveGroupId.value, false)
   }
   // 再从当前分组移除
   if (activeTab.value.startsWith('group-')) {
@@ -1023,7 +1139,7 @@ async function confirmSingleCopy() {
 
 async function confirmSingleMove() {
   if (!singleTargetGroupId.value || !singleMoveRef.value) return
-  await api.copyServerToGroup(singleMoveRef.value, singleTargetGroupId.value)
+  await api.copyServerToGroup(singleMoveRef.value, singleTargetGroupId.value, false)
   // 从当前分组移除
   if (activeTab.value.startsWith('group-')) {
     const gi = parseInt(activeTab.value.replace('group-', ''))
@@ -1055,6 +1171,33 @@ async function confirmSingleMove() {
   padding: 0 24px;
   min-height: 46px;
 }
+/* Tab 视口：承载左右渐变遮罩，指示还有未显示的 tab */
+.tabs-viewport {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  overflow: hidden;
+}
+.tabs-viewport.has-left::before,
+.tabs-viewport.has-right::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 28px;
+  pointer-events: none;
+  z-index: 2;
+}
+.tabs-viewport.has-left::before {
+  left: 0;
+  background: linear-gradient(to right, #fff, rgba(255,255,255,0));
+}
+.tabs-viewport.has-right::after {
+  right: 0;
+  background: linear-gradient(to left, #fff, rgba(255,255,255,0));
+}
+
 .tabs-wrap {
   display: flex;
   align-items: stretch;
@@ -1063,9 +1206,38 @@ async function confirmSingleMove() {
   overflow-x: auto;
   overflow-y: hidden;
   gap: 0;
+  scrollbar-width: none;
 }
-.tabs-wrap::-webkit-scrollbar { height: 3px; }
-.tabs-wrap::-webkit-scrollbar-thumb { background: #d9d9d9; border-radius: 2px; }
+.tabs-wrap::-webkit-scrollbar { display: none; }
+
+/* 左右滚动按钮 */
+.tab-scroll-btn {
+  flex-shrink: 0;
+  align-self: center;
+  width: 24px;
+  height: 30px;
+  border: 1px solid #e8e8e8;
+  border-radius: 4px;
+  background: #fff;
+  color: #595959;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all .15s;
+  user-select: none;
+}
+.tab-scroll-btn:hover:not(:disabled) {
+  border-color: #1677ff;
+  color: #1677ff;
+  background: #f5f8ff;
+}
+.tab-scroll-btn:disabled {
+  opacity: .35;
+  cursor: default;
+}
 
 .tab {
   display: inline-flex;
@@ -1305,5 +1477,11 @@ async function confirmSingleMove() {
 .sel-row-active { background: #e6f0ff; }
 .sel-name { flex: 1; font-size: 13px; color: #262626; }
 .sel-addr { font-size: 11px; color: #bfbfbf; }
+.form-hint {
+  font-size: 11px;
+  color: #8c8c8c;
+  margin-top: 4px;
+  line-height: 1.5;
+}
 </style>
 

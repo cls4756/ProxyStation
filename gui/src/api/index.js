@@ -41,7 +41,7 @@ export const api = {
   deleteServers: (indexes) => http.delete('/servers', { data: { indexes } }),
   editServer: (index, data) => http.put(`/servers/${index}`, data),
   getServerLink: (type, index, sub = 0) => http.get('/server/link', { params: { type, index, sub } }),
-  copyServerToGroup: (ref, groupId) => http.post('/server/copy-to-group', { ref, groupId }),
+  copyServerToGroup: (ref, groupId, clone = true) => http.post('/server/copy-to-group', { ref, groupId, clone }),
 
   // 订阅
   getSubscriptions: () => http.get('/subscriptions'),

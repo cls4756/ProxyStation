@@ -188,6 +188,32 @@ var dataDownloadFallbacks = map[string][]dataDownloadFallback{
 	},
 }
 
+// RuleSetRef 一个待下载的 rule-set。Builtin 区分内置列表和用户规则引用，
+// 前者下载失败视为错误，后者名称来自用户输入、失败只做提示。
+type RuleSetRef struct {
+	Name    string
+	URL     string
+	Builtin bool
+}
+
+// allRuleSetRefs 内置列表加上自定义规则引用的 rule-set，按名称去重
+func allRuleSetRefs() []RuleSetRef {
+	seen := make(map[string]struct{}, len(ruleSetFiles))
+	refs := make([]RuleSetRef, 0, len(ruleSetFiles))
+	for _, rs := range ruleSetFiles {
+		seen[rs.Name] = struct{}{}
+		refs = append(refs, RuleSetRef{Name: rs.Name, URL: rs.URL, Builtin: true})
+	}
+	for _, ref := range collectUserRuleSetRefs() {
+		if _, ok := seen[ref.Name]; ok {
+			continue
+		}
+		seen[ref.Name] = struct{}{}
+		refs = append(refs, ref)
+	}
+	return refs
+}
+
 // rule-set 文件列表（sing-box 格式）
 // geosite/geoip 来自 MetaCubeX/meta-rules-dat（更全，包含 gfw 等）
 var ruleSetFiles = []struct {
@@ -862,11 +888,12 @@ type RuleSetFileInfo struct {
 	URL       string `json:"url"`
 }
 
-// GetRuleSetInfos 获取所有 rule-set 的本地文件信息
+// GetRuleSetInfos 获取所有 rule-set 的本地文件信息，含自定义规则引用到的
 func GetRuleSetInfos() []RuleSetFileInfo {
 	ruleSetDir := filepath.Join(Manager.dataDir, "rule-set")
-	result := make([]RuleSetFileInfo, 0, len(ruleSetFiles))
-	for _, rs := range ruleSetFiles {
+	refs := allRuleSetRefs()
+	result := make([]RuleSetFileInfo, 0, len(refs))
+	for _, rs := range refs {
 		info := RuleSetFileInfo{Name: rs.Name, URL: rs.URL}
 		path := filepath.Join(ruleSetDir, rs.Name+".srs")
 		if fi, err := os.Stat(path); err == nil {

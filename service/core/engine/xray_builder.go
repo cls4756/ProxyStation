@@ -118,7 +118,7 @@ func BuildXrayConfig(setting *configure.Setting) (*coreObj.Config, error) {
 	}
 
 	// 先收集有效出站 tag，再注入路由规则
-	validOutboundTags := map[string]bool{"direct": true, "block": true}
+	validOutboundTags := collectValidOutboundTags()
 	for _, name := range configure.GetOutboundNames() {
 		o := configure.GetOutbound(name)
 		if o == nil {
@@ -131,6 +131,19 @@ func BuildXrayConfig(setting *configure.Setting) (*coreObj.Config, error) {
 		ob, err := xrayServerToOutbound(s, name)
 		if err != nil {
 			return nil, fmt.Errorf("outbound %v: %w", name, err)
+		}
+		// 前置代理：xray 通过 streamSettings.sockopt.dialerProxy 引用前置出站 tag
+		if front := resolveFrontProxyTag(s, name, validOutboundTags); front != "" {
+			if ob.StreamSettings == nil {
+				ob.StreamSettings = &coreObj.StreamSettings{}
+			}
+			if ob.StreamSettings.Sockopt == nil {
+				ob.StreamSettings.Sockopt = &coreObj.Sockopt{}
+			}
+			ob.StreamSettings.Sockopt.DialerProxy = front
+			if LogCallback != nil {
+				LogCallback(fmt.Sprintf("🔗 xray outbound %s 前置代理 => %s", name, front))
+			}
 		}
 		if LogCallback != nil {
 			port := 0

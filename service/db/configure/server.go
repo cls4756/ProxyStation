@@ -23,6 +23,8 @@ type ServerRaw struct {
 	LastProbeTime int64 `json:"lastProbeTime"`
 	// 来源：manual（手动导入）或订阅ID
 	Source string `json:"source"`
+	// 前置代理出站名（用于链式代理，如 "proxy"），为空表示不使用前置
+	FrontProxy string `json:"frontProxy,omitempty"`
 }
 
 func Bytes2ServerRaw(b []byte) (*ServerRaw, error) {

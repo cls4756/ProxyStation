@@ -71,10 +71,17 @@
         </div>
         <div class="field-row">
           <label class="field-label">DNS 劫持</label>
-          <label class="toggle-wrap">
-            <input type="checkbox" v-model="form.enableHijackDNS" />
-            <span>{{ form.enableHijackDNS ? '已开启，代理接管 DNS' : '已关闭，更多依赖系统/应用 DNS' }}</span>
+          <label class="toggle-wrap" :class="{ 'toggle-wrap-disabled': hijackDNSUnsupported }">
+            <input type="checkbox" v-model="form.enableHijackDNS" :disabled="hijackDNSUnsupported" />
+            <span v-if="hijackDNSUnsupported">当前内核不支持，此项不生效</span>
+            <span v-else>{{ form.enableHijackDNS ? '已开启，代理接管 DNS' : '已关闭，更多依赖系统/应用 DNS' }}</span>
           </label>
+        </div>
+        <div class="field-row field-row-tip">
+          <label class="field-label"></label>
+          <div class="field-tip">
+            仅 sing-box 内核支持，Xray/V2Ray 下不生效。此项只拦截真正的 53 端口查询，用于透明代理或把系统 DNS 指向本机的场景；浏览器等应用经 HTTP/SOCKS 代理接入时自身不发 DNS 查询，不受此项影响。
+          </div>
         </div>
         <div class="field-row">
           <label class="field-label">DNS 模式</label>
@@ -168,6 +175,57 @@
         <div class="field-row" v-if="form.subscriptionAutoUpdateMode === 'on'">
           <label class="field-label">更新间隔（小时）</label>
           <input type="number" class="input field-input" v-model.number="form.subscriptionAutoUpdateIntervalHour" />
+        </div>
+        <div class="field-row field-row-tip">
+          <label class="field-label">节点复制规则</label>
+          <div class="copy-rules-wrap">
+            <div class="field-tip">订阅分组自动更新并完成测速后，按规则向指定本地分组复制节点。目标分组已存在该节点时会跳过。</div>
+            <div v-for="(rule, ri) in form.subscriptionBestNodeCopyRules" :key="ri" class="copy-rule-card">
+              <div class="copy-rule-content">
+                <div class="copy-rule-row">
+                  <label class="copy-section-label">来源订阅分组</label>
+                  <div class="copy-source-groups">
+                    <label v-for="g in subscriptionGroups" :key="g.id" class="copy-source-item">
+                      <input type="checkbox" :value="g.id" v-model="rule.sourceGroupIds" />
+                      <span>{{ g.name }}</span>
+                    </label>
+                    <span v-if="subscriptionGroups.length === 0" class="empty-text">暂无订阅分组</span>
+                  </div>
+                </div>
+                <div class="copy-rule-row">
+                  <label class="copy-section-label">目标本地分组</label>
+                  <div class="copy-target-groups">
+                    <label v-for="g in localGroups" :key="g.id" class="copy-target-item">
+                      <input type="checkbox" :value="g.id" v-model="rule.targetGroupIds" />
+                      <span>{{ g.name }}</span>
+                    </label>
+                    <span v-if="localGroups.length === 0" class="empty-text">暂无本地分组</span>
+                  </div>
+                </div>
+                <div class="copy-rule-row">
+                  <label class="copy-section-label">复制数量</label>
+                  <div class="copy-mode-wrap">
+                    <label class="copy-mode-option">
+                      <input type="radio" value="best" v-model="rule.mode" />
+                      <span>仅延迟最低的 1 个</span>
+                    </label>
+                    <label class="copy-mode-option">
+                      <input type="radio" value="topN" v-model="rule.mode" />
+                      <span>延迟最低的前</span>
+                      <input type="number" class="input copy-count-input" v-model.number="rule.count" min="1" :disabled="rule.mode !== 'topN'" />
+                      <span>个</span>
+                    </label>
+                    <label class="copy-mode-option">
+                      <input type="radio" value="all" v-model="rule.mode" />
+                      <span>全部连通节点</span>
+                    </label>
+                  </div>
+                </div>
+              </div>
+              <button class="action-btn action-btn-danger" @click="removeCopyRule(ri)">删除</button>
+            </div>
+            <button class="action-btn action-btn-add" @click="addCopyRule">+ 添加规则</button>
+          </div>
         </div>
       </div>
 
@@ -264,6 +322,7 @@ const form = reactive({
   dnsMode: 'lightweight',
   subscriptionAutoUpdateMode: 'off',
   subscriptionAutoUpdateIntervalHour: 12,
+  subscriptionBestNodeCopyRules: [],
   transparentMode: 'close',
   lanSharingEnabled: false,
   probeTargets: '',
@@ -286,6 +345,11 @@ const kernelFiles = ref([
 const kernelDownloading = reactive({})
 const mirrorPresets = ['https://ghfast.top', 'https://mirror.ghproxy.com', 'https://gh-proxy.com']
 const builtinListenHost = computed(() => form.lanSharingEnabled ? '0.0.0.0' : '127.0.0.1')
+// DNS 劫持只在 sing-box 侧实现；auto 模式仍可能选中 sing-box，故不禁用
+const hijackDNSUnsupported = computed(() => form.kernelMode === 'xray' || form.kernelMode === 'v2ray')
+const groups = ref([])
+const subscriptionGroups = computed(() => groups.value.filter(g => g.fromSub))
+const localGroups = computed(() => groups.value.filter(g => !g.fromSub))
 let fullSetting = {}
 
 onMounted(async () => {
@@ -301,6 +365,7 @@ onMounted(async () => {
       dnsMode: s.dnsMode || 'lightweight',
       subscriptionAutoUpdateMode: s.subscriptionAutoUpdateMode || 'off',
       subscriptionAutoUpdateIntervalHour: s.subscriptionAutoUpdateIntervalHour || 12,
+      subscriptionBestNodeCopyRules: normalizeCopyRules(s.subscriptionBestNodeCopyRules),
       transparentMode: s.transparentMode || 'close',
       lanSharingEnabled: !!s.lanSharingEnabled,
       probeTargets: s.probeTargets || '',
@@ -315,8 +380,54 @@ onMounted(async () => {
       githubMirror: s.githubMirror || '',
     })
   } catch {}
+  await loadGroups()
   await refreshKernelStatus()
 })
+
+async function loadGroups() {
+  try {
+    const { data } = await api.getGroups()
+    groups.value = data.groups || []
+  } catch {
+    groups.value = []
+  }
+}
+
+function normalizeCopyRules(rules) {
+  if (!Array.isArray(rules)) return []
+  return rules.map(rule => {
+    // 旧数据只有单个 sourceGroupId，折叠进 sourceGroupIds
+    const sources = Array.isArray(rule?.sourceGroupIds) ? [...rule.sourceGroupIds] : []
+    if (rule?.sourceGroupId && !sources.includes(rule.sourceGroupId)) {
+      sources.push(rule.sourceGroupId)
+    }
+    const mode = ['best', 'topN', 'all'].includes(rule?.mode) ? rule.mode : 'best'
+    return {
+      sourceGroupIds: [...new Set(sources.filter(Boolean))],
+      targetGroupIds: Array.isArray(rule?.targetGroupIds) ? [...new Set(rule.targetGroupIds.filter(Boolean))] : [],
+      mode,
+      count: mode === 'topN' ? (Number(rule?.count) > 0 ? Number(rule.count) : 3) : 0,
+    }
+  })
+}
+
+function sanitizeCopyRules(rules) {
+  return normalizeCopyRules(rules)
+    .map(rule => ({
+      ...rule,
+      // 复制到自身没有意义，且会让节点在同一分组里重复累积
+      targetGroupIds: rule.targetGroupIds.filter(id => !rule.sourceGroupIds.includes(id)),
+    }))
+    .filter(rule => rule.sourceGroupIds.length > 0 && rule.targetGroupIds.length > 0)
+}
+
+function addCopyRule() {
+  form.subscriptionBestNodeCopyRules.push({ sourceGroupIds: [], targetGroupIds: [], mode: 'best', count: 0 })
+}
+
+function removeCopyRule(index) {
+  form.subscriptionBestNodeCopyRules.splice(index, 1)
+}
 
 async function downloadKernel(id) {
   const item = kernelFiles.value.find(k => k.id === id)
@@ -388,6 +499,7 @@ function kernelActionClass(k) {
 async function saveSettings() {
   saving.value = true
   saveMsg.value = null
+  const copyRules = sanitizeCopyRules(form.subscriptionBestNodeCopyRules)
   try {
     const { data } = await api.setSetting({
       ...fullSetting,
@@ -398,6 +510,7 @@ async function saveSettings() {
       dnsMode: form.dnsMode,
       subscriptionAutoUpdateMode: form.subscriptionAutoUpdateMode,
       subscriptionAutoUpdateIntervalHour: form.subscriptionAutoUpdateIntervalHour,
+      subscriptionBestNodeCopyRules: copyRules,
       transparentMode: form.transparentMode,
       lanSharingEnabled: form.lanSharingEnabled,
       probeTargets: form.probeTargets,
@@ -420,6 +533,7 @@ async function saveSettings() {
       dnsMode: form.dnsMode,
       subscriptionAutoUpdateMode: form.subscriptionAutoUpdateMode,
       subscriptionAutoUpdateIntervalHour: form.subscriptionAutoUpdateIntervalHour,
+      subscriptionBestNodeCopyRules: copyRules,
       transparentMode: form.transparentMode,
       lanSharingEnabled: form.lanSharingEnabled,
       probeTargets: form.probeTargets,
@@ -431,6 +545,7 @@ async function saveSettings() {
       maxLogFileSize: Math.round(form.maxLogFileSizeMB * 1024 * 1024),
       githubMirror: form.githubMirror,
     }
+    form.subscriptionBestNodeCopyRules = normalizeCopyRules(copyRules)
     if (data?.warning) {
       saveMsg.value = { error: true, text: data.warning }
     } else {
@@ -564,6 +679,7 @@ async function saveSettings() {
   font-size: 13px;
   color: #262626;
 }
+.toggle-wrap-disabled { opacity: .6; cursor: not-allowed; }
 .field-row-tip {
   align-items: flex-start;
 }
@@ -573,6 +689,103 @@ async function saveSettings() {
   font-size: 12px;
   line-height: 1.6;
   color: #8c8c8c;
+}
+.copy-rules-wrap {
+  display: flex;
+  flex-direction: column;
+  /* 不设 align-items 时默认 stretch，会把按钮拉满整行宽度 */
+  align-items: flex-start;
+  gap: 10px;
+  flex: 1;
+  max-width: 760px;
+}
+.copy-rule-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid #f0f0f0;
+  border-radius: 8px;
+  background: #fafafa;
+  width: 100%;
+  box-sizing: border-box;
+}
+.copy-rule-content {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  flex: 1;
+  min-width: 0;
+}
+.copy-rule-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+.copy-section-label {
+  font-size: 12px;
+  color: #8c8c8c;
+  width: 96px;
+  flex-shrink: 0;
+  padding-top: 5px;
+}
+.copy-source-groups,
+.copy-target-groups {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+}
+.copy-source-item,
+.copy-target-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 8px;
+  border: 1px solid #e8e8e8;
+  border-radius: 999px;
+  background: #fff;
+  font-size: 12px;
+  color: #595959;
+  cursor: pointer;
+}
+.copy-mode-wrap {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px;
+  flex: 1;
+  min-width: 0;
+}
+.copy-mode-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: #595959;
+  cursor: pointer;
+}
+.copy-count-input {
+  width: 64px;
+  display: inline-block;
+  padding: 3px 6px;
+}
+.action-btn-add { flex-shrink: 0; }
+.action-btn-danger {
+  flex-shrink: 0;
+  border-color: #ffccc7;
+  color: #ff4d4f;
+}
+.action-btn-danger:hover {
+  border-color: #ff4d4f;
+  color: #ff4d4f;
+  background: #fff2f0;
+}
+.empty-text {
+  font-size: 12px;
+  color: #bfbfbf;
+  line-height: 30px;
 }
 .listen-summary {
   display: flex;

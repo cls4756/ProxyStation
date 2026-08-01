@@ -251,11 +251,9 @@ func BuildSingboxConfig(setting *configure.Setting) (*SingboxConfig, error) {
 		}
 	}
 
-	// 先收集所有有效出站 tag（已绑定节点的）
-	validOutboundTags := map[string]bool{
-		"direct": true,
-		"block":  true,
-	}
+	// 先收集所有有效出站 tag（已绑定节点的），供前置代理引用校验
+	validOutboundTags := collectValidOutboundTags()
+
 	var firstProxyOutbound string
 	for _, name := range configure.GetOutboundNames() {
 		o := configure.GetOutbound(name)
@@ -269,6 +267,13 @@ func BuildSingboxConfig(setting *configure.Setting) (*SingboxConfig, error) {
 		ob, err := singboxServerToOutbound(s, name)
 		if err != nil {
 			return nil, fmt.Errorf("outbound %v: %w", name, err)
+		}
+		// 前置代理：sing-box 通过 detour 引用前置出站 tag
+		if front := resolveFrontProxyTag(s, name, validOutboundTags); front != "" {
+			ob.Detour = front
+			if LogCallback != nil {
+				LogCallback(fmt.Sprintf("🔗 singbox outbound %s 前置代理 => %s", name, front))
+			}
 		}
 		if LogCallback != nil {
 			LogCallback(fmt.Sprintf("📘 singbox outbound %s => type=%s server=%s port=%d", name, ob.Type, ob.Server, ob.ServerPort))
@@ -304,12 +309,6 @@ func BuildSingboxConfig(setting *configure.Setting) (*SingboxConfig, error) {
 				break
 			}
 		}
-		// 更新 rule-set 的 download_detour（仅 remote 类型）
-		for i := range cfg.Route.RuleSet {
-			if cfg.Route.RuleSet[i].Type == "remote" {
-				cfg.Route.RuleSet[i].DownloadDetour = firstProxyOutbound
-			}
-		}
 	} else {
 		cfg.Route.Final = "direct"
 		// 没有代理出站时，DNS remote 也走 direct
@@ -317,12 +316,6 @@ func BuildSingboxConfig(setting *configure.Setting) (*SingboxConfig, error) {
 			if cfg.DNS.Servers[i].Tag == "remote" {
 				cfg.DNS.Servers[i].Detour = "direct"
 				break
-			}
-		}
-		// 更新 rule-set 的 download_detour（仅 remote 类型）
-		for i := range cfg.Route.RuleSet {
-			if cfg.Route.RuleSet[i].Type == "remote" {
-				cfg.Route.RuleSet[i].DownloadDetour = "direct"
 			}
 		}
 	}
@@ -360,17 +353,13 @@ func BuildSingboxConfig(setting *configure.Setting) (*SingboxConfig, error) {
 		// 解析域名规则
 		for _, d := range r.Domains {
 			if strings.HasPrefix(d, "geosite:") {
-				name := strings.TrimPrefix(d, "geosite:")
-				if alias, ok := geoNameAliases[name]; ok {
-					if alias == "" {
-						continue
-					}
-					name = alias
+				name, ok := resolveGeoName(strings.TrimPrefix(d, "geosite:"))
+				if !ok {
+					continue
 				}
 				tag := "geosite-" + name
 				ruleSets = append(ruleSets, tag)
-				cfg.Route.RuleSet = appendRuleSetIfAbsent(cfg.Route.RuleSet, tag,
-					"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/"+name+".srs")
+				cfg.Route.RuleSet = appendRuleSetIfAbsent(cfg.Route.RuleSet, tag, geositeRuleSetURL(name))
 			} else if strings.HasPrefix(d, "domain:") {
 				// domain: 前缀用 domain_suffix，匹配该域名及其所有子域名
 				domainSuffixes = append(domainSuffixes, strings.TrimPrefix(d, "domain:"))
@@ -386,21 +375,18 @@ func BuildSingboxConfig(setting *configure.Setting) (*SingboxConfig, error) {
 		// 解析 IP 规则
 		for _, ip := range r.IPs {
 			if strings.HasPrefix(ip, "geoip:") {
-				name := strings.TrimPrefix(ip, "geoip:")
-				if name == "private" {
+				rawName := strings.TrimPrefix(ip, "geoip:")
+				if rawName == "private" {
 					ipIsPrivate = true
 					continue
 				}
-				if alias, ok := geoNameAliases[name]; ok {
-					if alias == "" {
-						continue
-					}
-					name = alias
+				name, ok := resolveGeoName(rawName)
+				if !ok {
+					continue
 				}
 				tag := "geoip-" + name
 				ruleSets = append(ruleSets, tag)
-				cfg.Route.RuleSet = appendRuleSetIfAbsent(cfg.Route.RuleSet, tag,
-					"https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/"+name+".srs")
+				cfg.Route.RuleSet = appendRuleSetIfAbsent(cfg.Route.RuleSet, tag, geoipRuleSetURL(name))
 			} else {
 				ipCIDRs = append(ipCIDRs, ip)
 			}
@@ -469,6 +455,16 @@ func BuildSingboxConfig(setting *configure.Setting) (*SingboxConfig, error) {
 		if len(ruleSets) == 0 && len(domainSuffixes) == 0 &&
 			len(domainKeywords) == 0 && len(domainRegexes) == 0 && len(ipCIDRs) == 0 && !ipIsPrivate {
 			addRule(base)
+		}
+	}
+
+	// download_detour 必须在所有 rule-set 收集完之后统一赋值：
+	// 用户自定义规则的 rule-set 是在上面的循环里才追加的，早于此处赋值会漏掉它们，
+	// 导致这些 rule-set 以直连方式下载而在被墙环境下静默失败。
+	ruleSetDetour := cfg.Route.Final
+	for i := range cfg.Route.RuleSet {
+		if cfg.Route.RuleSet[i].Type == "remote" {
+			cfg.Route.RuleSet[i].DownloadDetour = ruleSetDetour
 		}
 	}
 
@@ -886,6 +882,90 @@ var geoNameAliases = map[string]string{
 	"china-list": "cn",
 	"china":      "cn",
 	"private":    "", // 用 ip_is_private 替代，不生成 rule-set
+}
+
+// resolveGeoName 应用别名映射；返回 ok=false 表示该名称不对应 rule-set 文件
+func resolveGeoName(name string) (string, bool) {
+	if alias, ok := geoNameAliases[name]; ok {
+		if alias == "" {
+			return "", false
+		}
+		return alias, true
+	}
+	if !safeGeoName(name) {
+		return "", false
+	}
+	return name, true
+}
+
+// safeGeoName 拒绝会逃出 rule-set 目录的名称。
+// 该名称同时用于拼接下载 URL 和本地文件路径，且完全来自用户输入。
+func safeGeoName(name string) bool {
+	if name == "" || strings.Contains(name, "..") {
+		return false
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z',
+			r >= 'A' && r <= 'Z',
+			r >= '0' && r <= '9',
+			r == '-', r == '_', r == '.', r == '!':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// geositeRuleSetURL / geoipRuleSetURL 是 rule-set 下载地址的唯一来源，
+// 配置生成与预下载共用，避免两处拼接逻辑漂移。
+func geositeRuleSetURL(name string) string {
+	return "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/" + name + ".srs"
+}
+
+func geoipRuleSetURL(name string) string {
+	return "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/" + name + ".srs"
+}
+
+// collectUserRuleSetRefs 扫描已启用的自定义路由规则，得出其引用的 rule-set。
+// 只看已启用的规则，与 BuildSingboxConfig 的取值范围保持一致。
+func collectUserRuleSetRefs() []RuleSetRef {
+	seen := map[string]struct{}{}
+	var refs []RuleSetRef
+	add := func(tag, url string) {
+		if _, ok := seen[tag]; ok {
+			return
+		}
+		seen[tag] = struct{}{}
+		refs = append(refs, RuleSetRef{Name: tag, URL: url})
+	}
+
+	for _, r := range configure.GetRoutingRules() {
+		if !r.Enabled {
+			continue
+		}
+		for _, d := range r.Domains {
+			if !strings.HasPrefix(d, "geosite:") {
+				continue
+			}
+			if name, ok := resolveGeoName(strings.TrimPrefix(d, "geosite:")); ok {
+				add("geosite-"+name, geositeRuleSetURL(name))
+			}
+		}
+		for _, ip := range r.IPs {
+			if !strings.HasPrefix(ip, "geoip:") {
+				continue
+			}
+			raw := strings.TrimPrefix(ip, "geoip:")
+			if raw == "private" {
+				continue
+			}
+			if name, ok := resolveGeoName(raw); ok {
+				add("geoip-"+name, geoipRuleSetURL(name))
+			}
+		}
+	}
+	return refs
 }
 
 // singboxLogLevel 将通用日志级别直接传给 sing-box，保持一致

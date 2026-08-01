@@ -40,6 +40,8 @@ type Setting struct {
 	GroupSwitchThresholdMs int `json:"groupSwitchThresholdMs,omitempty"`
 	// 分组出站切换冷却时间（秒），冷却期内不重复切换
 	GroupSwitchCooldownSec int `json:"groupSwitchCooldownSec,omitempty"`
+	// 订阅分组更新测速后，向指定本地分组复制节点的规则
+	SubscriptionBestNodeCopyRules []SubscriptionNodeCopyRule `json:"subscriptionBestNodeCopyRules,omitempty"`
 	// 默认入站认证
 	Socks5Username string           `json:"socks5Username,omitempty"`
 	Socks5Password string           `json:"socks5Password,omitempty"`
@@ -50,6 +52,40 @@ type Setting struct {
 	// Web 管理端认证
 	WebUsername string `json:"webUsername,omitempty"`
 	WebPassword string `json:"webPassword,omitempty"`
+}
+
+// 订阅节点复制方式
+const (
+	CopyModeBest = "best" // 仅延迟最低的一个
+	CopyModeTopN = "topN" // 延迟最低的前 N 个
+	CopyModeAll  = "all"  // 全部连通节点
+)
+
+type SubscriptionNodeCopyRule struct {
+	SourceGroupIDs []string `json:"sourceGroupIds"`
+	TargetGroupIDs []string `json:"targetGroupIds"`
+	Mode           string   `json:"mode,omitempty"`
+	Count          int      `json:"count,omitempty"` // 仅 Mode=topN 时生效
+
+	// 旧版本只支持单个来源分组。这是已落库的用户配置，直接删字段会导致规则丢失，
+	// 因此保留用于读取，GetSettingNotNil 会折叠进 SourceGroupIDs 后清空。
+	LegacySourceGroupID string `json:"sourceGroupId,omitempty"`
+}
+
+// CopyCount 本规则应复制的节点数，0 表示不限（全部连通）
+func (r SubscriptionNodeCopyRule) CopyCount() int {
+	switch r.Mode {
+	case CopyModeAll:
+		return 0
+	case CopyModeTopN:
+		if r.Count > 0 {
+			return r.Count
+		}
+		return 1
+	default:
+		// 含历史数据的空 Mode：保持旧行为，只复制最快的一个
+		return 1
+	}
 }
 
 func NewSetting() *Setting {
@@ -118,10 +154,38 @@ func GetSettingNotNil() *Setting {
 		s.GroupSwitchCooldownSec = 600
 		changed = true
 	}
+	if migrateNodeCopyRules(s.SubscriptionBestNodeCopyRules) {
+		changed = true
+	}
 	if changed {
 		_ = db.Set("system", "setting", s)
 	}
 	return s
+}
+
+// migrateNodeCopyRules 把旧版单来源分组字段折叠进 SourceGroupIDs，返回是否有改动
+func migrateNodeCopyRules(rules []SubscriptionNodeCopyRule) bool {
+	changed := false
+	for i := range rules {
+		r := &rules[i]
+		legacy := strings.TrimSpace(r.LegacySourceGroupID)
+		if legacy == "" {
+			continue
+		}
+		found := false
+		for _, id := range r.SourceGroupIDs {
+			if id == legacy {
+				found = true
+				break
+			}
+		}
+		if !found {
+			r.SourceGroupIDs = append(r.SourceGroupIDs, legacy)
+		}
+		r.LegacySourceGroupID = ""
+		changed = true
+	}
+	return changed
 }
 
 func SetSetting(s *Setting) error {

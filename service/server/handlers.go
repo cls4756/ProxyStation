@@ -621,6 +621,8 @@ func editServer(c *gin.Context) {
 	var req struct {
 		Name string `json:"name"`
 		Link string `json:"link"`
+		// 指针类型：区分「未传」与「显式清空」
+		FrontProxy *string `json:"frontProxy"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -633,6 +635,14 @@ func editServer(c *gin.Context) {
 	}
 	if req.Name != "" {
 		s.Name = req.Name
+	}
+	if req.FrontProxy != nil {
+		fp := strings.TrimSpace(*req.FrontProxy)
+		if fp != "" && configure.GetOutbound(fp) == nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("前置代理出站 %s 不存在", fp)})
+			return
+		}
+		s.FrontProxy = fp
 	}
 	if req.Link != "" {
 		s.Link = req.Link
@@ -831,21 +841,93 @@ func copyServerToGroup(c *gin.Context) {
 	var req struct {
 		Ref     configure.ServerRef `json:"ref"`
 		GroupID string              `json:"groupId"`
+		Clone   *bool               `json:"clone,omitempty"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	groupIndex, _ := configure.GetGroupByID(req.GroupID)
+	groupIndex, group := configure.GetGroupByID(req.GroupID)
 	if groupIndex < 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "group not found"})
 		return
 	}
-	if err := configure.AddServerToGroup(groupIndex, req.Ref); err != nil {
+	ref := req.Ref
+	clone := req.Clone == nil || *req.Clone
+	if clone {
+		server := serverRawByServerRef(req.Ref)
+		if server == nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "server not found"})
+			return
+		}
+		if groupHasServerRaw(group.Servers, *server) {
+			c.JSON(http.StatusOK, gin.H{"ok": true, "skipped": true})
+			return
+		}
+		localRef, ok := ensureLocalServerCopy(*server)
+		if !ok {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "clone server failed"})
+			return
+		}
+		ref = localRef
+	}
+	if err := configure.AddServerToGroup(groupIndex, ref); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+func serverRawByServerRef(ref configure.ServerRef) *configure.ServerRaw {
+	switch ref.Type {
+	case "server":
+		return configure.GetServer(ref.Index)
+	case "sub_server":
+		sub := configure.GetSubscription(ref.Sub)
+		if sub == nil || ref.Index < 0 || ref.Index >= len(sub.Servers) {
+			return nil
+		}
+		return &sub.Servers[ref.Index]
+	default:
+		return nil
+	}
+}
+
+func ensureLocalServerCopy(server configure.ServerRaw) (configure.ServerRef, bool) {
+	servers := configure.GetServers()
+	for i, existing := range servers {
+		if sameServerRaw(existing, server) {
+			return configure.ServerRef{Type: "server", Index: i, Sub: 0}, true
+		}
+	}
+	server.Source = "manual"
+	server.Latency = -1
+	server.LastProbeTime = 0
+	index := len(servers)
+	if err := configure.AppendServers([]*configure.ServerRaw{&server}); err != nil {
+		return configure.ServerRef{}, false
+	}
+	return configure.ServerRef{Type: "server", Index: index, Sub: 0}, true
+}
+
+func groupHasServerRaw(refs []configure.ServerRef, server configure.ServerRaw) bool {
+	for _, ref := range refs {
+		existing := serverRawByServerRef(ref)
+		if existing != nil && sameServerRaw(*existing, server) {
+			return true
+		}
+	}
+	return false
+}
+
+func sameServerRaw(a, b configure.ServerRaw) bool {
+	if strings.TrimSpace(a.Link) != "" && strings.TrimSpace(a.Link) == strings.TrimSpace(b.Link) {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(a.Type), strings.TrimSpace(b.Type)) &&
+		strings.EqualFold(strings.TrimSpace(a.Host), strings.TrimSpace(b.Host)) &&
+		a.Port == b.Port &&
+		strings.TrimSpace(a.Name) == strings.TrimSpace(b.Name)
 }
 
 // ---- Subscriptions ----
@@ -912,6 +994,8 @@ func updateSubscription(c *gin.Context) {
 		Name   string                       `json:"name"`
 		URL    string                       `json:"url"`
 		Format configure.SubscriptionFormat `json:"format"`
+		// 指针类型：区分「未传」与「显式清空」
+		ProxyOutbound *string `json:"proxyOutbound"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -930,6 +1014,9 @@ func updateSubscription(c *gin.Context) {
 	}
 	if req.Format != "" {
 		sub.Format = req.Format
+	}
+	if req.ProxyOutbound != nil {
+		sub.ProxyOutbound = strings.TrimSpace(*req.ProxyOutbound)
 	}
 	if err := configure.SetSubscription(index, sub); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -1006,12 +1093,24 @@ func updateSubscriptionNodes(c *gin.Context) {
 // fetchSubscription 拉取订阅内容并更新节点
 func fetchSubscription(index int, sub *configure.SubscriptionRaw) {
 	addLog(fmt.Sprintf("📥 开始拉取订阅: %s (%s)", sub.Name, sub.URL))
-	subClient := &http.Client{
-		Transport: &http.Transport{
-			DialContext:         (&net.Dialer{Timeout: 30 * time.Second}).DialContext,
-			TLSHandshakeTimeout: 30 * time.Second,
-		},
+
+	// 构建 HTTP 客户端，支持通过指定出站代理拉取
+	transport := &http.Transport{
+		DialContext:         (&net.Dialer{Timeout: 30 * time.Second}).DialContext,
+		TLSHandshakeTimeout: 30 * time.Second,
 	}
+
+	// 若订阅配置了走代理拉取，则经由内核的本地 SOCKS5 入站
+	if sub.ProxyOutbound != "" {
+		if proxyURL, err := builtinSocksProxyURL(); err != nil {
+			addLog(fmt.Sprintf("⚠️  %v，将尝试直连拉取", err))
+		} else {
+			transport.Proxy = http.ProxyURL(proxyURL)
+			addLog(fmt.Sprintf("🔗 通过本地代理 %s 拉取订阅", proxyURL.Host))
+		}
+	}
+
+	subClient := &http.Client{Transport: transport}
 	resp, err := subClient.Get(sub.URL)
 	if err != nil {
 		addLog(fmt.Sprintf("❌ 拉取订阅失败: %v", err))
@@ -1040,6 +1139,7 @@ func fetchSubscription(index int, sub *configure.SubscriptionRaw) {
 	for i := range servers {
 		servers[i].Source = sub.ID
 	}
+	servers = configure.PreserveActiveSubscriptionServers(index, sub.Servers, servers)
 	sub.Servers = servers
 	sub.UpdatedAt = time.Now()
 
@@ -1498,6 +1598,10 @@ func fastReachableRef(ref configure.NodeRef) bool {
 		if s == nil {
 			return false
 		}
+		// 需经前置代理才能连通的节点，直连预检必然失败，交给内核走链路测
+		if s.FrontProxy != "" {
+			return true
+		}
 		return probe.FastReachable(s, fastProbeTimeout)
 	case "sub_server":
 		sub := configure.GetSubscription(ref.Sub)
@@ -1505,6 +1609,9 @@ func fastReachableRef(ref configure.NodeRef) bool {
 			return false
 		}
 		s := sub.Servers[ref.Index]
+		if s.FrontProxy != "" || sub.ProxyOutbound != "" {
+			return true
+		}
 		return probe.FastReachable(&s, fastProbeTimeout)
 	default:
 		return false
@@ -1529,6 +1636,23 @@ func ensureProbeOutboundForNode(ref configure.NodeRef) error {
 	}
 	observatory.OnOutboundUpdated(engine.ProbeOutboundName)
 	return engine.Manager.Restart()
+}
+
+// builtinSocksProxyURL 返回本地内建 SOCKS5 入站的代理 URL，若内核未运行则报错
+func builtinSocksProxyURL() (*url.URL, error) {
+	if !engine.Manager.IsRunning() {
+		return nil, fmt.Errorf("内核未运行")
+	}
+	setting := configure.GetSettingNotNil()
+	// 构造带认证的 SOCKS5 URL（若配置了认证账号）
+	accounts := setting.Socks5AuthAccounts()
+	if len(accounts) > 0 {
+		// 使用第一个账号
+		acc := accounts[0]
+		return url.Parse(fmt.Sprintf("socks5://%s:%s@127.0.0.1:%d",
+			url.QueryEscape(acc.Username), url.QueryEscape(acc.Password), setting.Socks5Port))
+	}
+	return url.Parse(fmt.Sprintf("socks5://127.0.0.1:%d", setting.Socks5Port))
 }
 
 func nodeRefEqual(a, b *configure.NodeRef) bool {
@@ -1678,6 +1802,25 @@ func setSetting(c *gin.Context) {
 	}
 	if s.GroupSwitchCooldownSec < 0 {
 		s.GroupSwitchCooldownSec = 600
+	}
+	for i := range s.SubscriptionBestNodeCopyRules {
+		r := &s.SubscriptionBestNodeCopyRules[i]
+		switch r.Mode {
+		case "":
+			r.Mode = configure.CopyModeBest
+		case configure.CopyModeBest, configure.CopyModeAll:
+		case configure.CopyModeTopN:
+			if r.Count <= 0 {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "复制数量必须大于 0"})
+				return
+			}
+		default:
+			c.JSON(http.StatusBadRequest, gin.H{"error": "节点复制方式非法"})
+			return
+		}
+		if r.Mode != configure.CopyModeTopN {
+			r.Count = 0
+		}
 	}
 	current := configure.GetSettingNotNil()
 	if s.WebPassword == "" {

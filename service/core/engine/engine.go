@@ -443,6 +443,11 @@ func getServerRaw(ref *configure.NodeRef) *configure.ServerRaw {
 			return nil
 		}
 		s := sub.Servers[ref.Index]
+		// 订阅需要代理才能拉取时，其节点通常也需经同一前置代理才能连通。
+		// 节点未显式设置前置代理时，继承订阅的代理出站。
+		if s.FrontProxy == "" && sub.ProxyOutbound != "" {
+			s.FrontProxy = sub.ProxyOutbound
+		}
 		return &s
 	}
 	return nil
@@ -492,6 +497,64 @@ func resolveOutboundServerRaw(name string, o *configure.Outbound) *configure.Ser
 		return nil
 	}
 	return getServerRaw(ref)
+}
+
+// collectValidOutboundTags 返回所有已绑定节点的出站名，供前置代理引用校验使用。
+// 必须先于出站生成完整收集一遍，否则前置代理指向排序靠后的出站会被误判为不存在。
+func collectValidOutboundTags() map[string]bool {
+	tags := map[string]bool{"direct": true, "block": true}
+	for _, name := range configure.GetOutboundNames() {
+		o := configure.GetOutbound(name)
+		if o == nil {
+			continue
+		}
+		if resolveOutboundServerRaw(name, o) != nil {
+			tags[name] = true
+		}
+	}
+	return tags
+}
+
+// resolveFrontProxyTag 校验节点的前置代理是否可用，返回应写入配置的 tag。
+// 返回空字符串表示不设前置代理。校验不通过时只记日志，不阻断配置生成。
+func resolveFrontProxyTag(s *configure.ServerRaw, name string, validTags map[string]bool) string {
+	if s == nil || s.FrontProxy == "" {
+		return ""
+	}
+	front := s.FrontProxy
+	warn := func(reason string) {
+		if LogCallback != nil {
+			LogCallback(fmt.Sprintf("⚠️  出站 %s 的前置代理 %s %s，已忽略", name, front, reason))
+		}
+	}
+	// 自引用会让内核建链时死循环
+	if front == name {
+		warn("指向自身")
+		return ""
+	}
+	if !validTags[front] {
+		warn("不存在或未绑定节点")
+		return ""
+	}
+	// 沿前置链上溯，防止 A→B→A 这类环导致内核无法建链
+	seen := map[string]bool{name: true}
+	for cur := front; cur != ""; {
+		if seen[cur] {
+			warn("存在循环引用")
+			return ""
+		}
+		seen[cur] = true
+		o := configure.GetOutbound(cur)
+		if o == nil {
+			break
+		}
+		next := resolveOutboundServerRaw(cur, o)
+		if next == nil {
+			break
+		}
+		cur = next.FrontProxy
+	}
+	return front
 }
 
 func (em *EngineManager) ensureCfDOSidecars() error {
@@ -836,7 +899,7 @@ func RuleSetStatus() map[string]string {
 	return result
 }
 
-// DownloadRuleSets 下载所有内置 rule-set 文件到 dataDir/rule-set/
+// DownloadRuleSets 下载内置 rule-set，以及自定义路由规则引用到的 rule-set
 func DownloadRuleSets(mirror string, progressCh chan<- DownloadProgress) error {
 	// 若前端未传 mirror，从设置里读
 	if mirror == "" {
@@ -848,8 +911,10 @@ func DownloadRuleSets(mirror string, progressCh chan<- DownloadProgress) error {
 		return err
 	}
 
-	total := len(ruleSetFiles)
-	for i, rs := range ruleSetFiles {
+	refs := allRuleSetRefs()
+	total := len(refs)
+	var failedOptional []string
+	for i, rs := range refs {
 		pct := float64(i) / float64(total) * 100
 		progressCh <- DownloadProgress{
 			Kernel:  "rule-set",
@@ -866,6 +931,15 @@ func DownloadRuleSets(mirror string, progressCh chan<- DownloadProgress) error {
 		destPath := filepath.Join(ruleSetDir, rs.Name+".srs")
 		if err := downloadFile(fileURL, destPath); err != nil {
 			msg := fmt.Sprintf("下载 %s 失败: %v", rs.Name, err)
+			// 自定义规则里的名称由用户手输，拼错会 404；
+			// 这类失败不应中断整批下载，记下来最后一起提示。
+			if !rs.Builtin {
+				failedOptional = append(failedOptional, rs.Name)
+				if LogCallback != nil {
+					LogCallback("⚠️ " + msg + "（请检查规则中的名称是否正确）")
+				}
+				continue
+			}
 			progressCh <- DownloadProgress{Kernel: "rule-set", Status: "error", Message: msg}
 			if LogCallback != nil {
 				LogCallback("❌ " + msg)
@@ -874,9 +948,18 @@ func DownloadRuleSets(mirror string, progressCh chan<- DownloadProgress) error {
 		}
 	}
 
-	progressCh <- DownloadProgress{Kernel: "rule-set", Status: "done", Message: "所有 rule-set 下载完成", Percent: 100}
+	doneMsg := "所有 rule-set 下载完成"
+	if len(failedOptional) > 0 {
+		doneMsg = fmt.Sprintf("rule-set 下载完成，但以下自定义规则引用的文件获取失败：%s",
+			strings.Join(failedOptional, "、"))
+	}
+	progressCh <- DownloadProgress{Kernel: "rule-set", Status: "done", Message: doneMsg, Percent: 100}
 	if LogCallback != nil {
-		LogCallback("✅ rule-set 下载完成")
+		if len(failedOptional) > 0 {
+			LogCallback("⚠️ " + doneMsg)
+		} else {
+			LogCallback("✅ rule-set 下载完成")
+		}
 	}
 	return nil
 }

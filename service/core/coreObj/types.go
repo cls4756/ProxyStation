@@ -143,6 +143,8 @@ type Sockopt struct {
 	Mark        *int   `json:"mark,omitempty"`
 	TCPFastOpen *bool  `json:"tcpFastOpen,omitempty"`
 	Tproxy      string `json:"tproxy,omitempty"`
+	// DialerProxy 前置代理出站 tag，本出站的连接先经由该出站建立
+	DialerProxy string `json:"dialerProxy,omitempty"`
 }
 
 type Mux struct {
