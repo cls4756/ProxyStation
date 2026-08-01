@@ -208,10 +208,21 @@ func importAuto(c *gin.Context) {
 		subURLs   []string
 	)
 	for _, line := range lines {
-		if isHTTPURL(line) {
+		switch classifyHTTPURL(line) {
+		case urlKindSubscription:
 			subURLs = append(subURLs, line)
-		} else if isNodeLink(line) {
-			nodeLinks = append(nodeLinks, line)
+		case urlKindAmbiguous:
+			// http://host:port 既可能是订阅也可能是 HTTP 代理节点，拉一次内容再定
+			if looksLikeSubscription(line) {
+				addLog(fmt.Sprintf("🔍 %s 返回可解析的订阅内容，按订阅导入", line))
+				subURLs = append(subURLs, line)
+			} else {
+				nodeLinks = append(nodeLinks, line)
+			}
+		default:
+			if isNodeLink(line) {
+				nodeLinks = append(nodeLinks, line)
+			}
 		}
 	}
 
@@ -369,21 +380,34 @@ func trimSpace(s string) string {
 	return s
 }
 
-func isHTTPURL(s string) bool {
+// urlKind 描述一行 http(s) 输入的归类结果
+type urlKind int
+
+const (
+	// urlKindNotHTTP 不是 http(s) 开头，交给 isNodeLink 判断
+	urlKindNotHTTP urlKind = iota
+	// urlKindSubscription 明确是订阅 URL
+	urlKindSubscription
+	// urlKindProxyNode 明确是 HTTP 代理节点链接
+	urlKindProxyNode
+	// urlKindAmbiguous 形如 http://host:port，订阅和代理节点无法从 URL 本身区分
+	urlKindAmbiguous
+)
+
+// classifyHTTPURL 区分订阅 URL 和 HTTP 代理节点链接
+// HTTP 代理节点格式：http://[user:pass@]host:port  —— 有端口，路径极短或无路径
+// 订阅 URL 格式：https://example.com/subscribe/xxx  —— 有路径
+//
+// 判断规则：
+//  1. 包含 @ 且 @ 在第一个 / 之前 → 代理节点（http://user:pass@host:port）
+//  2. 有实质路径（/xxx/yyy）→ 订阅 URL
+//  3. 去掉 scheme 后没有路径（或路径只有 /）→ 两者结构完全一致，无法靠字符串区分，
+//     交给调用方拉取内容后再定（urlKindAmbiguous）
+func classifyHTTPURL(s string) urlKind {
 	lower := strings.ToLower(s)
 	if !strings.HasPrefix(lower, "http://") && !strings.HasPrefix(lower, "https://") {
-		return false
+		return urlKindNotHTTP
 	}
-	// 区分订阅 URL 和 HTTP 代理节点链接
-	// HTTP 代理节点格式：http://[user:pass@]host:port  —— 有端口，路径极短或无路径
-	// 订阅 URL 格式：https://example.com/subscribe/xxx  —— 有路径
-	//
-	// 判断规则：
-	//   1. 包含 @ 且 @ 在第一个 / 之前 → 代理节点（http://user:pass@host:port）
-	//   2. 去掉 scheme 后，host:port 部分后面没有路径（或路径为 /）→ 可能是代理节点，但不确定
-	//   3. 有明显路径（/xxx/yyy）→ 订阅 URL
-	//
-	// 最可靠的判断：有 @ 符号在 host 部分 → 代理节点
 	afterScheme := s
 	if i := strings.Index(s, "://"); i >= 0 {
 		afterScheme = s[i+3:]
@@ -396,14 +420,44 @@ func isHTTPURL(s string) bool {
 	}
 	// hostPart 里有 @ → 是代理节点（user:pass@host:port）
 	if strings.Contains(hostPart, "@") {
-		return false // 是节点链接，不是订阅
+		return urlKindProxyNode
 	}
-	// 没有路径或路径只有 / → 不像订阅 URL，当节点处理
-	if slashIdx < 0 || (slashIdx == len(afterScheme)-1) {
-		return false
+	// 没有路径或路径只有 / → 无法判断，需要探测内容
+	if slashIdx < 0 || slashIdx == len(afterScheme)-1 {
+		return urlKindAmbiguous
 	}
 	// 有实质路径 → 当订阅 URL
-	return true
+	return urlKindSubscription
+}
+
+// probeBodyLimit 探测时最多读取的响应字节数，避免误连到大文件端点时读爆内存
+const probeBodyLimit = 4 << 20
+
+// looksLikeSubscription 拉取一次内容来判断 http://host:port 形式的地址是不是订阅。
+// 能解析出节点即认定为订阅；HTTP 代理节点收到普通 GET 时不会返回可解析的订阅内容，
+// 拉取失败（离线、超时）时同样落回节点处理，保持原有行为。
+func looksLikeSubscription(rawURL string) bool {
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext:         (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
+			TLSHandshakeTimeout: 5 * time.Second,
+		},
+		Timeout: 10 * time.Second,
+	}
+	resp, err := client.Get(rawURL)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return false
+	}
+	content, err := io.ReadAll(io.LimitReader(resp.Body, probeBodyLimit))
+	if err != nil {
+		return false
+	}
+	servers, _, err := subscription.Parse(content, configure.FormatAuto)
+	return err == nil && len(servers) > 0
 }
 
 func isNodeLink(s string) bool {
