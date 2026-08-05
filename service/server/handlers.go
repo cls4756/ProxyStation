@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -826,11 +827,14 @@ func buildShareURIFromClashMap(s *configure.ServerRaw, m map[string]interface{})
 
 	case "trojan":
 		password := getString("password")
-		sni := getString("sni")
+		sni := firstNonEmptyStr(getString("sni"), getString("servername"))
 		insecure := getBool("skip-cert-verify")
-		q := url.Values{}
+		q := clashTransportQuery(m)
 		if sni != "" {
 			q.Set("sni", sni)
+		}
+		if fp := getString("client-fingerprint"); fp != "" {
+			q.Set("fp", fp)
 		}
 		if insecure {
 			q.Set("allowInsecure", "1")
@@ -844,10 +848,233 @@ func buildShareURIFromClashMap(s *configure.ServerRaw, m map[string]interface{})
 		}
 		return u.String()
 
-	default:
-		// 其他协议直接返回原始 link 或简单格式
-		return fmt.Sprintf("%s://%s:%d#%s", s.Type, host, port, name)
+	case "ss", "shadowsocks":
+		method := firstNonEmptyStr(getString("cipher"), getString("method"))
+		password := getString("password")
+		if method == "" || password == "" {
+			break
+		}
+		// SIP002: ss://base64(method:password)@host:port#name
+		userinfo := base64.RawURLEncoding.EncodeToString([]byte(method + ":" + password))
+		q := url.Values{}
+		if plugin := getString("plugin"); plugin != "" {
+			q.Set("plugin", plugin+clashPluginOpts(m))
+		}
+		share := fmt.Sprintf("ss://%s@%s:%d", userinfo, host, port)
+		if encoded := q.Encode(); encoded != "" {
+			share += "?" + encoded
+		}
+		return share + "#" + name
+
+	case "vless":
+		uuid := firstNonEmptyStr(getString("uuid"), getString("id"))
+		if uuid == "" {
+			break
+		}
+		q := clashTransportQuery(m)
+		security := "none"
+		if reality, ok := m["reality-opts"].(map[string]interface{}); ok {
+			security = "reality"
+			if pbk, _ := reality["public-key"].(string); pbk != "" {
+				q.Set("pbk", pbk)
+			}
+			if sid, _ := reality["short-id"].(string); sid != "" {
+				q.Set("sid", sid)
+			}
+		} else if getBool("tls") {
+			security = "tls"
+		}
+		q.Set("security", security)
+		if sni := firstNonEmptyStr(getString("sni"), getString("servername")); sni != "" {
+			q.Set("sni", sni)
+		}
+		if fp := getString("client-fingerprint"); fp != "" {
+			q.Set("fp", fp)
+		}
+		if flow := getString("flow"); flow != "" {
+			q.Set("flow", flow)
+		}
+		if getBool("skip-cert-verify") {
+			q.Set("allowInsecure", "1")
+		}
+		u := url.URL{
+			Scheme:   "vless",
+			User:     url.User(uuid),
+			Host:     fmt.Sprintf("%s:%d", host, port),
+			RawQuery: q.Encode(),
+			Fragment: s.Name,
+		}
+		return u.String()
+
+	case "vmess":
+		uuid := firstNonEmptyStr(getString("uuid"), getString("id"))
+		if uuid == "" {
+			break
+		}
+		// vmess 通用格式为 base64(JSON)，字段名沿用 v2rayN 约定
+		network := strings.ToLower(getString("network"))
+		if network == "" {
+			network = "tcp"
+		}
+		path, wsHost, serviceName := clashTransportParts(m)
+		if serviceName != "" {
+			path = serviceName
+		}
+		tls := ""
+		if getBool("tls") {
+			tls = "tls"
+		}
+		conf := map[string]interface{}{
+			"v":    "2",
+			"ps":   s.Name,
+			"add":  host,
+			"port": strconv.Itoa(port),
+			"id":   uuid,
+			"aid":  strconv.Itoa(anyToIntLocal(m["alterId"])),
+			"scy":  firstNonEmptyStr(getString("cipher"), "auto"),
+			"net":  network,
+			"type": "none",
+			"host": wsHost,
+			"path": path,
+			"tls":  tls,
+			"sni":  firstNonEmptyStr(getString("sni"), getString("servername")),
+		}
+		data, err := json.Marshal(conf)
+		if err != nil {
+			break
+		}
+		return "vmess://" + base64.StdEncoding.EncodeToString(data)
+
+	case "socks5", "socks":
+		u := url.URL{
+			Scheme:   "socks5",
+			Host:     fmt.Sprintf("%s:%d", host, port),
+			Fragment: s.Name,
+		}
+		if username := getString("username"); username != "" {
+			u.User = url.UserPassword(username, getString("password"))
+		}
+		return u.String()
+
+	case "http", "https":
+		scheme := "http"
+		if s.Type == "https" || getBool("tls") {
+			scheme = "https"
+		}
+		u := url.URL{
+			Scheme:   scheme,
+			Host:     fmt.Sprintf("%s:%d", host, port),
+			Fragment: s.Name,
+		}
+		if username := getString("username"); username != "" {
+			u.User = url.UserPassword(username, getString("password"))
+		}
+		return u.String()
 	}
+
+	// 无法还原完整参数时退回最简形式，至少保留地址信息
+	return fmt.Sprintf("%s://%s:%d#%s", s.Type, host, port, name)
+}
+
+func firstNonEmptyStr(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func anyToIntLocal(v interface{}) int {
+	switch val := v.(type) {
+	case int:
+		return val
+	case float64:
+		return int(val)
+	case string:
+		n, _ := strconv.Atoi(val)
+		return n
+	}
+	return 0
+}
+
+// clashTransportParts 取出 clash 各传输层子字典里的 path / host / serviceName
+func clashTransportParts(m map[string]interface{}) (path, host, serviceName string) {
+	sub := func(key string) map[string]interface{} {
+		v, _ := m[key].(map[string]interface{})
+		return v
+	}
+	if ws := sub("ws-opts"); ws != nil {
+		path, _ = ws["path"].(string)
+		if headers, ok := ws["headers"].(map[string]interface{}); ok {
+			if h, _ := headers["Host"].(string); h != "" {
+				host = h
+			} else if h, _ := headers["host"].(string); h != "" {
+				host = h
+			}
+		}
+	}
+	if hu := sub("http-upgrade-opts"); hu != nil && path == "" {
+		path, _ = hu["path"].(string)
+	}
+	if h2 := sub("h2-opts"); h2 != nil && path == "" {
+		path, _ = h2["path"].(string)
+	}
+	if grpc := sub("grpc-opts"); grpc != nil {
+		serviceName, _ = grpc["grpc-service-name"].(string)
+	}
+	if host == "" {
+		host, _ = m["servername"].(string)
+	}
+	return path, host, serviceName
+}
+
+// clashTransportQuery 把传输层参数拼成标准分享 URI 的查询串
+func clashTransportQuery(m map[string]interface{}) url.Values {
+	q := url.Values{}
+	network, _ := m["network"].(string)
+	network = strings.ToLower(network)
+	path, host, serviceName := clashTransportParts(m)
+	// clash 用 ws-opts.v2ray-http-upgrade 表示 httpupgrade
+	if ws, ok := m["ws-opts"].(map[string]interface{}); ok {
+		if upgrade, _ := ws["v2ray-http-upgrade"].(bool); upgrade {
+			network = "httpupgrade"
+		}
+	}
+	if network != "" {
+		q.Set("type", network)
+	}
+	if path != "" {
+		q.Set("path", path)
+	}
+	if host != "" {
+		q.Set("host", host)
+	}
+	if serviceName != "" {
+		q.Set("serviceName", serviceName)
+	}
+	return q
+}
+
+// clashPluginOpts 还原 ss 的 plugin-opts 为 ";k=v" 串
+func clashPluginOpts(m map[string]interface{}) string {
+	opts, ok := m["plugin-opts"].(map[string]interface{})
+	if !ok || len(opts) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(opts))
+	for k := range opts {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for _, k := range keys {
+		b.WriteString(";")
+		b.WriteString(k)
+		b.WriteString("=")
+		b.WriteString(fmt.Sprintf("%v", opts[k]))
+	}
+	return b.String()
 }
 
 // copyServerToGroup 将节点复制到指定分组
