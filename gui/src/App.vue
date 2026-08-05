@@ -219,7 +219,7 @@
     </main>
 
     <!-- 日志面板（底部可折叠） -->
-    <div class="logs-panel" :class="{ 'logs-panel-expanded': showLogs }" ref="logsPanel">
+    <div class="logs-panel" :class="{ 'logs-panel-expanded': showLogs, 'logs-panel-resizing': logsResizing }" :style="logsPanelStyle" ref="logsPanel">
       <div class="logs-resize-handle" v-if="showLogs" @mousedown="startResize"></div>
       <div class="logs-header" @click="showLogs = !showLogs">
         <span class="logs-title">📋 日志</span>
@@ -354,6 +354,15 @@ const logsPanel = ref(null)
 let logsStreamPromise = null
 let logsEventSource = null
 const logsPanelHeight = ref(null)  // 用户自定义高度
+const logsResizing = ref(false)
+
+// 面板高度改用响应式绑定：此前用 nextTick 后手动写 style.height，
+// 而 logsPanel 在 v-else 分支内，首帧未挂载时赋值会丢失，
+// 表现为刷新后面板恢复成 CSS 的 max-height: 80vh（几乎占满屏幕）。
+const logsPanelStyle = computed(() => {
+  if (!showLogs.value || !logsPanelHeight.value) return {}
+  return { height: logsPanelHeight.value + 'px' }
+})
 
 // 从 localStorage 恢复日志面板状态和高度
 function restoreLogsPanelState() {
@@ -363,7 +372,18 @@ function restoreLogsPanelState() {
   }
   const saved = localStorage.getItem('logsPanelHeight')
   if (saved) {
-    logsPanelHeight.value = parseInt(saved)
+    const h = parseInt(saved)
+    if (Number.isFinite(h) && h >= 80) {
+      logsPanelHeight.value = h
+    }
+  }
+  const savedAutoScroll = localStorage.getItem('logsAutoScroll')
+  if (savedAutoScroll !== null) {
+    logsAutoScroll.value = savedAutoScroll === 'true'
+  }
+  const savedStreaming = localStorage.getItem('logsStreaming')
+  if (savedStreaming !== null) {
+    logsStreaming.value = savedStreaming === 'true'
   }
 }
 
@@ -374,18 +394,18 @@ function startResize(e) {
   if (!panel) return
   const startY = e.clientY
   const startH = panel.offsetHeight
+  logsResizing.value = true
   function onMove(ev) {
     const delta = startY - ev.clientY
-    const newH = Math.min(Math.max(startH + delta, 80), window.innerHeight * 0.8)
-    panel.style.height = newH + 'px'
-    logsPanelHeight.value = newH
+    logsPanelHeight.value = Math.min(Math.max(startH + delta, 80), window.innerHeight * 0.8)
   }
   function onUp() {
     document.removeEventListener('mousemove', onMove)
     document.removeEventListener('mouseup', onUp)
+    logsResizing.value = false
     // 保存高度到 localStorage
     if (logsPanelHeight.value) {
-      localStorage.setItem('logsPanelHeight', logsPanelHeight.value.toString())
+      localStorage.setItem('logsPanelHeight', Math.round(logsPanelHeight.value).toString())
     }
   }
   document.addEventListener('mousemove', onMove)
@@ -458,15 +478,11 @@ async function selectOutbound(outbound) {
   }
 }
 
-// 监听 showLogs 变化，收缩时清除高度样式，并保存状态
+// 监听 showLogs 变化，保存展开/收起状态（高度由 logsPanelStyle 响应式接管）
 watch(showLogs, (newVal) => {
   localStorage.setItem('showLogs', newVal.toString())
-  if (!newVal && logsPanel.value) {
-    // 收缩时，清除内联样式，让 CSS 接管
-    logsPanel.value.style.height = ''
-  } else if (newVal && logsPanel.value && logsPanelHeight.value) {
-    // 展开时，恢复保存的高度
-    logsPanel.value.style.height = logsPanelHeight.value + 'px'
+  if (newVal) {
+    scrollLogsToBottom()
   }
 })
 
@@ -551,6 +567,10 @@ async function handleLogoutFromMenu() {
 async function initAuthenticatedApp() {
   if (!appInitialized.value) {
     restoreLogsPanelState()
+    // 没有保存过高度时给个默认值，交给 logsPanelStyle 渲染
+    if (!logsPanelHeight.value) {
+      logsPanelHeight.value = Math.floor(window.innerHeight * 0.4)
+    }
     appInitialized.value = true
   }
   await store.fetchStatus()
@@ -558,16 +578,6 @@ async function initAuthenticatedApp() {
   api.getKernelStatus?.().then(r => { kernels.value = r.data.kernels || {} }).catch(() => {})
   await loadLogs()
   startLogsStream()
-  await nextTick()
-  if (logsPanel.value && showLogs.value) {
-    if (!logsPanelHeight.value) {
-      const defaultHeight = Math.floor(window.innerHeight * 0.4)
-      logsPanel.value.style.height = defaultHeight + 'px'
-      logsPanelHeight.value = defaultHeight
-    } else {
-      logsPanel.value.style.height = logsPanelHeight.value + 'px'
-    }
-  }
 }
 
 async function saveAccountProfile() {
@@ -719,7 +729,7 @@ async function loadLogs() {
       }
       return { time: '', message: log, level: 'info' }
     })
-    scrollLogsToBottom()
+    scrollLogsToBottom(true)
   } catch (e) {
     console.error('Failed to load logs:', e)
   }
@@ -738,14 +748,14 @@ function startLogsStream() {
           if (logs.value.length > 500) {
             logs.value = logs.value.slice(-500)
           }
-          if (logsAutoScroll.value) {
-            scrollLogsToBottom()
-          }
+          scrollLogsToBottom()
         }
       } catch {}
     }
     es.onerror = () => {
-      if (es.readyState === EventSource.CLOSED) return
+      // CLOSED 表示连接已彻底断开且浏览器不会自行重连，
+      // 这里必须清空 logsEventSource，否则 startLogsStream 的重入判断
+      // 会一直认为流还活着，导致再也收不到新日志。
       if (logsEventSource === es) {
         logsEventSource = null
         logsStreamPromise = null
@@ -771,10 +781,17 @@ function closeLogsStream() {
 
 function toggleLogsStream() {
   logsStreaming.value = !logsStreaming.value
+  localStorage.setItem('logsStreaming', logsStreaming.value.toString())
+  if (logsStreaming.value) {
+    // 恢复实时时补齐暂停期间遗漏的日志，并确保底层连接还在
+    startLogsStream()
+    loadLogs()
+  }
 }
 
 function toggleAutoScroll() {
   logsAutoScroll.value = !logsAutoScroll.value
+  localStorage.setItem('logsAutoScroll', logsAutoScroll.value.toString())
   if (logsAutoScroll.value) {
     scrollLogsToBottom()
   }
@@ -784,12 +801,15 @@ function clearLogs() {
   logs.value = []
 }
 
-function scrollLogsToBottom() {
-  if (logsContainer.value) {
-    setTimeout(() => {
-      logsContainer.value.scrollTop = logsContainer.value.scrollHeight
-    }, 0)
-  }
+// force 用于初次加载等需要无条件置底的场景；
+// 常规新日志到达时必须尊重「手动滚动」，否则会把用户正在查看的位置拽走。
+function scrollLogsToBottom(force = false) {
+  if (!force && !logsAutoScroll.value) return
+  const el = logsContainer.value
+  if (!el) return
+  nextTick(() => {
+    el.scrollTop = el.scrollHeight
+  })
 }
 </script>
 
