@@ -257,6 +257,9 @@ func buildStandardLink(s *configure.ServerRaw) string {
 }
 
 func xrayVmess(s *configure.ServerRaw, tag string) (coreObj.OutboundObject, error) {
+	if m, ok := internalNodeMap(s.Link); ok {
+		return xrayVmessFromMap(s, m, tag)
+	}
 	b64 := s.Link[len("vmess://"):]
 	decoded, err := b64Decode(b64)
 	if err != nil {
@@ -290,6 +293,9 @@ func xrayVmess(s *configure.ServerRaw, tag string) (coreObj.OutboundObject, erro
 }
 
 func xrayVless(s *configure.ServerRaw, tag string) (coreObj.OutboundObject, error) {
+	if m, ok := internalNodeMap(s.Link); ok {
+		return xrayVlessFromMap(s, m, tag)
+	}
 	u, err := url.Parse(s.Link)
 	if err != nil || u.Hostname() == "" {
 		return coreObj.OutboundObject{}, fmt.Errorf("invalid vless link: %w", err)
@@ -354,6 +360,9 @@ func xraySSR(s *configure.ServerRaw, tag string) (coreObj.OutboundObject, error)
 }
 
 func xrayTrojan(s *configure.ServerRaw, tag string) (coreObj.OutboundObject, error) {
+	if m, ok := internalNodeMap(s.Link); ok {
+		return xrayTrojanFromMap(s, m, tag)
+	}
 	u, err := url.Parse(s.Link)
 	if err != nil || u.Hostname() == "" {
 		return coreObj.OutboundObject{}, fmt.Errorf("invalid trojan link: %w", err)
@@ -603,6 +612,111 @@ func extractSingboxCredentials(link string) (string, string) {
 	}
 
 	return "", ""
+}
+
+// nodeXrayStream 把 clash/sing-box 节点字典还原成 Xray 的 StreamSettings。
+// 与 nodeTransport 同源，区别是 Xray 用扁平字符串参数而非嵌套结构。
+func nodeXrayStream(m map[string]interface{}, host string, forceTLS bool) *coreObj.StreamSettings {
+	network := strings.ToLower(mapString(m, "network"))
+	var path, wsHost, serviceName string
+
+	if ws := mapSubMap(m, "ws-opts"); ws != nil {
+		path = mapString(ws, "path")
+		if headers := mapSubMap(ws, "headers"); headers != nil {
+			wsHost = firstNonEmpty(mapString(headers, "Host"), mapString(headers, "host"))
+		}
+		// Xray 无独立 httpupgrade 网络类型，用 xhttp 承载
+		if mapBool(ws, "v2ray-http-upgrade") {
+			network = "xhttp"
+		}
+	}
+	if grpc := mapSubMap(m, "grpc-opts"); grpc != nil {
+		serviceName = mapString(grpc, "grpc-service-name")
+	}
+	if h2 := mapSubMap(m, "h2-opts"); h2 != nil {
+		path = firstNonEmpty(path, mapString(h2, "path"))
+	}
+	if hu := mapSubMap(m, "http-upgrade-opts"); hu != nil {
+		path = firstNonEmpty(path, mapString(hu, "path"))
+	}
+	wsHost = firstNonEmpty(wsHost, mapString(m, "servername"), host)
+
+	security := ""
+	if forceTLS || mapBool(m, "tls") {
+		security = "tls"
+	}
+	var pbk, sid, spx string
+	if reality := mapSubMap(m, "reality-opts"); reality != nil {
+		security = "reality"
+		pbk = mapString(reality, "public-key")
+		sid = mapString(reality, "short-id")
+		spx = mapString(reality, "spider-x")
+	}
+	sni := firstNonEmpty(mapString(m, "sni"), mapString(m, "servername"), host)
+
+	return buildXrayStream(network, security, wsHost, path, sni,
+		mapString(m, "client-fingerprint"), "", pbk, sid, spx, serviceName)
+}
+
+func xrayVlessFromMap(s *configure.ServerRaw, m map[string]interface{}, tag string) (coreObj.OutboundObject, error) {
+	host, port := nodeEndpoint(s, m)
+	if host == "" || port == 0 {
+		return coreObj.OutboundObject{}, fmt.Errorf("invalid vless node: missing server or port")
+	}
+	uuid := firstNonEmpty(mapString(m, "uuid"), mapString(m, "id"))
+	if uuid == "" {
+		return coreObj.OutboundObject{}, fmt.Errorf("invalid vless node: missing uuid")
+	}
+	return coreObj.OutboundObject{
+		Tag: tag, Protocol: "vless",
+		Settings: coreObj.OutboundSettings{Vnext: []coreObj.VnextObject{{
+			Address: host, Port: port,
+			Users: []coreObj.VnextUser{{ID: uuid, Encryption: "none", Flow: mapString(m, "flow")}},
+		}}},
+		StreamSettings: nodeXrayStream(m, host, false),
+	}, nil
+}
+
+func xrayVmessFromMap(s *configure.ServerRaw, m map[string]interface{}, tag string) (coreObj.OutboundObject, error) {
+	host, port := nodeEndpoint(s, m)
+	if host == "" || port == 0 {
+		return coreObj.OutboundObject{}, fmt.Errorf("invalid vmess node: missing server or port")
+	}
+	uuid := firstNonEmpty(mapString(m, "uuid"), mapString(m, "id"))
+	if uuid == "" {
+		return coreObj.OutboundObject{}, fmt.Errorf("invalid vmess node: missing uuid")
+	}
+	return coreObj.OutboundObject{
+		Tag: tag, Protocol: "vmess",
+		Settings: coreObj.OutboundSettings{Vnext: []coreObj.VnextObject{{
+			Address: host, Port: port,
+			Users: []coreObj.VnextUser{{
+				ID:       uuid,
+				AlterID:  firstNonZero(mapInt(m, "alterId"), mapInt(m, "alter_id")),
+				Security: firstNonEmpty(mapString(m, "cipher"), "auto"),
+			}},
+		}}},
+		StreamSettings: nodeXrayStream(m, host, false),
+	}, nil
+}
+
+func xrayTrojanFromMap(s *configure.ServerRaw, m map[string]interface{}, tag string) (coreObj.OutboundObject, error) {
+	host, port := nodeEndpoint(s, m)
+	if host == "" || port == 0 {
+		return coreObj.OutboundObject{}, fmt.Errorf("invalid trojan node: missing server or port")
+	}
+	password := mapString(m, "password")
+	if password == "" {
+		return coreObj.OutboundObject{}, fmt.Errorf("invalid trojan node: missing password")
+	}
+	return coreObj.OutboundObject{
+		Tag: tag, Protocol: "trojan",
+		Settings: coreObj.OutboundSettings{
+			Servers: []coreObj.ServerObject{{Address: host, Port: port, Password: password}},
+		},
+		// trojan 始终基于 TLS
+		StreamSettings: nodeXrayStream(m, host, true),
+	}, nil
 }
 
 func buildXrayStream(network, security, host, path, sni, fp, alpn, pbk, sid, spx, serviceName string) *coreObj.StreamSettings {

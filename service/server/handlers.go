@@ -433,6 +433,20 @@ func classifyHTTPURL(s string) urlKind {
 // probeBodyLimit 探测时最多读取的响应字节数，避免误连到大文件端点时读爆内存
 const probeBodyLimit = 4 << 20
 
+// subscriptionUserAgent 伪装成常见客户端。多数机场按 UA 白名单放行，
+// Go 默认的 Go-http-client/1.1 会被直接 403，拿到错误页后解析必然失败。
+const subscriptionUserAgent = "clash-verge/v1.6.0"
+
+// getSubscription 按订阅站期望的 UA 发起 GET 请求。
+func getSubscription(client *http.Client, rawURL string) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", subscriptionUserAgent)
+	return client.Do(req)
+}
+
 // looksLikeSubscription 拉取一次内容来判断 http://host:port 形式的地址是不是订阅。
 // 能解析出节点即认定为订阅；HTTP 代理节点收到普通 GET 时不会返回可解析的订阅内容，
 // 拉取失败（离线、超时）时同样落回节点处理，保持原有行为。
@@ -444,7 +458,7 @@ func looksLikeSubscription(rawURL string) bool {
 		},
 		Timeout: 10 * time.Second,
 	}
-	resp, err := client.Get(rawURL)
+	resp, err := getSubscription(client, rawURL)
 	if err != nil {
 		return false
 	}
@@ -1111,12 +1125,16 @@ func fetchSubscription(index int, sub *configure.SubscriptionRaw) {
 	}
 
 	subClient := &http.Client{Transport: transport}
-	resp, err := subClient.Get(sub.URL)
+	resp, err := getSubscription(subClient, sub.URL)
 	if err != nil {
 		addLog(fmt.Sprintf("❌ 拉取订阅失败: %v", err))
 		return
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		addLog(fmt.Sprintf("❌ 拉取订阅失败: 服务器返回 HTTP %d，订阅链接可能已失效或拒绝了本次请求", resp.StatusCode))
+		return
+	}
 	content, err := io.ReadAll(resp.Body)
 	if err != nil {
 		addLog(fmt.Sprintf("❌ 读取订阅内容失败: %v", err))

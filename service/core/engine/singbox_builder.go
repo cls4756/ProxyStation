@@ -513,6 +513,9 @@ func singboxServerToOutbound(s *configure.ServerRaw, tag string) (SingboxOutboun
 }
 
 func sbVmess(s *configure.ServerRaw, tag string) (SingboxOutbound, error) {
+	if m, ok := internalNodeMap(s.Link); ok {
+		return sbVmessFromMap(s, m, tag)
+	}
 	b64 := s.Link[len("vmess://"):]
 	decoded, err := b64Decode(b64)
 	if err != nil {
@@ -545,6 +548,9 @@ func sbVmess(s *configure.ServerRaw, tag string) (SingboxOutbound, error) {
 }
 
 func sbVless(s *configure.ServerRaw, tag string) (SingboxOutbound, error) {
+	if m, ok := internalNodeMap(s.Link); ok {
+		return sbVlessFromMap(s, m, tag)
+	}
 	u, err := url.Parse(s.Link)
 	if err != nil {
 		return SingboxOutbound{}, err
@@ -576,6 +582,9 @@ func sbSS(s *configure.ServerRaw, tag string) (SingboxOutbound, error) {
 }
 
 func sbTrojan(s *configure.ServerRaw, tag string) (SingboxOutbound, error) {
+	if m, ok := internalNodeMap(s.Link); ok {
+		return sbTrojanFromMap(s, m, tag)
+	}
 	u, err := url.Parse(s.Link)
 	if err != nil {
 		return SingboxOutbound{}, err
@@ -593,6 +602,9 @@ func sbTrojan(s *configure.ServerRaw, tag string) (SingboxOutbound, error) {
 }
 
 func sbHysteria2(s *configure.ServerRaw, tag string) (SingboxOutbound, error) {
+	if m, ok := internalNodeMap(s.Link); ok {
+		return sbHysteria2FromMap(s, m, tag)
+	}
 	u, err := url.Parse(s.Link)
 	if err != nil {
 		return SingboxOutbound{}, err
@@ -616,6 +628,9 @@ func sbHysteria2(s *configure.ServerRaw, tag string) (SingboxOutbound, error) {
 }
 
 func sbHysteria(s *configure.ServerRaw, tag string) (SingboxOutbound, error) {
+	if m, ok := internalNodeMap(s.Link); ok {
+		return sbHysteriaFromMap(s, m, tag)
+	}
 	u, err := url.Parse(s.Link)
 	if err != nil {
 		return SingboxOutbound{}, err
@@ -635,6 +650,9 @@ func sbHysteria(s *configure.ServerRaw, tag string) (SingboxOutbound, error) {
 }
 
 func sbTuic(s *configure.ServerRaw, tag string) (SingboxOutbound, error) {
+	if m, ok := internalNodeMap(s.Link); ok {
+		return sbTuicFromMap(s, m, tag)
+	}
 	u, err := url.Parse(s.Link)
 	if err != nil {
 		return SingboxOutbound{}, err
@@ -651,6 +669,18 @@ func sbTuic(s *configure.ServerRaw, tag string) (SingboxOutbound, error) {
 }
 
 func sbWireguard(s *configure.ServerRaw, tag string) (SingboxOutbound, error) {
+	if m, ok := internalNodeMap(s.Link); ok {
+		host, port := nodeEndpoint(s, m)
+		if host == "" || port == 0 {
+			return SingboxOutbound{}, fmt.Errorf("invalid wireguard node: missing server or port")
+		}
+		return SingboxOutbound{
+			Type: "wireguard", Tag: tag,
+			Server: host, ServerPort: port,
+			PrivateKey:    firstNonEmpty(mapString(m, "private-key"), mapString(m, "private_key")),
+			PeerPublicKey: firstNonEmpty(mapString(m, "public-key"), mapString(m, "peer_public_key")),
+		}, nil
+	}
 	// wireguard:// 格式：wireguard://privatekey@host:port?publickey=xxx&ip=xxx
 	u, err := url.Parse(s.Link)
 	if err != nil {
@@ -1235,4 +1265,212 @@ func sbTransport(network, path, host, serviceName string) *SingboxTransport {
 func (o SingboxOutbound) MarshalJSON() ([]byte, error) {
 	type Alias SingboxOutbound
 	return json.Marshal((Alias)(o))
+}
+
+// internalNodeMap 识别 clash:// 与 singbox:// 这两种内部链接，解出其中的节点 JSON。
+// 这类链接的 base64 载荷会被 url.Parse 当成主机名，必须在解析 URI 前先拦下来。
+func internalNodeMap(link string) (map[string]interface{}, bool) {
+	for _, prefix := range []string{"clash://", "singbox://"} {
+		if strings.HasPrefix(strings.ToLower(link), prefix) {
+			m, err := decodeInternalNodeMap(link, prefix)
+			if err != nil {
+				return nil, false
+			}
+			return m, true
+		}
+	}
+	return nil, false
+}
+
+func mapBool(m map[string]interface{}, key string) bool {
+	b, _ := m[key].(bool)
+	return b
+}
+
+func mapSubMap(m map[string]interface{}, key string) map[string]interface{} {
+	sub, _ := m[key].(map[string]interface{})
+	return sub
+}
+
+// nodeEndpoint 取节点地址，clash 用 server/port，sing-box 用 server/server_port，
+// 都缺失时回落到订阅解析阶段已存下的 Host/Port。
+func nodeEndpoint(s *configure.ServerRaw, m map[string]interface{}) (string, int) {
+	host := firstNonEmpty(mapString(m, "server"), s.Host)
+	port := firstNonZero(mapInt(m, "port"), mapInt(m, "server_port"), s.Port)
+	return host, port
+}
+
+// nodeTransport 还原传输层。clash 把参数放在 ws-opts/grpc-opts 等子字典里，
+// 且 v2ray-http-upgrade 为真时 ws 实际走 httpupgrade。
+func nodeTransport(m map[string]interface{}) *SingboxTransport {
+	network := strings.ToLower(mapString(m, "network"))
+	var path, host, serviceName string
+
+	if ws := mapSubMap(m, "ws-opts"); ws != nil {
+		path = mapString(ws, "path")
+		if headers := mapSubMap(ws, "headers"); headers != nil {
+			host = firstNonEmpty(mapString(headers, "Host"), mapString(headers, "host"))
+		}
+		if mapBool(ws, "v2ray-http-upgrade") {
+			network = "httpupgrade"
+		}
+	}
+	if grpc := mapSubMap(m, "grpc-opts"); grpc != nil {
+		serviceName = mapString(grpc, "grpc-service-name")
+	}
+	if h2 := mapSubMap(m, "h2-opts"); h2 != nil {
+		path = firstNonEmpty(path, mapString(h2, "path"))
+	}
+	if hu := mapSubMap(m, "http-upgrade-opts"); hu != nil {
+		path = firstNonEmpty(path, mapString(hu, "path"))
+	}
+	host = firstNonEmpty(host, mapString(m, "servername"))
+	return sbTransport(network, path, host, serviceName)
+}
+
+// nodeTLS 还原 TLS。clash 的 tls 是布尔值，sni 可能写在 servername/sni 上。
+func nodeTLS(m map[string]interface{}, host string, forceTLS bool) *SingboxTLS {
+	enabled := forceTLS || mapBool(m, "tls")
+	sni := firstNonEmpty(mapString(m, "sni"), mapString(m, "servername"), host)
+	tls := sbTLS(enabled, sni, mapString(m, "client-fingerprint"), "", "", "", false)
+	if tls == nil {
+		return nil
+	}
+	tls.Insecure = mapBool(m, "skip-cert-verify")
+	if reality := mapSubMap(m, "reality-opts"); reality != nil {
+		tls.Reality = &SingboxReality{
+			Enabled:   true,
+			PublicKey: mapString(reality, "public-key"),
+			ShortID:   mapString(reality, "short-id"),
+		}
+	}
+	return tls
+}
+
+// nodeMux 还原多路复用。clash 的 smux 字段与 sing-box 的 multiplex 对应。
+func nodeMux(m map[string]interface{}) *SingboxMux {
+	smux := mapSubMap(m, "smux")
+	if smux == nil || !mapBool(smux, "enabled") {
+		return nil
+	}
+	return &SingboxMux{Enabled: true, Protocol: mapString(smux, "protocol")}
+}
+
+func sbVlessFromMap(s *configure.ServerRaw, m map[string]interface{}, tag string) (SingboxOutbound, error) {
+	host, port := nodeEndpoint(s, m)
+	if host == "" || port == 0 {
+		return SingboxOutbound{}, fmt.Errorf("invalid vless node: missing server or port")
+	}
+	uuid := firstNonEmpty(mapString(m, "uuid"), mapString(m, "id"))
+	if uuid == "" {
+		return SingboxOutbound{}, fmt.Errorf("invalid vless node: missing uuid")
+	}
+	ob := SingboxOutbound{
+		Type: "vless", Tag: tag,
+		Server: host, ServerPort: port,
+		UUID: uuid, Flow: mapString(m, "flow"),
+	}
+	ob.TLS = nodeTLS(m, host, false)
+	ob.Transport = nodeTransport(m)
+	ob.Multiplex = nodeMux(m)
+	return ob, nil
+}
+
+func sbVmessFromMap(s *configure.ServerRaw, m map[string]interface{}, tag string) (SingboxOutbound, error) {
+	host, port := nodeEndpoint(s, m)
+	if host == "" || port == 0 {
+		return SingboxOutbound{}, fmt.Errorf("invalid vmess node: missing server or port")
+	}
+	uuid := firstNonEmpty(mapString(m, "uuid"), mapString(m, "id"))
+	if uuid == "" {
+		return SingboxOutbound{}, fmt.Errorf("invalid vmess node: missing uuid")
+	}
+	ob := SingboxOutbound{
+		Type: "vmess", Tag: tag,
+		Server: host, ServerPort: port,
+		UUID:     uuid,
+		Security: firstNonEmpty(mapString(m, "cipher"), "auto"),
+		AlterID:  firstNonZero(mapInt(m, "alterId"), mapInt(m, "alter_id")),
+	}
+	ob.TLS = nodeTLS(m, host, false)
+	ob.Transport = nodeTransport(m)
+	ob.Multiplex = nodeMux(m)
+	return ob, nil
+}
+
+func sbTrojanFromMap(s *configure.ServerRaw, m map[string]interface{}, tag string) (SingboxOutbound, error) {
+	host, port := nodeEndpoint(s, m)
+	if host == "" || port == 0 {
+		return SingboxOutbound{}, fmt.Errorf("invalid trojan node: missing server or port")
+	}
+	password := mapString(m, "password")
+	if password == "" {
+		return SingboxOutbound{}, fmt.Errorf("invalid trojan node: missing password")
+	}
+	ob := SingboxOutbound{
+		Type: "trojan", Tag: tag,
+		Server: host, ServerPort: port,
+		Password: password,
+	}
+	// trojan 始终基于 TLS，即使 clash 配置里没显式写 tls: true
+	ob.TLS = nodeTLS(m, host, true)
+	ob.Transport = nodeTransport(m)
+	ob.Multiplex = nodeMux(m)
+	return ob, nil
+}
+
+func sbHysteria2FromMap(s *configure.ServerRaw, m map[string]interface{}, tag string) (SingboxOutbound, error) {
+	host, port := nodeEndpoint(s, m)
+	if host == "" || port == 0 {
+		return SingboxOutbound{}, fmt.Errorf("invalid hysteria2 node: missing server or port")
+	}
+	password := mapString(m, "password")
+	if password == "" {
+		return SingboxOutbound{}, fmt.Errorf("invalid hysteria2 node: missing password")
+	}
+	ob := SingboxOutbound{
+		Type: "hysteria2", Tag: tag,
+		Server: host, ServerPort: port,
+		Password: password,
+		UpMbps:   firstNonZero(mapInt(m, "up"), mapInt(m, "up_mbps")),
+		DownMbps: firstNonZero(mapInt(m, "down"), mapInt(m, "down_mbps")),
+	}
+	ob.TLS = nodeTLS(m, host, true)
+	return ob, nil
+}
+
+func sbHysteriaFromMap(s *configure.ServerRaw, m map[string]interface{}, tag string) (SingboxOutbound, error) {
+	host, port := nodeEndpoint(s, m)
+	if host == "" || port == 0 {
+		return SingboxOutbound{}, fmt.Errorf("invalid hysteria node: missing server or port")
+	}
+	ob := SingboxOutbound{
+		Type: "hysteria", Tag: tag,
+		Server: host, ServerPort: port,
+		Password: mapString(m, "auth"),
+		UpMbps:   firstNonZero(mapInt(m, "up"), mapInt(m, "up_mbps")),
+		DownMbps: firstNonZero(mapInt(m, "down"), mapInt(m, "down_mbps")),
+	}
+	ob.TLS = nodeTLS(m, host, true)
+	return ob, nil
+}
+
+func sbTuicFromMap(s *configure.ServerRaw, m map[string]interface{}, tag string) (SingboxOutbound, error) {
+	host, port := nodeEndpoint(s, m)
+	if host == "" || port == 0 {
+		return SingboxOutbound{}, fmt.Errorf("invalid tuic node: missing server or port")
+	}
+	uuid := firstNonEmpty(mapString(m, "uuid"), mapString(m, "id"))
+	if uuid == "" {
+		return SingboxOutbound{}, fmt.Errorf("invalid tuic node: missing uuid")
+	}
+	ob := SingboxOutbound{
+		Type: "tuic", Tag: tag,
+		Server: host, ServerPort: port,
+		UUID:              uuid,
+		Password:          mapString(m, "password"),
+		CongestionControl: firstNonEmpty(mapString(m, "congestion_control"), mapString(m, "congestion-control"), "bbr"),
+	}
+	ob.TLS = nodeTLS(m, host, true)
+	return ob, nil
 }
