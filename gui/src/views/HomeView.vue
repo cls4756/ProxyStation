@@ -652,6 +652,16 @@ function ipTypeOrder(type) {
 
 function latencyValue(server) {
   const lat = Number(server?.latency)
+  // 调试：检查类型转换
+  if (server?.latency !== undefined && server?.latency !== null && server?.latency !== -1) {
+    console.log('latency debug:', {
+      raw: server.latency,
+      rawType: typeof server.latency,
+      converted: lat,
+      convertedType: typeof lat,
+      isFinite: Number.isFinite(lat)
+    })
+  }
   // -1=未测速, 0=超时，都排在最后
   if (!Number.isFinite(lat) || lat < 0) return Number.MAX_SAFE_INTEGER
   if (lat === 0) return Number.MAX_SAFE_INTEGER - 1
