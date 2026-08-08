@@ -740,13 +740,13 @@ async function refreshPanel() {
   if (refreshing.value) return
   refreshing.value = true
   try {
-    // 根据当前 tab 只刷新需要的数据
+    // 根据当前 tab 只刷新表格数据
     if (activeTab.value.startsWith('sub-')) {
       // 订阅 tab：只刷新订阅数据
       await store.fetchSubscriptions()
     } else if (activeTab.value.startsWith('group-')) {
-      // 分组 tab：只刷新分组和服务器数据
-      await Promise.all([store.fetchGroups(), store.fetchServers()])
+      // 分组 tab：只刷新服务器数据（分组结构不变）
+      await store.fetchServers()
     } else {
       // 其他情况刷新全部
       await store.fetchAll()
