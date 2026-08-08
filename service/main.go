@@ -91,6 +91,8 @@ func main() {
 
 	// 确保 SERVER 内置分组存在
 	ensureServerGroup()
+	// 修复共享节点问题（一次性数据迁移）
+	fixSharedNodes()
 	// 启动独立于内核的 cfdo/cfgoodnet 代理
 	server.EnsureIndependentProxyInbounds()
 
@@ -279,5 +281,80 @@ func migratePortSettings(setting *configure.Setting) {
 		if err := configure.SetSetting(setting); err != nil {
 			log.Printf("⚠️ 保存端口迁移失败: %v", err)
 		}
+	}
+}
+
+// fixSharedNodes 修复不同分组共享同一节点的问题（一次性数据迁移）
+func fixSharedNodes() {
+	groups := configure.GetGroups()
+	if len(groups) == 0 {
+		return
+	}
+
+	// 统计每个手动节点被多少个分组引用
+	nodeRefCount := make(map[int][]int) // 节点索引 -> 引用它的分组索引列表
+	for gi, g := range groups {
+		for _, ref := range g.Servers {
+			if ref.Type == "server" {
+				nodeRefCount[ref.Index] = append(nodeRefCount[ref.Index], gi)
+			}
+		}
+	}
+
+	// 找出被多个分组共享的节点
+	var fixedCount int
+	for nodeIndex, groupIndexes := range nodeRefCount {
+		if len(groupIndexes) <= 1 {
+			continue // 没有共享，跳过
+		}
+
+		server := configure.GetServer(nodeIndex)
+		if server == nil {
+			continue
+		}
+
+		log.Printf("🔧 检测到节点 %s 被 %d 个分组共享，正在修复...", server.Name, len(groupIndexes))
+
+		// 为除第一个分组外的其他分组创建独立副本
+		for i := 1; i < len(groupIndexes); i++ {
+			gi := groupIndexes[i]
+			group := &groups[gi]
+
+			// 创建节点副本
+			newServer := *server
+			newServer.Source = "manual"
+			newServer.Latency = -1
+			newServer.LastProbeTime = 0
+
+			servers := configure.GetServers()
+			newIndex := len(servers)
+			if err := configure.AppendServers([]*configure.ServerRaw{&newServer}); err != nil {
+				log.Printf("⚠️ 创建节点副本失败: %v", err)
+				continue
+			}
+
+			// 更新分组引用
+			for j, ref := range group.Servers {
+				if ref.Type == "server" && ref.Index == nodeIndex {
+					group.Servers[j] = configure.ServerRef{
+						Type:  "server",
+						Index: newIndex,
+						Sub:   0,
+					}
+					break
+				}
+			}
+
+			if err := configure.SetGroup(gi, group); err != nil {
+				log.Printf("⚠️ 更新分组失败: %v", err)
+				continue
+			}
+
+			fixedCount++
+		}
+	}
+
+	if fixedCount > 0 {
+		log.Printf("✅ 已修复 %d 个共享节点问题", fixedCount)
 	}
 }
