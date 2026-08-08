@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/ProxyStation/proxystation/db/configure"
@@ -17,21 +16,6 @@ const (
 	authCookieName = "proxystation_session"
 	authSessionTTL = 3 * 24 * time.Hour // 3 天内有访问就自动续期
 )
-
-type authSession struct {
-	Username   string
-	ExpiresAt  time.Time
-	LastAccess time.Time // 最后访问时间，用于滑动过期
-}
-
-type authManager struct {
-	mu       sync.RWMutex
-	sessions map[string]authSession
-}
-
-var webAuth = &authManager{
-	sessions: map[string]authSession{},
-}
 
 func AuthRequired() gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -75,13 +59,16 @@ func login(c *gin.Context) {
 
 	now := time.Now()
 	expiresAt := now.Add(authSessionTTL)
-	webAuth.mu.Lock()
-	webAuth.sessions[sessionID] = authSession{
+	session := &configure.Session{
+		SessionID:  sessionID,
 		Username:   setting.WebUsername,
 		ExpiresAt:  expiresAt,
 		LastAccess: now,
 	}
-	webAuth.mu.Unlock()
+	if err := configure.SetSession(session); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save session"})
+		return
+	}
 
 	c.SetSameSite(http.SameSiteLaxMode)
 	c.SetCookie(authCookieName, sessionID, int(authSessionTTL.Seconds()), "/", "", false, true)
@@ -156,18 +143,14 @@ func authMe(c *gin.Context) {
 
 func clearSession(c *gin.Context) {
 	if sessionID, err := c.Cookie(authCookieName); err == nil {
-		webAuth.mu.Lock()
-		delete(webAuth.sessions, sessionID)
-		webAuth.mu.Unlock()
+		_ = configure.DeleteSession(sessionID)
 	}
 	c.SetSameSite(http.SameSiteLaxMode)
 	c.SetCookie(authCookieName, "", -1, "/", "", false, true)
 }
 
 func clearAllSessions() {
-	webAuth.mu.Lock()
-	webAuth.sessions = map[string]authSession{}
-	webAuth.mu.Unlock()
+	_ = configure.ClearAllSessions()
 }
 
 func validateSession(c *gin.Context) (string, bool) {
@@ -178,30 +161,27 @@ func validateSession(c *gin.Context) (string, bool) {
 
 	now := time.Now()
 
-	webAuth.mu.Lock()
-	defer webAuth.mu.Unlock()
-
-	session, ok := webAuth.sessions[sessionID]
-	if !ok {
+	session, err := configure.GetSession(sessionID)
+	if err != nil {
 		return "", false
 	}
 
 	// 检查是否超过过期时间（从最后访问时间算起）
 	if now.Sub(session.LastAccess) > authSessionTTL {
-		delete(webAuth.sessions, sessionID)
+		_ = configure.DeleteSession(sessionID)
 		return "", false
 	}
 
 	setting := configure.GetSettingNotNil()
 	if session.Username != setting.WebUsername {
-		delete(webAuth.sessions, sessionID)
+		_ = configure.DeleteSession(sessionID)
 		return "", false
 	}
 
 	// 滑动过期：更新最后访问时间和过期时间
 	session.LastAccess = now
 	session.ExpiresAt = now.Add(authSessionTTL)
-	webAuth.sessions[sessionID] = session
+	_ = configure.SetSession(session)
 
 	// 同时更新 cookie 的过期时间
 	c.SetSameSite(http.SameSiteLaxMode)

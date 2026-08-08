@@ -89,6 +89,9 @@ func main() {
 	// 迁移旧端口到新端口
 	migratePortSettings(setting)
 
+	// 清理过期的 session
+	cleanExpiredSessions()
+
 	// 确保 SERVER 内置分组存在
 	ensureServerGroup()
 	// 修复共享节点问题（一次性数据迁移）
@@ -356,5 +359,12 @@ func fixSharedNodes() {
 
 	if fixedCount > 0 {
 		log.Printf("✅ 已修复 %d 个共享节点问题", fixedCount)
+	}
+}
+
+// cleanExpiredSessions 清理过期的 session
+func cleanExpiredSessions() {
+	if err := configure.CleanExpiredSessions(3 * 24 * time.Hour); err != nil {
+		log.Printf("⚠️ 清理过期 session 失败: %v", err)
 	}
 }
