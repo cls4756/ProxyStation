@@ -15,12 +15,13 @@ import (
 
 const (
 	authCookieName = "proxystation_session"
-	authSessionTTL = 7 * 24 * time.Hour
+	authSessionTTL = 3 * 24 * time.Hour // 3 天内有访问就自动续期
 )
 
 type authSession struct {
-	Username  string
-	ExpiresAt time.Time
+	Username   string
+	ExpiresAt  time.Time
+	LastAccess time.Time // 最后访问时间，用于滑动过期
 }
 
 type authManager struct {
@@ -72,11 +73,13 @@ func login(c *gin.Context) {
 		return
 	}
 
-	expiresAt := time.Now().Add(authSessionTTL)
+	now := time.Now()
+	expiresAt := now.Add(authSessionTTL)
 	webAuth.mu.Lock()
 	webAuth.sessions[sessionID] = authSession{
-		Username:  setting.WebUsername,
-		ExpiresAt: expiresAt,
+		Username:   setting.WebUsername,
+		ExpiresAt:  expiresAt,
+		LastAccess: now,
 	}
 	webAuth.mu.Unlock()
 
@@ -175,26 +178,34 @@ func validateSession(c *gin.Context) (string, bool) {
 
 	now := time.Now()
 
-	webAuth.mu.RLock()
+	webAuth.mu.Lock()
+	defer webAuth.mu.Unlock()
+
 	session, ok := webAuth.sessions[sessionID]
-	webAuth.mu.RUnlock()
 	if !ok {
 		return "", false
 	}
-	if now.After(session.ExpiresAt) {
-		webAuth.mu.Lock()
+
+	// 检查是否超过过期时间（从最后访问时间算起）
+	if now.Sub(session.LastAccess) > authSessionTTL {
 		delete(webAuth.sessions, sessionID)
-		webAuth.mu.Unlock()
 		return "", false
 	}
 
 	setting := configure.GetSettingNotNil()
 	if session.Username != setting.WebUsername {
-		webAuth.mu.Lock()
 		delete(webAuth.sessions, sessionID)
-		webAuth.mu.Unlock()
 		return "", false
 	}
+
+	// 滑动过期：更新最后访问时间和过期时间
+	session.LastAccess = now
+	session.ExpiresAt = now.Add(authSessionTTL)
+	webAuth.sessions[sessionID] = session
+
+	// 同时更新 cookie 的过期时间
+	c.SetSameSite(http.SameSiteLaxMode)
+	c.SetCookie(authCookieName, sessionID, int(authSessionTTL.Seconds()), "/", "", false, true)
 
 	return session.Username, true
 }
