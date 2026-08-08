@@ -740,7 +740,17 @@ async function refreshPanel() {
   if (refreshing.value) return
   refreshing.value = true
   try {
-    await store.fetchAll()
+    // 根据当前 tab 只刷新需要的数据
+    if (activeTab.value.startsWith('sub-')) {
+      // 订阅 tab：只刷新订阅数据
+      await store.fetchSubscriptions()
+    } else if (activeTab.value.startsWith('group-')) {
+      // 分组 tab：只刷新分组和服务器数据
+      await Promise.all([store.fetchGroups(), store.fetchServers()])
+    } else {
+      // 其他情况刷新全部
+      await store.fetchAll()
+    }
   } catch (e) {
     showNotice('刷新失败：' + (e?.response?.data?.error || e?.message || '未知错误'), true)
   } finally {
@@ -1089,7 +1099,8 @@ async function pingSelected(mode = 'fast') {
   pinging.value = true
   try {
     await pingRefsWithProgress(selectedRefs.value, mode)
-    await store.fetchAll()
+    // 测速只影响节点延迟
+    await Promise.all([store.fetchServers(), store.fetchSubscriptions()])
   } finally {
     pingAbortController.value = null
     pingProgress.value = { total: 0, done: 0, current: '' }
@@ -1124,7 +1135,8 @@ async function removeSelected() {
     }
   }
   selectedRefs.value = []
-  await store.fetchAll()
+  // 删除只影响分组数据
+  await store.fetchGroups()
 }
 
 function openNodeMenu(mode, refObj, server) {
@@ -1214,7 +1226,8 @@ async function switchToGroupMode() {
     groupId: group.id,
     mode: 'leastping',
   })
-  await store.fetchAll()
+  // 只刷新出站数据
+  await store.fetchOutbounds()
   // 刷新代理状态，因为 connectOutbound 可能会触发 Restart
   await store.fetchStatus()
 }
@@ -1288,14 +1301,16 @@ async function connectNode(ref) {
   } else {
     await api.connectOutbound(currentOutbound.value, { targetType: 'node', nodeRef: { type: ref.type, index: ref.index, sub: ref.sub || 0 } })
   }
-  await store.fetchAll()
+  // 只刷新出站数据，不需要拉取订阅、分组等
+  await store.fetchOutbounds()
   // 刷新代理状态，因为 connectOutbound 可能会触发 Restart
   await store.fetchStatus()
 }
 
 async function pingSingleNode(ref) {
   await api.pingNodes([{ type: ref.type, index: ref.index, sub: ref.sub || 0 }], 'fast')
-  await store.fetchAll()
+  // 测速只影响节点延迟，只刷新服务器和订阅数据
+  await Promise.all([store.fetchServers(), store.fetchSubscriptions()])
 }
 
 async function pingCurrentTab(mode = 'fast') {
@@ -1320,7 +1335,8 @@ async function pingCurrentTab(mode = 'fast') {
     if (refs.length && group && !pingAborted.value) {
       await applyGroupSwitchAfterPing(group, mode)
     }
-    await store.fetchAll()
+    // 测速只影响节点延迟，只刷新服务器和订阅数据
+    await Promise.all([store.fetchServers(), store.fetchSubscriptions()])
   } finally {
     pingAbortController.value = null
     pingProgress.value = { total: 0, done: 0, current: '' }
@@ -1365,7 +1381,8 @@ async function detectIPTypeForRefs(refs) {
   ipTypeStates.value = states
   try {
     await api.detectServerIPType(queue)
-    await store.fetchAll()
+    // IP 类型检测只影响节点的 ipType 字段，只刷新服务器和订阅数据
+    await Promise.all([store.fetchServers(), store.fetchSubscriptions()])
   } catch (e) {
     console.error('IP 类型检测失败', e)
   } finally {
@@ -1427,7 +1444,8 @@ async function pollIPScore() {
     if (!data.running) {
       stopIPScorePoll()
       ipScoringRefs.value = {}
-      await store.fetchAll()
+      // IP 评分只影响节点的 ipScore 字段，只刷新服务器和订阅数据
+      await Promise.all([store.fetchServers(), store.fetchSubscriptions()])
       if (wasRunning) {
         const failed = data.failed ? `，${data.failed} 个失败` : ''
         showNotice(`IP 评分完成：成功 ${Math.max(data.done - data.failed, 0)}/${data.total}${failed}。`)
@@ -1449,17 +1467,20 @@ async function abortIPScore() {
 
 async function removeManualServer(ref) {
   await api.deleteServers([ref.index])
-  await store.fetchAll()
+  // 删除服务器后需要刷新服务器和分组数据
+  await Promise.all([store.fetchServers(), store.fetchGroups()])
 }
 
 async function removeFromGroup(groupIndex, ref) {
   await api.removeServerFromGroup(groupIndex, ref)
-  await store.fetchAll()
+  // 只刷新分组数据
+  await store.fetchGroups()
 }
 
 async function refreshSub(si) {
   await api.refreshSubscription(si)
-  await store.fetchAll()
+  // 刷新订阅只影响订阅数据
+  await store.fetchSubscriptions()
 }
 
 function openEditSub(si) {
@@ -1478,20 +1499,23 @@ async function saveEditSub() {
   if (editSubIdx.value < 0) return
   await api.updateSubscription(editSubIdx.value, editSubForm.value)
   editSubIdx.value = -1
-  await store.fetchAll()
+  // 只刷新订阅数据
+  await store.fetchSubscriptions()
 }
 
 async function deleteSub(si) {
   await api.deleteSubscription(si)
   activeTab.value = 'group-0'
-  await store.fetchAll()
+  // 删除订阅需要刷新订阅和分组数据
+  await Promise.all([store.fetchSubscriptions(), store.fetchGroups()])
 }
 
 async function deleteGroup(gi) {
   const group = manualGroups.value[gi]
   await api.deleteGroup(realGroupIndex(group))
   activeTab.value = 'group-0'
-  await store.fetchAll()
+  // 删除分组需要刷新分组和服务器数据
+  await Promise.all([store.fetchGroups(), store.fetchServers()])
 }
 
 async function createGroup() {
@@ -1499,7 +1523,8 @@ async function createGroup() {
   await api.createGroup(newGroupName.value.trim())
   showNewGroup.value = false
   newGroupName.value = ''
-  await store.fetchAll()
+  // 只刷新分组数据
+  await store.fetchGroups()
   activeTab.value = 'group-' + (manualGroups.value.length - 1)
 }
 
@@ -1513,7 +1538,8 @@ async function saveEditGroup() {
   const group = manualGroups.value[editGroupIdx.value]
   await api.updateGroup(realGroupIndex(group), editGroupName.value.trim())
   editGroupIdx.value = -1
-  await store.fetchAll()
+  // 只刷新分组数据
+  await store.fetchGroups()
 }
 
 async function openAddToGroup(gi) {
@@ -1536,7 +1562,8 @@ async function confirmAddToGroup() {
   await api.addServerToGroup(realGroupIndex(group), s._ref)
   showAddToGroup.value = -1
   selectedAddIdx.value = -1
-  await store.fetchAll()
+  // 只刷新分组数据
+  await store.fetchGroups()
 }
 
 async function confirmBulkCopy() {
@@ -1547,7 +1574,8 @@ async function confirmBulkCopy() {
   showBulkCopyModal.value = false
   bulkCopyGroupId.value = ''
   selectedRefs.value = []
-  await store.fetchAll()
+  // 复制节点需要刷新分组和服务器数据
+  await Promise.all([store.fetchGroups(), store.fetchServers()])
 }
 
 // 移动到分组（从当前分组移除，加入目标分组）
@@ -1576,7 +1604,8 @@ async function confirmBulkMove() {
   showBulkMoveModal.value = false
   bulkMoveGroupId.value = ''
   selectedRefs.value = []
-  await store.fetchAll()
+  // 移动节点需要刷新分组和服务器数据
+  await Promise.all([store.fetchGroups(), store.fetchServers()])
 }
 
 function openSingleCopy(ref) {
@@ -1595,7 +1624,8 @@ async function confirmSingleCopy() {
   if (!singleTargetGroupId.value || !singleCopyRef.value) return
   await api.copyServerToGroup(singleCopyRef.value, singleTargetGroupId.value)
   showSingleCopyModal.value = false
-  await store.fetchAll()
+  // 复制节点需要刷新分组和服务器数据
+  await Promise.all([store.fetchGroups(), store.fetchServers()])
 }
 
 async function confirmSingleMove() {
@@ -1608,7 +1638,8 @@ async function confirmSingleMove() {
     await api.removeServerFromGroup(realGroupIndex(group), singleMoveRef.value)
   }
   showSingleMoveModal.value = false
-  await store.fetchAll()
+  // 移动节点需要刷新分组和服务器数据
+  await Promise.all([store.fetchGroups(), store.fetchServers()])
 }</script>
 
 <style scoped>
