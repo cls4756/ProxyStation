@@ -602,18 +602,26 @@ function onResetColumnWidth(key) {
 // 排序结果是点击表头那一刻的快照：把每个节点的名次固定下来，之后延迟再怎么变都
 // 只更新数字、不重新排位，避免测速过程中行来回跳导致点错节点。
 const sortKey = ref('')
-const sortDir = ref('')
-const sortRanks = ref(null)
+const sortDir = ref('') // 'asc' | 'desc' | ''
 
 function onSortColumn(key) {
   if (sortKey.value === key) {
-    sortDir.value = sortDir.value === 'asc' ? 'desc' : 'asc'
+    // 同一列：升序 → 降序 → 还原
+    if (sortDir.value === 'asc') {
+      sortDir.value = 'desc'
+    } else if (sortDir.value === 'desc') {
+      sortDir.value = ''
+      sortKey.value = ''
+    }
   } else {
+    // 不同列：从升序开始
     sortKey.value = key
     sortDir.value = 'asc'
   }
   captureSortOrder()
 }
+
+const sortRanks = ref(null)
 
 function sortValueFor(key, server) {
   if (key === 'latency') return latencyValue(server)
