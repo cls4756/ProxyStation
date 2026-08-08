@@ -1,5 +1,5 @@
 <template>
-  <div class="home">
+  <div class="home" :style="columnVars">
     <!-- Tab 栏 -->
     <div class="tab-bar-outer">
       <div class="tab-bar">
@@ -58,6 +58,11 @@
     <!-- 当前出站状态条已移至 App.vue 全局显示 -->
     <div class="content-area">
 
+      <div v-if="notice" :class="['notice-bar', { 'notice-bar-error': notice.error }]">
+        <span>{{ notice.text }}</span>
+        <button class="notice-close" @click="notice = null" title="关闭">✕</button>
+      </div>
+
       <!-- 多选工具栏（有选中时显示） -->
       <div class="bulk-bar" v-if="selectedRefs.length || showSelectAll">
         <span class="bulk-count">已选 {{ selectedRefs.length }} 个节点</span>
@@ -67,6 +72,13 @@
         <button class="action-btn" @click="pingSelected('real')" :disabled="pinging">🧪 批量真连</button>
         <button v-if="pinging" class="action-btn action-btn-danger" @click="abortPing">⏹ 中止检测</button>
         <span v-if="pinging && pingProgress.total > 0" class="ping-progress">{{ pingProgress.done }}/{{ pingProgress.total }}</span>
+        <button class="action-btn" @click="detectIPTypeForRefs(selectedRefs)" :disabled="detectingIPType">
+          🌐 {{ detectingIPType ? '检测中…' : '检测 IP 类型' }}
+        </button>
+        <button class="action-btn" @click="scoreIPForRefs(selectedRefs)" :disabled="ipScoreTask.running" title="查询 IP 纯净度评分（后台串行执行）">
+          🧮 {{ ipScoreTask.running ? `评分中 ${ipScoreTask.done}/${ipScoreTask.total}` : '查 IP 评分' }}
+        </button>
+        <button v-if="ipScoreTask.running" class="action-btn action-btn-danger" @click="abortIPScore">⏹ 中止评分</button>
         <button class="action-btn" @click="shareSelected">🔗 批量分享</button>
         <button class="action-btn" @click="showBulkCopyModal = true">📋 复制到分组</button>
         <button v-if="canBulkRemove" class="action-btn" @click="showBulkMoveModal = true">✂ 移动到分组</button>
@@ -81,30 +93,34 @@
           <span class="info-count">{{ sortedSearchResults.length }} 个节点</span>
           <button class="action-btn" style="margin-left:auto" @click="searchQuery=''; isSearching=false">✕ 关闭</button>
         </div>
-        <div class="server-list-head" v-if="sortedSearchResults.length">
-          <span class="head-placeholder"></span>
-          <span class="head-placeholder"></span>
-          <span class="head-cell head-name">节点</span>
-          <span class="head-cell head-addr">地址</span>
-          <span class="head-cell head-type">协议</span>
-          <button class="head-lat-btn" @click="toggleLatencySort">
-            延迟{{ latencySortAsc ? ' ↑' : '' }}
-          </button>
-          <span class="head-cell head-ops">操作</span>
-        </div>
         <div v-if="!sortedSearchResults.length" class="empty-hint" style="padding:20px 0">
           <p class="empty-sub">无匹配节点</p>
         </div>
+        <div class="table-scroll" v-else>
+          <ServerListHead
+            :columns="listColumns"
+            :sort-key="sortKey"
+            :sort-dir="sortDir"
+            @sort="onSortColumn"
+            @resize="onResizeColumn"
+            @resize-end="onResizeColumnEnd"
+            @reset-width="onResetColumnWidth"
+          />
           <ServerRow
             v-for="(r, i) in sortedSearchResults" :key="refKey(r.ref) + ':' + i"
             :server="r.server" :ref-obj="r.ref" :outbounds="store.outbounds" :removable="false"
             :current-outbound="currentOutbound"
             :ping-state="pingStates[refKey(r.ref)] || null"
+            :ip-type-state="ipTypeStates[refKey(r.ref)] || null"
+            :ip-score-running="!!ipScoringRefs[refKey(r.ref)]"
             :selected="isSelected(r.ref)"
-          @connect="connectNode" 
-          @select="toggleSelect"
-          @share="(ref, sv) => openNodeMenu('share', ref, sv)"
-        />
+            @connect="connectNode"
+            @select="toggleSelect"
+            @select-start="startDragSelect"
+            @select-enter="continueDragSelect"
+            @share="(ref, sv) => openNodeMenu('share', ref, sv)"
+          />
+        </div>
       </div>
 
       <!-- 订阅 tab -->
@@ -122,6 +138,9 @@
                 placeholder="搜索节点…"
                 @input="onSearch"
               />
+              <button class="action-btn" @click="refreshPanel" :disabled="refreshing" title="重新加载节点数据">
+                ↻ {{ refreshing ? '刷新中…' : '刷新' }}
+              </button>
               <button class="action-btn" @click="pingCurrentTab('fast')" :disabled="pinging">
                 ⚡ {{ pinging ? '探测中…' : '快速检测' }}
               </button>
@@ -130,6 +149,13 @@
               </button>
               <button v-if="pinging" class="action-btn action-btn-danger" @click="abortPing">⏹ 中止检测</button>
               <span v-if="pinging && pingProgress.total > 0" class="ping-progress">{{ pingProgress.done }}/{{ pingProgress.total }}</span>
+              <button class="action-btn" @click="detectIPTypeForCurrentTab" :disabled="detectingIPType" title="查询节点地址是机房还是家宽">
+                🌐 {{ detectingIPType ? '检测中…' : 'IP 类型' }}
+              </button>
+              <button class="action-btn" @click="scoreIPForCurrentTab" :disabled="ipScoreTask.running" title="查询 IP 纯净度评分（后台串行执行，避免触发第三方限流）">
+                🧮 {{ ipScoreTask.running ? `评分中 ${ipScoreTask.done}/${ipScoreTask.total}` : 'IP 评分' }}
+              </button>
+              <button v-if="ipScoreTask.running" class="action-btn action-btn-danger" @click="abortIPScore">⏹ 中止评分</button>
               <button class="action-btn" @click="refreshSub(si)" title="重新拉取订阅节点">↻ 更新节点</button>
               <button class="action-btn" @click="openEditSub(si)" title="编辑订阅名称和链接">✏ 编辑</button>
               <button class="action-btn action-btn-danger" @click="deleteSub(si)">删除</button>
@@ -138,27 +164,29 @@
           <div v-if="!sub.servers?.length" class="empty-hint">
             <p class="empty-sub">订阅为空，点击「更新节点」拉取</p>
           </div>
-          <div class="server-list-head" v-if="getSortedSubEntries(sub, si).length">
-            <span class="head-placeholder"></span>
-            <span class="head-placeholder"></span>
-            <span class="head-cell head-name">节点</span>
-            <span class="head-cell head-addr">地址</span>
-            <span class="head-cell head-type">协议</span>
-            <button class="head-lat-btn" @click="toggleLatencySort">
-              延迟{{ latencySortAsc ? ' ↑' : '' }}
-            </button>
-            <span class="head-cell head-ops">操作</span>
-          </div>
-          <div class="server-list-body" v-if="getSortedSubEntries(sub, si).length">
+          <div class="table-scroll" v-if="getSortedSubEntries(sub, si).length">
+            <ServerListHead
+              :columns="listColumns"
+              :sort-key="sortKey"
+              :sort-dir="sortDir"
+              @sort="onSortColumn"
+              @resize="onResizeColumn"
+              @resize-end="onResizeColumnEnd"
+              @reset-width="onResetColumnWidth"
+            />
             <ServerRow
               v-for="(item, i) in getSortedSubEntries(sub, si)" :key="refKey(item.ref) + ':' + i"
               :server="item.server" :ref-obj="item.ref"
               :outbounds="store.outbounds" :removable="false"
               :current-outbound="currentOutbound"
               :ping-state="pingStates[refKey(item.ref)] || null"
+              :ip-type-state="ipTypeStates[refKey(item.ref)] || null"
+              :ip-score-running="!!ipScoringRefs[refKey(item.ref)]"
               :selected="isSelected(item.ref)"
               @connect="connectNode"
               @select="toggleSelect"
+              @select-start="startDragSelect"
+              @select-enter="continueDragSelect"
               @share="(r, sv) => openNodeMenu('share', r, sv)"
               @copy-to-group="ref => openSingleCopy(ref)"
             />
@@ -181,6 +209,9 @@
                 placeholder="搜索节点…"
                 @input="onSearch"
               />
+              <button class="action-btn" @click="refreshPanel" :disabled="refreshing" title="重新加载节点数据">
+                ↻ {{ refreshing ? '刷新中…' : '刷新' }}
+              </button>
               <button class="action-btn" @click="pingCurrentTab('fast')" :disabled="pinging">
                 ⚡ {{ pinging ? '探测中…' : '快速检测' }}
               </button>
@@ -189,6 +220,13 @@
               </button>
               <button v-if="pinging" class="action-btn action-btn-danger" @click="abortPing">⏹ 中止检测</button>
               <span v-if="pinging && pingProgress.total > 0" class="ping-progress">{{ pingProgress.done }}/{{ pingProgress.total }}</span>
+              <button class="action-btn" @click="detectIPTypeForCurrentTab" :disabled="detectingIPType" title="查询节点地址是机房还是家宽">
+                🌐 {{ detectingIPType ? '检测中…' : 'IP 类型' }}
+              </button>
+              <button class="action-btn" @click="scoreIPForCurrentTab" :disabled="ipScoreTask.running" title="查询 IP 纯净度评分（后台串行执行，避免触发第三方限流）">
+                🧮 {{ ipScoreTask.running ? `评分中 ${ipScoreTask.done}/${ipScoreTask.total}` : 'IP 评分' }}
+              </button>
+              <button v-if="ipScoreTask.running" class="action-btn action-btn-danger" @click="abortIPScore">⏹ 中止评分</button>
               <button v-if="group.name !== 'SERVER'" class="action-btn" @click="openEditGroup(gi)">✏ 编辑</button>
               <button class="action-btn" @click="openAddToGroup(gi)">＋ 添加节点</button>
               <button v-if="group.name !== 'SERVER'" class="action-btn action-btn-danger" @click="deleteGroup(gi)">删除分组</button>
@@ -197,26 +235,28 @@
           <div v-if="!getSortedGroupEntries(group).length" class="empty-hint">
             <p class="empty-sub">分组为空，点击「添加节点」</p>
           </div>
-          <div class="server-list-head" v-if="getSortedGroupEntries(group).length">
-            <span class="head-placeholder"></span>
-            <span class="head-placeholder"></span>
-            <span class="head-cell head-name">节点</span>
-            <span class="head-cell head-addr">地址</span>
-            <span class="head-cell head-type">协议</span>
-            <button class="head-lat-btn" @click="toggleLatencySort">
-              延迟{{ latencySortAsc ? ' ↑' : '' }}
-            </button>
-            <span class="head-cell head-ops">操作</span>
-          </div>
-          <div class="server-list-body" v-if="getSortedGroupEntries(group).length">
+          <div class="table-scroll" v-if="getSortedGroupEntries(group).length">
+            <ServerListHead
+              :columns="listColumns"
+              :sort-key="sortKey"
+              :sort-dir="sortDir"
+              @sort="onSortColumn"
+              @resize="onResizeColumn"
+              @resize-end="onResizeColumnEnd"
+              @reset-width="onResetColumnWidth"
+            />
             <ServerRow
               v-for="(item, i) in getSortedGroupEntries(group)" :key="refKey(item.ref) + ':' + i"
               :server="item.server" :ref-obj="item.ref" :outbounds="store.outbounds" :removable="true"
               :current-outbound="currentOutbound"
               :ping-state="pingStates[refKey(item.ref)] || null"
+              :ip-type-state="ipTypeStates[refKey(item.ref)] || null"
+              :ip-score-running="!!ipScoringRefs[refKey(item.ref)]"
               :selected="isSelected(item.ref)"
               @connect="connectNode"
               @select="toggleSelect"
+              @select-start="startDragSelect"
+              @select-enter="continueDragSelect"
               @remove="ref => removeFromGroup(realGroupIndex(group), ref)"
               @edit="(r, sv) => openNodeMenu('edit', r, sv)"
               @share="(r, sv) => openNodeMenu('share', r, sv)"
@@ -459,6 +499,7 @@ import { ref, computed, inject, watch, onMounted, onBeforeUnmount, nextTick } fr
 import { useProxyStore } from '../stores/proxy'
 import { api } from '../api'
 import ServerRow from '../components/ServerRow.vue'
+import ServerListHead from '../components/ServerListHead.vue'
 import NodeMenu from '../components/NodeMenu.vue'
 import axios from 'axios'
 
@@ -482,9 +523,202 @@ const isSearching = ref(false)
 const pingProgress = ref({ total: 0, done: 0, current: '' })
 const pingStates = ref({})
 const FAST_PING_CONCURRENCY = 6
-const latencySortAsc = ref(false)
+
+// ---- 列宽 ----
+// 操作列也是一列：6 个按钮实际要 220px 左右，之前固定 180px 且右对齐 + 裁剪，
+// 导致最左侧的按钮被切掉。放进来后既有足够默认宽度，也能像其他列一样拖动调整。
+const COLUMN_DEFS = [
+  { key: 'name', label: '节点', min: 80, def: 200, sortable: true },
+  { key: 'addr', label: '地址', min: 90, def: 220, sortable: true },
+  { key: 'type', label: '协议', min: 50, def: 76, sortable: true },
+  { key: 'iptype', label: 'IP 类型', min: 46, def: 62, sortable: true },
+  { key: 'ipscore', label: '评分', min: 46, def: 62, sortable: true },
+  { key: 'latency', label: '延迟', min: 46, def: 64, sortable: true },
+  { key: 'ops', label: '操作', min: 120, def: 232, noResizer: true },
+]
+const COLUMN_WIDTH_STORAGE_KEY = 'ps.serverList.columnWidths'
+
+const columnWidths = ref(loadColumnWidths())
+
+function loadColumnWidths() {
+  const widths = {}
+  for (const col of COLUMN_DEFS) widths[col.key] = col.def
+  try {
+    const saved = JSON.parse(localStorage.getItem(COLUMN_WIDTH_STORAGE_KEY) || '{}')
+    for (const col of COLUMN_DEFS) {
+      const v = Number(saved[col.key])
+      if (Number.isFinite(v) && v >= col.min) widths[col.key] = v
+    }
+  } catch {}
+  return widths
+}
+
+function persistColumnWidths() {
+  try {
+    localStorage.setItem(COLUMN_WIDTH_STORAGE_KEY, JSON.stringify(columnWidths.value))
+  } catch {}
+}
+
+const listColumns = computed(() => COLUMN_DEFS.map(col => ({
+  key: col.key,
+  label: col.label,
+  sortable: !!col.sortable,
+  noResizer: !!col.noResizer,
+})))
+
+const columnVars = computed(() => {
+  const vars = {}
+  for (const col of COLUMN_DEFS) vars[`--col-${col.key}`] = `${columnWidths.value[col.key]}px`
+  return vars
+})
+
+// 拖动过程中每次都以按下时的宽度为基准，避免累积误差。
+// 基准在一次拖动结束时清空，否则同一列再次拖动会从上一轮的起点算起、宽度突跳。
+let resizeBase = null
+function onResizeColumn(key, delta) {
+  const def = COLUMN_DEFS.find(c => c.key === key)
+  if (!def) return
+  if (!resizeBase || resizeBase.key !== key) {
+    resizeBase = { key, width: columnWidths.value[key] }
+  }
+  const next = Math.max(def.min, Math.round(resizeBase.width + delta))
+  columnWidths.value = { ...columnWidths.value, [key]: next }
+  persistColumnWidths()
+}
+
+function onResizeColumnEnd() {
+  resizeBase = null
+}
+
+function onResetColumnWidth(key) {
+  const def = COLUMN_DEFS.find(c => c.key === key)
+  if (!def) return
+  resizeBase = null
+  columnWidths.value = { ...columnWidths.value, [key]: def.def }
+  persistColumnWidths()
+}
+
+// ---- 排序 ----
+// 排序结果是点击表头那一刻的快照：把每个节点的名次固定下来，之后延迟再怎么变都
+// 只更新数字、不重新排位，避免测速过程中行来回跳导致点错节点。
+const sortKey = ref('')
+const sortDir = ref('')
+const sortRanks = ref(null)
+
+function onSortColumn(key) {
+  if (sortKey.value === key) {
+    sortDir.value = sortDir.value === 'asc' ? 'desc' : 'asc'
+  } else {
+    sortKey.value = key
+    sortDir.value = 'asc'
+  }
+  captureSortOrder()
+}
+
+function sortValueFor(key, server) {
+  if (key === 'latency') return latencyValue(server)
+  if (key === 'iptype') return ipTypeOrder(server?.ipType)
+  // 评分越高越好，取负值让"升序"= 从优到劣，和延迟列的方向观感一致
+  if (key === 'ipscore') {
+    const s = server?.ipScore
+    return (s === null || s === undefined) ? Number.MAX_SAFE_INTEGER : -s
+  }
+  return 0
+}
+
+// numeric 让"节点2"排在"节点10"前面，也让 IP 段按数值而不是字典序比
+const textCollator = new Intl.Collator('zh-Hans-CN', { numeric: true, sensitivity: 'base' })
+
+// 空值一律沉底，和"未检测"列的处理保持一致
+function compareText(a, b) {
+  const x = (a || '').trim()
+  const y = (b || '').trim()
+  if (!x || !y) return (x ? 0 : 1) - (y ? 0 : 1)
+  return textCollator.compare(x, y)
+}
+
+function compareServers(key, a, b) {
+  if (key === 'name') return compareText(a?.name, b?.name)
+  if (key === 'type') return compareText(a?.type, b?.type)
+  if (key === 'addr') {
+    return compareText(a?.host, b?.host) || (Number(a?.port) || 0) - (Number(b?.port) || 0)
+  }
+  return sortValueFor(key, a) - sortValueFor(key, b)
+}
+
+// 未检测的排在最后，避免空值抢占前排
+function ipTypeOrder(type) {
+  const order = { idc: 0, residential: 1, mobile: 2, unknown: 3 }
+  const v = order[type]
+  return v === undefined ? Number.MAX_SAFE_INTEGER : v
+}
+
+// 对所有节点（手动 + 全部订阅）统一算名次，这样切换 tab 时排序依然生效。
+// 名次按节点身份存储而非下标：删节点或刷新订阅会让下标整体前移，用下标当键会把
+// 名次张冠李戴到别的节点上。
+function captureSortOrder() {
+  if (!sortKey.value) {
+    sortRanks.value = null
+    return
+  }
+  const items = []
+  store.servers.forEach((server) => items.push(server))
+  store.subscriptions.forEach((sub) => {
+    (sub?.servers || []).forEach((server) => items.push(server))
+  })
+
+  const dir = sortDir.value === 'desc' ? -1 : 1
+  items.sort((a, b) => compareServers(sortKey.value, a, b) * dir)
+
+  const ranks = new Map()
+  items.forEach((server, i) => {
+    const id = nodeIdentity(server)
+    if (!ranks.has(id)) ranks.set(id, i)
+  })
+  sortRanks.value = ranks
+}
+
+// 与后端 serverProbeKeys 同样的思路：优先用链接，退回协议/地址/端口/名称组合
+function nodeIdentity(server) {
+  const link = (server?.link || '').trim()
+  if (link) return `link:${link}`
+  const type = (server?.type || '').toLowerCase().trim()
+  const host = (server?.host || '').toLowerCase().trim()
+  return `srv:${type}|${host}|${server?.port || 0}|${(server?.name || '').trim()}`
+}
 const pingAbortController = ref(null)
 const pingAborted = ref(false)
+
+// IP 类型检测状态
+const detectingIPType = ref(false)
+const ipTypeStates = ref({})
+
+// IP 评分：后端串行限速跑，这里轮询进度
+const ipScoreTask = ref({ running: false, total: 0, done: 0, failed: 0, currentIp: '', lastError: '' })
+
+// 顶部轻提示：后台任务没有即时结果，至少要让用户知道"已经开始了"
+const notice = ref(null)
+let noticeTimer = null
+function showNotice(text, isError = false) {
+  notice.value = { text, error: isError }
+  if (noticeTimer) clearTimeout(noticeTimer)
+  noticeTimer = setTimeout(() => { notice.value = null }, isError ? 8000 : 5000)
+}
+
+const refreshing = ref(false)
+async function refreshPanel() {
+  if (refreshing.value) return
+  refreshing.value = true
+  try {
+    await store.fetchAll()
+  } catch (e) {
+    showNotice('刷新失败：' + (e?.response?.data?.error || e?.message || '未知错误'), true)
+  } finally {
+    refreshing.value = false
+  }
+}
+const ipScoringRefs = ref({})
+let ipScorePollTimer = null
 
 // 订阅编辑状态
 const editSubIdx = ref(-1)
@@ -501,6 +735,12 @@ const nodeMenuServer = ref(null)
 
 // 多选状态
 const selectedRefs = ref([])
+const selectionAnchorKey = ref('')
+const dragSelecting = ref(false)
+const dragSelectChecked = ref(true)
+const dragLastKey = ref('')
+const dragStartPos = ref({ x: 0, y: 0 }) // 记录拖拽开始位置
+const dragMoved = ref(false) // 标记是否真正发生了拖拽移动
 
 // ===== Tab 栏横向滚动 =====
 const tabsWrapEl = ref(null)
@@ -552,12 +792,28 @@ onMounted(() => {
     tabsResizeObserver.observe(tabsWrapEl.value)
   }
   window.addEventListener('resize', updateTabScrollState)
+  window.addEventListener('pointerup', endDragSelect)
+  window.addEventListener('pointercancel', endDragSelect)
+  window.addEventListener('blur', endDragSelect)
+  // 评分任务跑在后端，刷新页面后要接回进度显示
+  resumeIPScoreIfRunning()
 })
 
 onBeforeUnmount(() => {
   tabsResizeObserver?.disconnect()
   window.removeEventListener('resize', updateTabScrollState)
+  window.removeEventListener('pointerup', endDragSelect)
+  window.removeEventListener('pointercancel', endDragSelect)
+  window.removeEventListener('blur', endDragSelect)
+  stopIPScorePoll()
 })
+
+async function resumeIPScoreIfRunning() {
+  try {
+    const { data } = await api.getIPScoreStatus()
+    if (data?.running) startIPScorePoll()
+  } catch {}
+}
 
 function refKey(ref) {
   return `${ref.type}:${ref.index}:${ref.sub || 0}`
@@ -565,12 +821,96 @@ function refKey(ref) {
 function isSelected(ref) {
   return selectedRefs.value.some(r => refKey(r) === refKey(ref))
 }
-function toggleSelect(ref, checked) {
+
+function setSelected(ref, checked) {
   if (checked) {
-    if (!isSelected(ref)) selectedRefs.value.push(ref)
-  } else {
-    selectedRefs.value = selectedRefs.value.filter(r => refKey(r) !== refKey(ref))
+    if (!isSelected(ref)) selectedRefs.value = [...selectedRefs.value, ref]
+    return
   }
+  selectedRefs.value = selectedRefs.value.filter(r => refKey(r) !== refKey(ref))
+}
+
+function getVisibleRefs() {
+  if (isSearching.value) return sortedSearchResults.value.map(entry => entry.ref)
+  return getSortedCurrentTabRefs()
+}
+
+function selectRange(fromKey, toRef, checked) {
+  const visibleRefs = getVisibleRefs()
+  const fromIndex = visibleRefs.findIndex(ref => refKey(ref) === fromKey)
+  const toIndex = visibleRefs.findIndex(ref => refKey(ref) === refKey(toRef))
+  if (fromIndex < 0 || toIndex < 0) {
+    setSelected(toRef, checked)
+    return
+  }
+
+  const start = Math.min(fromIndex, toIndex)
+  const end = Math.max(fromIndex, toIndex)
+  const rangeRefs = visibleRefs.slice(start, end + 1)
+  const rangeKeys = new Set(rangeRefs.map(refKey))
+
+  if (checked) {
+    const selectedKeys = new Set(selectedRefs.value.map(refKey))
+    selectedRefs.value = [
+      ...selectedRefs.value,
+      ...rangeRefs.filter(ref => !selectedKeys.has(refKey(ref))),
+    ]
+    return
+  }
+  selectedRefs.value = selectedRefs.value.filter(ref => !rangeKeys.has(refKey(ref)))
+}
+
+function toggleSelect(ref, checked, event) {
+  if (event?.shiftKey && selectionAnchorKey.value) {
+    selectRange(selectionAnchorKey.value, ref, checked)
+    return
+  }
+  setSelected(ref, checked)
+  selectionAnchorKey.value = refKey(ref)
+}
+
+function startDragSelect(ref, event) {
+  if (event.button !== 0) return
+
+  const checked = !isSelected(ref)
+  if (event.shiftKey && selectionAnchorKey.value) {
+    selectRange(selectionAnchorKey.value, ref, checked)
+  } else {
+    setSelected(ref, checked)
+    selectionAnchorKey.value = refKey(ref)
+  }
+
+  dragSelecting.value = true
+  dragSelectChecked.value = checked
+  dragLastKey.value = refKey(ref)
+  dragStartPos.value = { x: event.clientX, y: event.clientY }
+  dragMoved.value = false
+  // 单元格文字现在可以划词，拖拽多选时要临时关掉，否则会顺带选中整片文本
+  document.body.style.userSelect = 'none'
+}
+
+function continueDragSelect(ref, event) {
+  if (!dragSelecting.value || !(event.buttons & 1)) return
+
+  // 检查是否真正移动了（移动超过 5 像素才算拖拽）
+  if (!dragMoved.value) {
+    const dx = Math.abs(event.clientX - dragStartPos.value.x)
+    const dy = Math.abs(event.clientY - dragStartPos.value.y)
+    if (dx < 5 && dy < 5) return // 移动距离太小，不算拖拽
+    dragMoved.value = true
+  }
+
+  const currentKey = refKey(ref)
+  if (currentKey === dragLastKey.value) return
+  selectRange(dragLastKey.value, ref, dragSelectChecked.value)
+  dragLastKey.value = currentKey
+}
+
+function endDragSelect() {
+  if (dragSelecting.value) document.body.style.userSelect = ''
+  dragSelecting.value = false
+  dragLastKey.value = ''
+  dragMoved.value = false
 }
 
 // 全选功能
@@ -595,6 +935,24 @@ function getCurrentTabServers() {
   return []
 }
 
+function getSortedCurrentTabRefs() {
+  if (activeTab.value.startsWith('sub-')) {
+    const si = parseInt(activeTab.value.replace('sub-', ''))
+    const sub = store.subscriptions[si]
+    if (!sub?.servers) return []
+    return getSortedSubEntries(sub, si).map(e => e.ref)
+  }
+  if (activeTab.value.startsWith('group-')) {
+    const gi = parseInt(activeTab.value.replace('group-', ''))
+    const group = manualGroups.value[gi]
+    if (!group?.servers) return []
+    return getSortedGroupEntries(group).map(e => e.ref)
+  }
+  return []
+}
+
+
+
 function selectAll() {
   const currentTabServers = getCurrentTabServers()
   selectedRefs.value = [...currentTabServers]
@@ -605,6 +963,8 @@ function selectAll() {
 watch(activeTab, async () => {
   selectedRefs.value = []
   showSelectAll.value = false
+  selectionAnchorKey.value = ''
+  endDragSelect()
   await nextTick()
   scrollActiveTabIntoView()
 })
@@ -648,81 +1008,42 @@ const canBulkRemove = computed(() => {
   return activeTab.value.startsWith('group-')
 })
 
-async function pingRefsFastConcurrent(refs) {
-  const queue = refs.map(ref => ({ type: ref.type, index: ref.index, sub: ref.sub || 0 }))
-  const stateMap = {}
-  for (const ref of queue) {
-    stateMap[refKey(ref)] = { status: 'pending' }
-  }
-  pingStates.value = stateMap
-  let cursor = 0
-  const worker = async () => {
-    while (true) {
-      if (pingAbortController.value?.signal?.aborted) return
-      const idx = cursor++
-      if (idx >= queue.length) return
-      const ref = queue[idx]
-      const key = refKey(ref)
-      pingStates.value[key] = { status: 'running' }
-      try {
-        const { data } = await api.pingNodes([ref], 'fast', { signal: pingAbortController.value?.signal })
-        const lat = data?.results?.[0]?.latency
-        pingStates.value[key] = { status: 'done', latency: typeof lat === 'number' ? lat : -1 }
-      } catch (e) {
-        if (axios.isCancel(e) || pingAbortController.value?.signal?.aborted) {
-          pingAborted.value = true
-          pingStates.value[key] = { status: 'pending' }
-          return
-        }
-        pingStates.value[key] = { status: 'done', latency: -1 }
-      } finally {
-        pingProgress.value.done += 1
-      }
-    }
-  }
-  const workers = []
-  const n = Math.min(FAST_PING_CONCURRENCY, queue.length)
-  for (let i = 0; i < n; i += 1) workers.push(worker())
-  await Promise.all(workers)
-}
-
-async function pingRefsRealSequential(refs) {
-  const queue = refs.map(ref => ({ type: ref.type, index: ref.index, sub: ref.sub || 0 }))
-  const stateMap = {}
-  for (const ref of queue) {
-    stateMap[refKey(ref)] = { status: 'pending' }
-  }
-  pingStates.value = stateMap
-  for (const raw of refs) {
-    if (pingAbortController.value?.signal?.aborted) return
-    const ref = { type: raw.type, index: raw.index, sub: raw.sub || 0 }
-    const key = refKey(ref)
-    pingStates.value[key] = { status: 'running' }
-    try {
-      const { data } = await api.pingNodes([ref], 'real', { signal: pingAbortController.value?.signal })
-      const lat = data?.results?.[0]?.latency
-      pingStates.value[key] = { status: 'done', latency: typeof lat === 'number' ? lat : -1 }
-    } catch (e) {
-      if (axios.isCancel(e) || pingAbortController.value?.signal?.aborted) {
-        pingAborted.value = true
-        pingStates.value[key] = { status: 'pending' }
-        return
-      }
-      pingStates.value[key] = { status: 'done', latency: -1 }
-    } finally {
-      pingProgress.value.done += 1
-    }
-  }
-}
-
+// 一次性把所有 refs 提交给后端，由后端 worker pool 按配置的并发数调度
+// （real 默认 4、fast 16），前端只消费 SSE 进度事件更新状态。
 async function pingRefsWithProgress(refs, mode = 'fast') {
   pingProgress.value = { total: refs.length, done: 0, current: '' }
   pingAborted.value = false
   pingAbortController.value = new AbortController()
-  if (mode === 'real') {
-    await pingRefsRealSequential(refs)
-  } else {
-    await pingRefsFastConcurrent(refs)
+
+  const queue = refs.map(ref => ({ type: ref.type, index: ref.index, sub: ref.sub || 0 }))
+  const stateMap = {}
+  for (const ref of queue) {
+    stateMap[refKey(ref)] = { status: 'pending' }
+  }
+  pingStates.value = stateMap
+
+  try {
+    await api.pingNodes(queue, mode, {
+      signal: pingAbortController.value.signal,
+      onEvent: (evt, payload) => {
+        const ref = payload?.ref
+        if (!ref) return
+        const key = refKey({ type: ref.type, index: ref.index, sub: ref.sub || 0 })
+        if (evt === 'running') {
+          pingStates.value[key] = { status: 'running' }
+        } else if (evt === 'done') {
+          const lat = payload.latency
+          pingStates.value[key] = { status: 'done', latency: typeof lat === 'number' ? lat : -1 }
+          pingProgress.value.done += 1
+        }
+      },
+    })
+  } catch (e) {
+    if (e?.name === 'AbortError' || pingAbortController.value?.signal?.aborted) {
+      pingAborted.value = true
+      return
+    }
+    throw e
   }
 }
 
@@ -787,13 +1108,18 @@ function latencyValue(server) {
   return Number.isFinite(lat) && lat >= 0 ? lat : Number.MAX_SAFE_INTEGER
 }
 
-function sortEntriesByLatency(entries) {
-  if (!latencySortAsc.value) return entries
-  return [...entries].sort((a, b) => latencyValue(a.server) - latencyValue(b.server))
-}
-
-function toggleLatencySort() {
-  latencySortAsc.value = !latencySortAsc.value
+// 按点击表头时固定下来的名次排列。新导入、排序后才出现的节点没有名次，排在末尾。
+function applySortOrder(entries) {
+  const ranks = sortRanks.value
+  if (!ranks) return entries
+  return [...entries].sort((a, b) => {
+    const ra = ranks.get(nodeIdentity(a.server))
+    const rb = ranks.get(nodeIdentity(b.server))
+    if (ra === undefined && rb === undefined) return 0
+    if (ra === undefined) return 1
+    if (rb === undefined) return -1
+    return ra - rb
+  })
 }
 
 let searchTimer = null
@@ -903,7 +1229,7 @@ function getGroupServerEntries(group) {
 }
 
 function getSortedGroupEntries(group) {
-  return sortEntriesByLatency(getGroupServerEntries(group))
+  return applySortOrder(getGroupServerEntries(group))
 }
 
 function getSubServerEntries(sub, si) {
@@ -914,10 +1240,10 @@ function getSubServerEntries(sub, si) {
 }
 
 function getSortedSubEntries(sub, si) {
-  return sortEntriesByLatency(getSubServerEntries(sub, si))
+  return applySortOrder(getSubServerEntries(sub, si))
 }
 
-const sortedSearchResults = computed(() => sortEntriesByLatency(searchResults.value))
+const sortedSearchResults = computed(() => applySortOrder(searchResults.value))
 
 const filteredSelectableServers = computed(() => {
   if (!addSearch.value.trim()) return selectableServers.value
@@ -965,24 +1291,148 @@ async function pingCurrentTab(mode = 'fast') {
   pinging.value = true
   try {
     let refs = []
+    let group = null
     if (activeTab.value.startsWith('sub-')) {
       const si = parseInt(activeTab.value.replace('sub-', ''))
       const sub = store.subscriptions[si]
       if (sub?.servers?.length) {
         refs = sub.servers.map((_, i) => ({ type: 'sub_server', index: i, sub: si }))
       }
+      group = store.groups.find(g => g.id === sub?.groupId) || null
     } else if (activeTab.value.startsWith('group-')) {
       const gi = parseInt(activeTab.value.replace('group-', ''))
-      const group = manualGroups.value[gi]
+      group = manualGroups.value[gi] || null
       if (group) refs = (group.servers || []).map(r => ({ type: r.type, index: r.index, sub: r.sub || 0 }))
     }
     if (refs.length) await pingRefsWithProgress(refs, mode)
+    // 中途中断时数据只有一半，用它判定切换会挑到"恰好先测完"的节点
+    if (refs.length && group && !pingAborted.value) {
+      await applyGroupSwitchAfterPing(group, mode)
+    }
     await store.fetchAll()
   } finally {
     pingAbortController.value = null
     pingProgress.value = { total: 0, done: 0, current: '' }
     pingStates.value = {}
     pinging.value = false
+  }
+}
+
+// 分组测速跑完后交给后端按绑定策略决定是否切换节点。后端会跳过测速方式与本次不一致
+// 的出站，切换结果通过日志面板反馈。
+async function applyGroupSwitchAfterPing(group, mode) {
+  const index = realGroupIndex(group)
+  if (index < 0) return
+  try {
+    await api.applyGroupSwitch(index, mode)
+  } catch (e) {
+    console.error('应用分组切换策略失败', e)
+  }
+}
+
+// 检测当前 tab 全部节点的 IP 类型
+async function detectIPTypeForCurrentTab() {
+  let refs = []
+  if (activeTab.value.startsWith('sub-')) {
+    const si = parseInt(activeTab.value.replace('sub-', ''))
+    const sub = store.subscriptions[si]
+    refs = (sub?.servers || []).map((_, i) => ({ type: 'sub_server', index: i, sub: si }))
+  } else if (activeTab.value.startsWith('group-')) {
+    const gi = parseInt(activeTab.value.replace('group-', ''))
+    const group = manualGroups.value[gi]
+    refs = (group?.servers || []).map(r => ({ type: r.type, index: r.index, sub: r.sub || 0 }))
+  }
+  await detectIPTypeForRefs(refs)
+}
+
+async function detectIPTypeForRefs(refs) {
+  if (detectingIPType.value || !refs?.length) return
+  const queue = refs.map(r => ({ type: r.type, index: r.index, sub: r.sub || 0 }))
+  detectingIPType.value = true
+  const states = {}
+  for (const ref of queue) states[refKey(ref)] = { status: 'running' }
+  ipTypeStates.value = states
+  try {
+    await api.detectServerIPType(queue)
+    await store.fetchAll()
+  } catch (e) {
+    console.error('IP 类型检测失败', e)
+  } finally {
+    ipTypeStates.value = {}
+    detectingIPType.value = false
+  }
+}
+
+// 查询当前 tab 全部节点的 IP 评分
+async function scoreIPForCurrentTab() {
+  let refs = []
+  if (activeTab.value.startsWith('sub-')) {
+    const si = parseInt(activeTab.value.replace('sub-', ''))
+    const sub = store.subscriptions[si]
+    refs = (sub?.servers || []).map((_, i) => ({ type: 'sub_server', index: i, sub: si }))
+  } else if (activeTab.value.startsWith('group-')) {
+    const gi = parseInt(activeTab.value.replace('group-', ''))
+    const group = manualGroups.value[gi]
+    refs = (group?.servers || []).map(r => ({ type: r.type, index: r.index, sub: r.sub || 0 }))
+  }
+  await scoreIPForRefs(refs)
+}
+
+async function scoreIPForRefs(refs) {
+  if (ipScoreTask.value.running || !refs?.length) return
+  const queue = refs.map(r => ({ type: r.type, index: r.index, sub: r.sub || 0 }))
+  const marks = {}
+  for (const ref of queue) marks[refKey(ref)] = true
+  ipScoringRefs.value = marks
+  try {
+    await api.scoreServerIP(queue)
+    showNotice(`已在后台开始查询 ${queue.length} 个节点的 IP 评分，按限速逐个进行，请稍后在「评分」列查看结果。`)
+    startIPScorePoll()
+  } catch (e) {
+    ipScoringRefs.value = {}
+    showNotice(e?.response?.data?.error || 'IP 评分启动失败', true)
+  }
+}
+
+function startIPScorePoll() {
+  stopIPScorePoll()
+  ipScoreTask.value = { ...ipScoreTask.value, running: true }
+  ipScorePollTimer = setInterval(pollIPScore, 1000)
+  pollIPScore()
+}
+
+function stopIPScorePoll() {
+  if (ipScorePollTimer) {
+    clearInterval(ipScorePollTimer)
+    ipScorePollTimer = null
+  }
+}
+
+async function pollIPScore() {
+  try {
+    const { data } = await api.getIPScoreStatus()
+    const wasRunning = ipScoreTask.value.running
+    ipScoreTask.value = data
+    if (!data.running) {
+      stopIPScorePoll()
+      ipScoringRefs.value = {}
+      await store.fetchAll()
+      if (wasRunning) {
+        const failed = data.failed ? `，${data.failed} 个失败` : ''
+        showNotice(`IP 评分完成：成功 ${Math.max(data.done - data.failed, 0)}/${data.total}${failed}。`)
+      }
+    }
+  } catch (e) {
+    stopIPScorePoll()
+    ipScoringRefs.value = {}
+  }
+}
+
+async function abortIPScore() {
+  try {
+    await api.cancelIPScore()
+  } catch (e) {
+    console.error('中止评分失败', e)
   }
 }
 
@@ -1326,6 +1776,35 @@ async function confirmSingleMove() {
 .action-btn-danger { color: #ff4d4f; border-color: #ff4d4f; }
 .action-btn-danger:hover { background: #fff1f0; }
 
+/* ===== 后台任务提示条 ===== */
+.notice-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 24px;
+  background: #f6ffed;
+  border-bottom: 1px solid #b7eb8f;
+  color: #237804;
+  font-size: 13px;
+  flex-shrink: 0;
+}
+.notice-bar-error {
+  background: #fff2f0;
+  border-bottom-color: #ffccc7;
+  color: #a8071a;
+}
+.notice-close {
+  margin-left: auto;
+  border: none;
+  background: transparent;
+  color: inherit;
+  opacity: .6;
+  cursor: pointer;
+  font-size: 12px;
+  padding: 0 4px;
+}
+.notice-close:hover { opacity: 1; }
+
 /* ===== 多选工具栏 ===== */
 .bulk-bar {
   display: flex;
@@ -1369,59 +1848,18 @@ async function confirmSingleMove() {
   flex: 1;
   min-height: 0;
 }
-.server-list-head {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 6px 16px;
-  border-bottom: 1px solid #f0f0f0;
-  background: #fcfcfc;
-  flex-shrink: 0;
-}
-.server-list-body {
+/* 表头和行放在同一个滚动容器里，横向滚动时两者才不会错位。
+   列宽固定后总宽可能超过面板，窄窗口下靠横向滚动而不是挤压列。 */
+.table-scroll {
   flex: 1;
   min-height: 0;
-  overflow-y: auto;
+  overflow: auto;
 }
-.head-placeholder {
-  width: 14px;
-  flex-shrink: 0;
+.table-scroll > :first-child {
+  position: sticky;
+  top: 0;
+  z-index: 2;
 }
-.head-cell {
-  font-size: 11px;
-  color: #bfbfbf;
-  white-space: nowrap;
-  flex-shrink: 0;
-}
-.head-name {
-  flex: 1.5;
-  min-width: 0;
-}
-.head-addr {
-  flex: 2;
-  min-width: 0;
-}
-.head-type {
-  width: 48px;
-  margin-right: 16px;
-}
-.head-ops {
-  width: 180px;
-  text-align: right;
-}
-.head-lat-btn {
-  min-width: 52px;
-  margin-right: 16px;
-  border: none;
-  background: transparent;
-  color: #8c8c8c;
-  font-size: 11px;
-  font-weight: 600;
-  text-align: right;
-  cursor: pointer;
-  padding: 0;
-}
-.head-lat-btn:hover { color: #1677ff; }
 
 /* 信息栏（订阅/分组头部） */
 .info-bar {
@@ -1484,4 +1922,3 @@ async function confirmSingleMove() {
   line-height: 1.5;
 }
 </style>
-
