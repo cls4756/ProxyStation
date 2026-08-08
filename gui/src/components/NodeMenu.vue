@@ -126,7 +126,8 @@ watch(() => props.mode, async (m) => {
   }
   if (m === 'copy') {
     targetGroupId.value = ''
-    await store.fetchAll()
+    // 只刷新分组列表，不需要拉取所有数据
+    await store.fetchGroups()
   }
 }, { immediate: true })
 
@@ -136,12 +137,15 @@ function close() {
 
 async function saveEdit() {
   if (!props.refObj || props.refObj.type !== 'server') return
-  await api.editServer(props.refObj.index, {
+  const { data } = await api.editServer(props.refObj.index, {
     name: editName.value,
     link: editLink.value,
     frontProxy: editFrontProxy.value,
   })
-  await store.fetchAll()
+  // 只更新这个节点的数据，不重新拉取所有内容
+  if (data.server) {
+    store.servers[props.refObj.index] = data.server
+  }
   emit('updated')
   close()
 }
@@ -156,7 +160,8 @@ async function copyLink() {
 async function doCopy() {
   if (!targetGroupId.value || !props.refObj) return
   await api.copyServerToGroup(props.refObj, targetGroupId.value)
-  await store.fetchAll()
+  // 只刷新分组数据，不需要拉取订阅和服务器
+  await store.fetchGroups()
   emit('updated')
   close()
 }
