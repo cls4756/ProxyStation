@@ -599,11 +599,9 @@ function onResetColumnWidth(key) {
 }
 
 // ---- 排序 ----
-// 排序结果是点击表头那一刻的快照：把每个节点的名次固定下来，之后延迟再怎么变都
-// 只更新数字、不重新排位，避免测速过程中行来回跳导致点错节点。
+// 排序改为实时计算，而非固定快照。这样测速过程中延迟更新后会实时重新排序。
 const sortKey = ref('')
 const sortDir = ref('')
-const sortRanks = ref(null)
 
 function onSortColumn(key) {
   if (sortKey.value === key) {
@@ -612,7 +610,6 @@ function onSortColumn(key) {
     sortKey.value = key
     sortDir.value = 'asc'
   }
-  captureSortOrder()
 }
 
 function sortValueFor(key, server) {
@@ -653,38 +650,19 @@ function ipTypeOrder(type) {
   return v === undefined ? Number.MAX_SAFE_INTEGER : v
 }
 
-// 对所有节点（手动 + 全部订阅）统一算名次，这样切换 tab 时排序依然生效。
-// 名次按节点身份存储而非下标：删节点或刷新订阅会让下标整体前移，用下标当键会把
-// 名次张冠李戴到别的节点上。
-function captureSortOrder() {
-  if (!sortKey.value) {
-    sortRanks.value = null
-    return
-  }
-  const items = []
-  store.servers.forEach((server) => items.push(server))
-  store.subscriptions.forEach((sub) => {
-    (sub?.servers || []).forEach((server) => items.push(server))
-  })
-
-  const dir = sortDir.value === 'desc' ? -1 : 1
-  items.sort((a, b) => compareServers(sortKey.value, a, b) * dir)
-
-  const ranks = new Map()
-  items.forEach((server, i) => {
-    const id = nodeIdentity(server)
-    if (!ranks.has(id)) ranks.set(id, i)
-  })
-  sortRanks.value = ranks
+function latencyValue(server) {
+  const lat = Number(server?.latency)
+  // -1=未测速, 0=超时，都排在最后
+  if (!Number.isFinite(lat) || lat < 0) return Number.MAX_SAFE_INTEGER
+  if (lat === 0) return Number.MAX_SAFE_INTEGER - 1
+  return lat
 }
 
-// 与后端 serverProbeKeys 同样的思路：优先用链接，退回协议/地址/端口/名称组合
-function nodeIdentity(server) {
-  const link = (server?.link || '').trim()
-  if (link) return `link:${link}`
-  const type = (server?.type || '').toLowerCase().trim()
-  const host = (server?.host || '').toLowerCase().trim()
-  return `srv:${type}|${host}|${server?.port || 0}|${(server?.name || '').trim()}`
+// 实时排序：根据当前的排序键和方向对节点列表排序
+function applySortOrder(entries) {
+  if (!sortKey.value) return entries
+  const dir = sortDir.value === 'desc' ? -1 : 1
+  return [...entries].sort((a, b) => compareServers(sortKey.value, a.server, b.server) * dir)
 }
 const pingAbortController = ref(null)
 const pingAborted = ref(false)
@@ -1101,25 +1079,6 @@ function openNodeMenu(mode, refObj, server) {
   nodeMenuRef.value = refObj
   nodeMenuServer.value = server
   nodeMenuMode.value = mode
-}
-
-function latencyValue(server) {
-  const lat = Number(server?.latency)
-  return Number.isFinite(lat) && lat >= 0 ? lat : Number.MAX_SAFE_INTEGER
-}
-
-// 按点击表头时固定下来的名次排列。新导入、排序后才出现的节点没有名次，排在末尾。
-function applySortOrder(entries) {
-  const ranks = sortRanks.value
-  if (!ranks) return entries
-  return [...entries].sort((a, b) => {
-    const ra = ranks.get(nodeIdentity(a.server))
-    const rb = ranks.get(nodeIdentity(b.server))
-    if (ra === undefined && rb === undefined) return 0
-    if (ra === undefined) return 1
-    if (rb === undefined) return -1
-    return ra - rb
-  })
 }
 
 let searchTimer = null
