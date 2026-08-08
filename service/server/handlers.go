@@ -1,7 +1,6 @@
 package server
 
 import (
-	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -23,31 +22,40 @@ import (
 	"github.com/ProxyStation/proxystation/core/cfgoodnet"
 	"github.com/ProxyStation/proxystation/core/engine"
 	"github.com/ProxyStation/proxystation/db/configure"
+	"github.com/ProxyStation/proxystation/pkg/ipinfo"
+	"github.com/ProxyStation/proxystation/pkg/ipscore"
 	"github.com/ProxyStation/proxystation/pkg/observatory"
-	"github.com/ProxyStation/proxystation/pkg/probe"
 	"github.com/ProxyStation/proxystation/pkg/subscription"
 	"github.com/gin-gonic/gin"
 	gonanoid "github.com/matoous/go-nanoid"
-	xproxy "golang.org/x/net/proxy"
 )
 
 // 日志缓冲区和订阅者管理
 var (
 	logMutex        sync.RWMutex
 	logBuffer       []string
-	logSubscribers  []chan LogEntry
+	logSubscribers  []*logSubscriber
 	maxLogLines     = 500
 	logFilePath     string
 	maxLogFileSize  int64 = 2 * 1024 * 1024 // 2MB
 	logQueue              = make(chan queuedLogEntry, 1024)
 	logDroppedCount int
 	logWorkerOnce   sync.Once
-	probeCoreMu     sync.Mutex
 )
 
 type queuedLogEntry struct {
 	message string
 	level   string
+}
+
+// logSubscriber 携带单个 SSE 订阅者的过滤条件。
+// inbound 非空时只推送消息前缀匹配 "inbound:<id>" 的日志；
+// alwaysSystem 为真时，即使设置了 inbound 过滤，无 "inbound:" 前缀的系统日志仍会推送。
+type logSubscriber struct {
+	ch           chan LogEntry
+	inbound      string
+	inboundTag   string
+	alwaysSystem bool
 }
 
 // InitLogFile 初始化日志文件路径
@@ -117,7 +125,7 @@ func processLogQueue() {
 
 		var (
 			logsToFlush []string
-			subscribers []chan LogEntry
+			subscribers []*logSubscriber
 		)
 
 		logMutex.Lock()
@@ -135,9 +143,12 @@ func processLogQueue() {
 			writeLogsToFile(logsToFlush)
 		}
 
-		for _, ch := range subscribers {
+		for _, sub := range subscribers {
+			if !shouldIncludeLog(item.message, sub.inbound, sub.inboundTag, sub.alwaysSystem) {
+				continue
+			}
 			select {
-			case ch <- entry:
+			case sub.ch <- entry:
 			default:
 			}
 		}
@@ -1101,11 +1112,13 @@ func copyServerToGroup(c *gin.Context) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "server not found"})
 			return
 		}
+		// 检查目标分组内是否已有配置相同的节点（不比较名称）
 		if groupHasServerRaw(group.Servers, *server) {
 			c.JSON(http.StatusOK, gin.H{"ok": true, "skipped": true})
 			return
 		}
-		localRef, ok := ensureLocalServerCopy(*server)
+		// 每次都创建新的独立副本，不复用已有节点
+		localRef, ok := createLocalServerCopy(*server)
 		if !ok {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "clone server failed"})
 			return
@@ -1134,16 +1147,12 @@ func serverRawByServerRef(ref configure.ServerRef) *configure.ServerRaw {
 	}
 }
 
-func ensureLocalServerCopy(server configure.ServerRaw) (configure.ServerRef, bool) {
-	servers := configure.GetServers()
-	for i, existing := range servers {
-		if sameServerRaw(existing, server) {
-			return configure.ServerRef{Type: "server", Index: i, Sub: 0}, true
-		}
-	}
+// createLocalServerCopy 创建节点的新副本（不复用已有节点）
+func createLocalServerCopy(server configure.ServerRaw) (configure.ServerRef, bool) {
 	server.Source = "manual"
 	server.Latency = -1
 	server.LastProbeTime = 0
+	servers := configure.GetServers()
 	index := len(servers)
 	if err := configure.AppendServers([]*configure.ServerRaw{&server}); err != nil {
 		return configure.ServerRef{}, false
@@ -1151,24 +1160,27 @@ func ensureLocalServerCopy(server configure.ServerRaw) (configure.ServerRef, boo
 	return configure.ServerRef{Type: "server", Index: index, Sub: 0}, true
 }
 
+// groupHasServerRaw 检查分组内是否已有配置相同的节点（不比较名称）
 func groupHasServerRaw(refs []configure.ServerRef, server configure.ServerRaw) bool {
 	for _, ref := range refs {
 		existing := serverRawByServerRef(ref)
-		if existing != nil && sameServerRaw(*existing, server) {
+		if existing != nil && sameServerConfig(*existing, server) {
 			return true
 		}
 	}
 	return false
 }
 
-func sameServerRaw(a, b configure.ServerRaw) bool {
+// sameServerConfig 比较两个节点的配置是否相同（不比较名称）
+func sameServerConfig(a, b configure.ServerRaw) bool {
+	// 优先比较链接，如果链接相同则认为是同一节点
 	if strings.TrimSpace(a.Link) != "" && strings.TrimSpace(a.Link) == strings.TrimSpace(b.Link) {
 		return true
 	}
+	// 链接不同或为空时，比较类型、主机、端口（不包括名称）
 	return strings.EqualFold(strings.TrimSpace(a.Type), strings.TrimSpace(b.Type)) &&
 		strings.EqualFold(strings.TrimSpace(a.Host), strings.TrimSpace(b.Host)) &&
-		a.Port == b.Port &&
-		strings.TrimSpace(a.Name) == strings.TrimSpace(b.Name)
+		a.Port == b.Port
 }
 
 // ---- Subscriptions ----
@@ -1585,12 +1597,80 @@ func getOutbounds(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"outbounds": outbounds})
 }
 
+// normalizeProbeInterval 校验出站的探测间隔（Go duration 字符串，如 "30s"、"5m"）。
+// 空串表示未设置，由 observatory 回退到默认间隔。
+func normalizeProbeInterval(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return "", fmt.Errorf("探测间隔格式非法，应形如 30s / 5m：%v", raw)
+	}
+	if d < 10*time.Second {
+		return "", fmt.Errorf("探测间隔不能小于 10s")
+	}
+	return raw, nil
+}
+
+// normalizeProbeMode 校验出站的测速方式，空串表示回退到设置里的默认测速方式。
+func normalizeProbeMode(raw string) (string, error) {
+	mode := strings.ToLower(strings.TrimSpace(raw))
+	switch mode {
+	case "", "real", "fast":
+		return mode, nil
+	default:
+		return "", fmt.Errorf("测速方式非法：%v", raw)
+	}
+}
+
+func outboundSwitchDefaults() (int, int) {
+	s := configure.GetSettingNotNil()
+	threshold := s.GroupSwitchThresholdMs
+	if threshold < 0 {
+		threshold = 100
+	}
+	cooldown := s.GroupSwitchCooldownSec
+	if cooldown < 0 {
+		cooldown = 600
+	}
+	return threshold, cooldown
+}
+
+func normalizeSwitchThreshold(raw int) (int, error) {
+	if raw < 0 {
+		return 0, fmt.Errorf("切换阈值不能小于 0")
+	}
+	return raw, nil
+}
+
+func normalizeSwitchCooldown(raw int) (int, error) {
+	if raw < 0 {
+		return 0, fmt.Errorf("切换冷却时间不能小于 0")
+	}
+	return raw, nil
+}
+
 func createOutbound(c *gin.Context) {
 	var req configure.Outbound
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	interval, err := normalizeProbeInterval(req.ProbeInterval)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	req.ProbeInterval = interval
+	mode, err := normalizeProbeMode(req.ProbeMode)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	req.ProbeMode = mode
+	req.Name = strings.TrimSpace(req.Name)
 	if err := configure.AddOutbound(req.Name); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -1611,6 +1691,18 @@ func updateOutbound(c *gin.Context) {
 		return
 	}
 	req.Name = name
+	interval, err := normalizeProbeInterval(req.ProbeInterval)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	req.ProbeInterval = interval
+	mode, err := normalizeProbeMode(req.ProbeMode)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	req.ProbeMode = mode
 	if err := configure.SetOutbound(name, &req); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -1629,9 +1721,50 @@ func deleteOutbound(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
+func renameOutbound(c *gin.Context) {
+	oldName := c.Param("name")
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	newName := strings.TrimSpace(req.Name)
+	if err := configure.RenameOutbound(oldName, newName); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	observatory.OnOutboundUpdated(oldName)
+	observatory.OnOutboundUpdated(newName)
+	// 出站 tag 变了，运行中的配置引用的是旧 tag，必须重建
+	if engine.Manager.IsRunning() {
+		_ = engine.Manager.Restart()
+	}
+	addLog(fmt.Sprintf("✏️ 出站已重命名：%s -> %s", oldName, newName))
+	c.JSON(http.StatusOK, gin.H{"outbound": configure.GetOutbound(newName)})
+}
+
+func groupContainsNodeRef(refs []configure.ServerRef, target configure.NodeRef) bool {
+	for _, ref := range refs {
+		if ref.Type == target.Type && ref.Index == target.Index && ref.Sub == target.Sub {
+			return true
+		}
+	}
+	return false
+}
+
 func connectOutbound(c *gin.Context) {
 	name := c.Param("name")
-	var req configure.OutboundTarget
+	// 请求体同时承载 target 字段与出站级测速配置。指针用于区分"未提交"和"提交了空值"，
+	// 未提交时沿用出站已存的配置。
+	var req struct {
+		configure.OutboundTarget
+		ProbeInterval     *string `json:"probeInterval"`
+		ProbeMode         *string `json:"probeMode"`
+		SwitchThresholdMs *int    `json:"switchThresholdMs"`
+		SwitchCooldownSec *int    `json:"switchCooldownSec"`
+	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -1640,7 +1773,63 @@ func connectOutbound(c *gin.Context) {
 	if o == nil {
 		o = &configure.Outbound{Name: name}
 	}
-	o.Target = req
+	o.Target = req.OutboundTarget
+	if o.Target.TargetType == "group" {
+		_, group := configure.GetGroupByID(o.Target.GroupID)
+		if group == nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "分组不存在"})
+			return
+		}
+		if o.Target.Mode == configure.ModeManual && o.Target.ActiveNodeRef == nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "手动指定策略必须选择分组内节点"})
+			return
+		}
+		if o.Target.ActiveNodeRef != nil && !groupContainsNodeRef(group.Servers, *o.Target.ActiveNodeRef) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "指定节点不属于所选分组"})
+			return
+		}
+		if o.SwitchThresholdMs == nil || o.SwitchCooldownSec == nil {
+			threshold, cooldown := outboundSwitchDefaults()
+			if o.SwitchThresholdMs == nil {
+				o.SwitchThresholdMs = &threshold
+			}
+			if o.SwitchCooldownSec == nil {
+				o.SwitchCooldownSec = &cooldown
+			}
+		}
+	}
+	if req.ProbeInterval != nil {
+		interval, err := normalizeProbeInterval(*req.ProbeInterval)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		o.ProbeInterval = interval
+	}
+	if req.ProbeMode != nil {
+		mode, err := normalizeProbeMode(*req.ProbeMode)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		o.ProbeMode = mode
+	}
+	if req.SwitchThresholdMs != nil {
+		threshold, err := normalizeSwitchThreshold(*req.SwitchThresholdMs)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		o.SwitchThresholdMs = &threshold
+	}
+	if req.SwitchCooldownSec != nil {
+		cooldown, err := normalizeSwitchCooldown(*req.SwitchCooldownSec)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		o.SwitchCooldownSec = &cooldown
+	}
 	if err := configure.SetOutbound(name, o); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -1698,35 +1887,52 @@ func pingNodes(c *gin.Context) {
 		Latency int               `json:"latency"` // ms, -1=timeout
 	}
 
-	var (
-		wg      sync.WaitGroup
-		mu      sync.Mutex
-		results []result
+	c.Writer.Header().Set("Content-Type", "text/event-stream")
+	c.Writer.Header().Set("Cache-Control", "no-cache")
+	c.Writer.Header().Set("Connection", "keep-alive")
+	flusher, _ := c.Writer.(http.Flusher)
+
+	ctx := c.Request.Context()
+	var sendMu sync.Mutex
+	send := func(event string, payload interface{}) {
+		b, _ := json.Marshal(payload)
+		sendMu.Lock()
+		defer sendMu.Unlock()
+		fmt.Fprintf(c.Writer, "event: %s\ndata: %s\n\n", event, b)
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+
+	observatory.ProbeNodesWithProgress(req.Refs, mode,
+		func(i int, ref configure.NodeRef) {
+			if ctx.Err() != nil {
+				return
+			}
+			send("running", result{Ref: ref, Latency: 0})
+		},
+		func(i int, ref configure.NodeRef, latency int) {
+			if ctx.Err() != nil {
+				return
+			}
+			send("done", result{Ref: ref, Latency: latency})
+		},
 	)
 
-	for _, ref := range req.Refs {
-		ref := ref
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			lat := probeNodeLatency(ref, strictProbeMode)
-			if strictProbeMode {
-				lat = probeNodeLatencyViaCore(ref)
-			}
-			mu.Lock()
-			results = append(results, result{Ref: ref, Latency: lat})
-			mu.Unlock()
-			// 顺便持久化延迟
-			saveLatency(ref, lat)
-		}()
+	if ctx.Err() != nil {
+		if strictProbeMode {
+			addLog("⏹ 真连接探测已中断")
+		} else {
+			addLog("⏹ 快速探测已中断")
+		}
+		return
 	}
-	wg.Wait()
 	if strictProbeMode {
 		addLog("✅ 真连接探测完成")
 	} else {
 		addLog("✅ 快速探测完成")
 	}
-	c.JSON(http.StatusOK, gin.H{"results": results})
+	send("end", gin.H{"done": true})
 }
 
 func pingGroup(c *gin.Context) {
@@ -1744,143 +1950,235 @@ func pingGroup(c *gin.Context) {
 	mode := strings.ToLower(strings.TrimSpace(c.Query("mode")))
 	strictProbeMode := mode == "real"
 
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "streaming unsupported"})
+		return
+	}
+
 	type result struct {
 		Ref     configure.ServerRef `json:"ref"`
 		Latency int                 `json:"latency"`
 	}
-
-	var (
-		wg      sync.WaitGroup
-		mu      sync.Mutex
-		results []result
-	)
-	for _, ref := range group.Servers {
-		ref := ref
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			nodeRef := configure.NodeRef{Type: ref.Type, Index: ref.Index, Sub: ref.Sub}
-			lat := probeNodeLatency(nodeRef, strictProbeMode)
-			if strictProbeMode {
-				lat = probeNodeLatencyViaCore(nodeRef)
-			}
-			mu.Lock()
-			results = append(results, result{Ref: ref, Latency: lat})
-			mu.Unlock()
-			saveLatency(nodeRef, lat)
-		}()
+	ctx := c.Request.Context()
+	var sendMu sync.Mutex
+	send := func(event string, payload any) {
+		sendMu.Lock()
+		defer sendMu.Unlock()
+		b, _ := json.Marshal(payload)
+		fmt.Fprintf(c.Writer, "event: %s\ndata: %s\n\n", event, b)
+		flusher.Flush()
 	}
-	wg.Wait()
+
+	serverRefs := group.Servers
+	refs := make([]configure.NodeRef, len(serverRefs))
+	for i, ref := range serverRefs {
+		refs[i] = configure.NodeRef{Type: ref.Type, Index: ref.Index, Sub: ref.Sub}
+	}
+
+	observatory.ProbeNodesWithProgress(refs, mode,
+		func(i int, _ configure.NodeRef) {
+			if ctx.Err() != nil {
+				return
+			}
+			send("running", result{Ref: serverRefs[i], Latency: 0})
+		},
+		func(i int, _ configure.NodeRef, latency int) {
+			if ctx.Err() != nil {
+				return
+			}
+			send("done", result{Ref: serverRefs[i], Latency: latency})
+		},
+	)
+
+	if ctx.Err() != nil {
+		if strictProbeMode {
+			addLog("⏹ 真连接探测已中断")
+		} else {
+			addLog("⏹ 快速探测已中断")
+		}
+		return
+	}
+	send("end", gin.H{"done": true})
+}
+
+// applyGroupSwitch 在界面上手动测完一个分组后调用，按绑定该分组的出站策略决定是否
+// 切换活跃节点。延迟直接读测速刚写回的值，不会重新探测；中途被中断的测速前端不会
+// 调这个接口，避免用半份数据做判定。
+func applyGroupSwitch(c *gin.Context) {
+	index, err := strconv.Atoi(c.Param("index"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid index"})
+		return
+	}
+	group := configure.GetGroup(index)
+	if group == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "group not found"})
+		return
+	}
+	mode := strings.ToLower(strings.TrimSpace(c.Query("mode")))
+	outcomes := observatory.ApplyGroupProbeResults(group.ID, mode)
+	c.JSON(http.StatusOK, gin.H{"outcomes": outcomes})
+}
+
+// ---- IP 类型检测 ----
+
+// detectServerIPType 查询节点地址属于机房、家宽还是移动网络，并把结果写回节点。
+// 只把节点的主机名发给 ip-api.com，不涉及节点凭据；若配置了下载代理则经代理请求。
+func detectServerIPType(c *gin.Context) {
+	var req struct {
+		Refs []configure.NodeRef `json:"refs"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if len(req.Refs) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "refs is required"})
+		return
+	}
+
+	hosts := make([]string, 0, len(req.Refs))
+	for _, ref := range req.Refs {
+		if s := serverRawByNodeRef(ref); s != nil {
+			hosts = append(hosts, s.Host)
+		}
+	}
+	if len(hosts) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "没有可检测的节点"})
+		return
+	}
+	addLog(fmt.Sprintf("🌐 开始检测 %d 个节点的 IP 类型...", len(hosts)))
+
+	lookups := ipinfo.Lookup(ipTypeHTTPClient(), hosts)
+
+	type result struct {
+		Ref    configure.NodeRef `json:"ref"`
+		IPType string            `json:"ipType"`
+		IP     string            `json:"ip,omitempty"`
+		ISP    string            `json:"isp,omitempty"`
+		Error  string            `json:"error,omitempty"`
+	}
+	results := make([]result, 0, len(req.Refs))
+	failed := 0
+	for _, ref := range req.Refs {
+		s := serverRawByNodeRef(ref)
+		if s == nil {
+			continue
+		}
+		res, ok := lookups[strings.TrimSpace(s.Host)]
+		if !ok {
+			res = ipinfo.Result{Kind: ipinfo.KindUnknown, Err: fmt.Errorf("节点地址为空")}
+		}
+		item := result{Ref: ref, IPType: string(res.Kind), IP: res.IP, ISP: res.ISP}
+		if res.Err != nil {
+			item.Error = res.Err.Error()
+			failed++
+		}
+		saveIPType(ref, res)
+		results = append(results, item)
+	}
+	addLog(fmt.Sprintf("✅ IP 类型检测完成：成功 %d 个，失败 %d 个", len(results)-failed, failed))
 	c.JSON(http.StatusOK, gin.H{"results": results})
 }
 
-// probeNodeLatency 协议级可用性探测，返回延迟 ms，-1 表示失败
-func probeNodeLatency(ref configure.NodeRef, strictProbeMode bool) int {
-	const fastProbeTimeout = 1200 * time.Millisecond
-	switch ref.Type {
-	case "server":
-		s := configure.GetServer(ref.Index)
-		if s == nil {
-			return -1
-		}
-		// 两阶段：先快速连通探测，失败则快速返回；成功再进入严格验证。
-		if strictProbeMode && !probe.FastReachable(s, fastProbeTimeout) {
-			return -1
-		}
-		if strictProbeMode && probe.SupportsRealProbe(s.Type) {
-			return probe.ProbeServer(s)
-		}
-		return probe.ProbeServer(s)
-	case "sub_server":
-		sub := configure.GetSubscription(ref.Sub)
-		if sub == nil || ref.Index >= len(sub.Servers) {
-			return -1
-		}
-		s := sub.Servers[ref.Index]
-		if strictProbeMode && !probe.FastReachable(&s, fastProbeTimeout) {
-			return -1
-		}
-		if strictProbeMode && probe.SupportsRealProbe(s.Type) {
-			return probe.ProbeServer(&s)
-		}
-		return probe.ProbeServer(&s)
-	default:
-		return -1
+// ---- IP 评分 ----
+
+// scoreServerIP 提交后台评分任务。评分是串行低频的外部请求，不能在 HTTP 请求里等，
+// 因此立刻返回，由前端轮询 /servers/ip-score/status 获取进度。
+func scoreServerIP(c *gin.Context) {
+	var req struct {
+		Refs []configure.NodeRef `json:"refs"`
 	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if len(req.Refs) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "refs is required"})
+		return
+	}
+	if err := startIPScoreTask(req.Refs); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "state": ipScoreState()})
 }
 
-func probeNodeLatencyViaCore(ref configure.NodeRef) int {
-	probeCoreMu.Lock()
-	defer probeCoreMu.Unlock()
-
-	if !engine.Manager.IsRunning() {
-		return -1
-	}
-	// 先快速预筛，避免无意义重启内核
-	if !fastReachableRef(ref) {
-		return -1
-	}
-	if err := ensureProbeOutboundForNode(ref); err != nil {
-		return -1
-	}
-	targets := parseProbeTargets(configure.GetSettingNotNil().ProbeTargets)
-	if len(targets) == 0 {
-		targets = []string{"www.gstatic.com", "www.google.com", "www.youtube.com", "cp.cloudflare.com", "example.com"}
-	}
-	for _, host := range targets {
-		if ms := probeViaCoreSocks(host, 4500*time.Millisecond); ms > 0 {
-			return ms
-		}
-	}
-	return -1
+func getIPScoreStatus(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"state": ipScoreState()})
 }
 
-func fastReachableRef(ref configure.NodeRef) bool {
-	const fastProbeTimeout = 1200 * time.Millisecond
+func cancelIPScore(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"canceled": cancelIPScoreTask()})
+}
+
+// ipTypeHTTPClient ip-api.com 免费接口在国内常被墙，配置了下载代理时优先走它，
+// 否则回退到运行中的内建 SOCKS5 入站，都没有就直连。
+func ipTypeHTTPClient() *http.Client {
+	const timeout = 20 * time.Second
+	transport := &http.Transport{
+		DialContext:         (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
+		TLSHandshakeTimeout: 10 * time.Second,
+	}
+	if raw := strings.TrimSpace(configure.GetSettingNotNil().DownloadProxy); raw != "" {
+		if proxyURL, err := url.Parse(raw); err == nil {
+			transport.Proxy = http.ProxyURL(proxyURL)
+			return &http.Client{Timeout: timeout, Transport: transport}
+		}
+	}
+	if proxyURL, err := builtinSocksProxyURL(); err == nil {
+		transport.Proxy = http.ProxyURL(proxyURL)
+	}
+	return &http.Client{Timeout: timeout, Transport: transport}
+}
+
+func serverRawByNodeRef(ref configure.NodeRef) *configure.ServerRaw {
 	switch ref.Type {
 	case "server":
-		s := configure.GetServer(ref.Index)
-		if s == nil {
-			return false
-		}
-		// 需经前置代理才能连通的节点，直连预检必然失败，交给内核走链路测
-		if s.FrontProxy != "" {
-			return true
-		}
-		return probe.FastReachable(s, fastProbeTimeout)
+		return configure.GetServer(ref.Index)
 	case "sub_server":
 		sub := configure.GetSubscription(ref.Sub)
 		if sub == nil || ref.Index < 0 || ref.Index >= len(sub.Servers) {
-			return false
+			return nil
 		}
-		s := sub.Servers[ref.Index]
-		if s.FrontProxy != "" || sub.ProxyOutbound != "" {
-			return true
-		}
-		return probe.FastReachable(&s, fastProbeTimeout)
+		return &sub.Servers[ref.Index]
 	default:
-		return false
+		return nil
 	}
 }
 
-func ensureProbeOutboundForNode(ref configure.NodeRef) error {
-	_ = configure.AddOutbound(engine.ProbeOutboundName)
-	if cur := configure.GetOutbound(engine.ProbeOutboundName); cur != nil &&
-		cur.Target.TargetType == "node" && nodeRefEqual(cur.Target.NodeRef, &ref) {
-		return nil
+// saveIPType 把检测结果写回节点。查询失败时只记 unknown，不覆盖上次成功的 IP/ISP，
+// 免得一次网络抖动把已有信息抹掉。
+func saveIPType(ref configure.NodeRef, res ipinfo.Result) {
+	apply := func(s *configure.ServerRaw) {
+		s.IPType = string(res.Kind)
+		s.IPTypeCheckedAt = time.Now().Unix()
+		if res.Err != nil {
+			return
+		}
+		s.IPTypeAddr = res.IP
+		s.IPTypeISP = res.ISP
 	}
-	o := &configure.Outbound{
-		Name: engine.ProbeOutboundName,
-		Target: configure.OutboundTarget{
-			TargetType: "node",
-			NodeRef:    &ref,
-		},
+	switch ref.Type {
+	case "server":
+		s := configure.GetServer(ref.Index)
+		if s == nil {
+			return
+		}
+		apply(s)
+		_ = configure.SetServer(ref.Index, s)
+	case "sub_server":
+		sub := configure.GetSubscription(ref.Sub)
+		if sub == nil || ref.Index < 0 || ref.Index >= len(sub.Servers) {
+			return
+		}
+		apply(&sub.Servers[ref.Index])
+		_ = configure.SetSubscription(ref.Sub, sub)
 	}
-	if err := configure.SetOutbound(engine.ProbeOutboundName, o); err != nil {
-		return err
-	}
-	observatory.OnOutboundUpdated(engine.ProbeOutboundName)
-	return engine.Manager.Restart()
 }
 
 // builtinSocksProxyURL 返回本地内建 SOCKS5 入站的代理 URL，若内核未运行则报错
@@ -1898,77 +2196,6 @@ func builtinSocksProxyURL() (*url.URL, error) {
 			url.QueryEscape(acc.Username), url.QueryEscape(acc.Password), setting.Socks5Port))
 	}
 	return url.Parse(fmt.Sprintf("socks5://127.0.0.1:%d", setting.Socks5Port))
-}
-
-func nodeRefEqual(a, b *configure.NodeRef) bool {
-	if a == nil || b == nil {
-		return false
-	}
-	return a.Type == b.Type && a.Index == b.Index && a.Sub == b.Sub
-}
-
-func parseProbeTargets(raw string) []string {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return nil
-	}
-	parts := strings.FieldsFunc(raw, func(r rune) bool {
-		return r == ',' || r == ';' || r == '\n' || r == '\r' || r == '\t' || r == ' '
-	})
-	out := make([]string, 0, len(parts))
-	seen := map[string]struct{}{}
-	for _, p := range parts {
-		h := strings.ToLower(strings.TrimSpace(p))
-		h = strings.TrimPrefix(h, "https://")
-		h = strings.TrimPrefix(h, "http://")
-		if i := strings.Index(h, "/"); i >= 0 {
-			h = h[:i]
-		}
-		if h == "" {
-			continue
-		}
-		if _, ok := seen[h]; ok {
-			continue
-		}
-		seen[h] = struct{}{}
-		out = append(out, h)
-	}
-	return out
-}
-
-func probeViaCoreSocks(host string, timeout time.Duration) int {
-	start := time.Now()
-	dialSocksProxy, err := xproxy.SOCKS5("tcp", net.JoinHostPort(engine.ProbeInboundListen, strconv.Itoa(engine.ProbeInboundSocksPort)), nil, xproxy.Direct)
-	if err != nil {
-		return -1
-	}
-	dialContext := func(ctx context.Context, network, addr string) (net.Conn, error) {
-		return dialSocksProxy.Dial(network, addr)
-	}
-	transport := &http.Transport{
-		DialContext:         dialContext,
-		TLSHandshakeTimeout: timeout,
-	}
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   timeout,
-	}
-	u := "https://" + host + "/generate_204?_=" + strconv.FormatInt(time.Now().UnixNano(), 10)
-	req, _ := http.NewRequest(http.MethodGet, u, nil)
-	req.Header.Set("User-Agent", "ProxyStation-CoreProbe/1.0")
-	resp, err := client.Do(req)
-	if err != nil {
-		return -1
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 204 && resp.StatusCode != 200 {
-		return -1
-	}
-	ms := int(time.Since(start).Milliseconds())
-	if ms <= 0 {
-		return 1
-	}
-	return ms
 }
 
 // saveLatency 将测速结果写回存储
@@ -2077,6 +2304,19 @@ func setSetting(c *gin.Context) {
 			return
 		}
 		s.WebPassword = hashed
+	}
+
+	// 未启用时只校验格式：用户可能先切到自定义、之后再回来填地址
+	provider, endpoint, err := ipscore.ValidateProviderEndpoint(s.IPScoreProvider, s.IPScoreEndpoint, s.IPScoreEnabled)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	s.IPScoreProvider = string(provider)
+	s.IPScoreEndpoint = endpoint
+	// 间隔太小会把第三方免费服务打成洪水，这里兜底钳住，界面上也有同样的下限
+	if s.IPScoreMinIntervalMs < 500 {
+		s.IPScoreMinIntervalMs = 1500
 	}
 
 	// 更新日志配置
@@ -2286,7 +2526,63 @@ var _ = engine.Manager
 func getLogs(c *gin.Context) {
 	logMutex.RLock()
 	defer logMutex.RUnlock()
-	c.JSON(http.StatusOK, gin.H{"logs": logBuffer})
+	filter := c.Query("inbound")
+	includeSystem := c.Query("system") == "1" || c.Query("system") == "true"
+	if filter == "" && includeSystem {
+		c.JSON(http.StatusOK, gin.H{"logs": logBuffer})
+		return
+	}
+	inboundID, inboundTag := resolveInboundFilter(filter)
+	logs := make([]string, 0, len(logBuffer))
+	for _, message := range logBuffer {
+		if shouldIncludeLog(message, inboundID, inboundTag, includeSystem) {
+			logs = append(logs, message)
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"logs": logs})
+}
+
+func resolveInboundFilter(filter string) (string, string) {
+	if filter == "socks-in" || filter == "http-in" {
+		return "", filter
+	}
+	for _, ib := range configure.GetCustomInbounds() {
+		if ib.ID == filter {
+			return ib.ID, ib.Tag
+		}
+		if ib.Tag == filter {
+			return ib.ID, ib.Tag
+		}
+	}
+	return filter, filter
+}
+
+func hasInboundMarker(message string) bool {
+	return strings.Contains(message, "inbound:") ||
+		strings.Contains(message, "[from: ") ||
+		strings.Contains(message, " ->")
+}
+
+func matchesInboundLog(message, inboundID, inboundTag string) bool {
+	if inboundID != "" {
+		prefix := "inbound:" + inboundID
+		if strings.Contains(message, prefix+" ") || strings.Contains(message, prefix+":") || strings.HasSuffix(message, prefix) {
+			return true
+		}
+	}
+	if inboundTag == "" {
+		return false
+	}
+	return strings.Contains(message, "[from: "+inboundTag+"]") ||
+		strings.Contains(message, "["+inboundTag+" ->")
+}
+
+func shouldIncludeLog(message, inboundID, inboundTag string, includeSystem bool) bool {
+	isInboundLog := hasInboundMarker(message)
+	if inboundID == "" && inboundTag == "" {
+		return isInboundLog || (includeSystem && !isInboundLog)
+	}
+	return matchesInboundLog(message, inboundID, inboundTag) || (includeSystem && !isInboundLog)
 }
 
 // getLogsStream 通过 SSE 流式推送日志
@@ -2297,18 +2593,24 @@ func getLogsStream(c *gin.Context) {
 	c.Header("X-Accel-Buffering", "no")
 	c.Header("Access-Control-Allow-Origin", "*")
 
-	// 创建新的日志订阅通道
+	// 创建新的日志订阅通道，携带过滤条件
 	logCh := make(chan LogEntry, 50)
+	sub := &logSubscriber{
+		ch:           logCh,
+		inbound:      c.Query("inbound"),
+		alwaysSystem: c.Query("system") == "1" || c.Query("system") == "true",
+	}
+	sub.inbound, sub.inboundTag = resolveInboundFilter(sub.inbound)
 
 	logMutex.Lock()
-	logSubscribers = append(logSubscribers, logCh)
+	logSubscribers = append(logSubscribers, sub)
 	logMutex.Unlock()
 
 	defer func() {
 		logMutex.Lock()
 		// 移除订阅者
-		for i, ch := range logSubscribers {
-			if ch == logCh {
+		for i, s := range logSubscribers {
+			if s == sub {
 				logSubscribers = append(logSubscribers[:i], logSubscribers[i+1:]...)
 				break
 			}
@@ -2662,7 +2964,9 @@ func ensureBuiltinProxyRunning(ib configure.CustomInbound) (configure.CustomInbo
 			DOFallbackDomains:    ib.CfDO.DOFallbackDomains,
 			DOFallbackExtensions: ib.CfDO.DOFallbackExtensions,
 		}
-		addr, err := cfdo.EnsureRunning("inbound:"+ib.ID, cfg, addLog)
+		addr, err := cfdo.EnsureRunning("inbound:"+ib.ID, cfg, func(message string) {
+			addLog("inbound:" + ib.ID + " " + message)
+		})
 		if err != nil {
 			return ib, err
 		}
@@ -2688,7 +2992,9 @@ func ensureBuiltinProxyRunning(ib configure.CustomInbound) (configure.CustomInbo
 		for _, r := range ib.CfGoodNet.Rules {
 			cfg.Rules = append(cfg.Rules, cfgoodnet.Rule{Pattern: r.Pattern, Action: r.Action})
 		}
-		addr, err := cfgoodnet.EnsureRunning("inbound:"+ib.ID, cfg, addLog)
+		addr, err := cfgoodnet.EnsureRunning("inbound:"+ib.ID, cfg, func(message string) {
+			addLog("inbound:" + ib.ID + " " + message)
+		})
 		if err != nil {
 			return ib, err
 		}
