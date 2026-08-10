@@ -11,6 +11,14 @@ import (
 	"github.com/ProxyStation/proxystation/db/configure"
 )
 
+// sniffingFor 按开关生成嗅探配置，关闭时返回零值（不写入 config）
+func sniffingFor(on bool) coreObj.Sniffing {
+	if !on {
+		return coreObj.Sniffing{}
+	}
+	return coreObj.Sniffing{Enabled: true, DestOverride: []string{"http", "tls"}}
+}
+
 // BuildConfig 根据当前出站配置生成 v2ray config.json
 func BuildConfig(setting *configure.Setting) (*coreObj.Config, error) {
 	if setting == nil {
@@ -30,7 +38,7 @@ func BuildConfig(setting *configure.Setting) (*coreObj.Config, error) {
 	// 基础入站：socks5 + http
 	cfg.Inbounds = []coreObj.Inbound{
 		{
-			Tag:      "socks",
+			Tag:      "socks-in",
 			Port:     setting.Socks5Port,
 			Listen:   "127.0.0.1",
 			Protocol: "socks",
@@ -38,20 +46,14 @@ func BuildConfig(setting *configure.Setting) (*coreObj.Config, error) {
 				UDP:  true,
 				Auth: "noauth",
 			},
-			Sniffing: coreObj.Sniffing{
-				Enabled:      true,
-				DestOverride: []string{"http", "tls"},
-			},
+			Sniffing: sniffingFor(setting.Socks5SniffOn()),
 		},
 		{
-			Tag:      "http",
+			Tag:      "http-in",
 			Port:     setting.HttpPort,
 			Listen:   "127.0.0.1",
 			Protocol: "http",
-			Sniffing: coreObj.Sniffing{
-				Enabled:      true,
-				DestOverride: []string{"http", "tls"},
-			},
+			Sniffing: sniffingFor(setting.HttpSniffOn()),
 		},
 	}
 
@@ -181,7 +183,7 @@ func BuildConfig(setting *configure.Setting) (*coreObj.Config, error) {
 		cfg.Outbounds = append([]coreObj.OutboundObject{outbound}, cfg.Outbounds...)
 
 		// 路由：入站流量 -> 该出站
-		inboundTags := []string{"socks", "http"}
+		inboundTags := []string{"socks-in", "http-in"}
 		if name == "proxy" {
 			// 默认出站：未匹配的流量走这里
 			cfg.Routing.Rules = append(cfg.Routing.Rules, coreObj.RoutingRule{

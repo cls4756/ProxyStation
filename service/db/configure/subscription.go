@@ -33,6 +33,17 @@ type SubscriptionRaw struct {
 	ProxyOutbound string `json:"proxyOutbound,omitempty"`
 }
 
+type SubscriptionSummary struct {
+	ID            string             `json:"id"`
+	Name          string             `json:"name"`
+	URL           string             `json:"url"`
+	Format        SubscriptionFormat `json:"format"`
+	UpdatedAt     time.Time          `json:"updatedAt"`
+	GroupID       string             `json:"groupId"`
+	ProxyOutbound string             `json:"proxyOutbound,omitempty"`
+	ServerCount   int                `json:"serverCount"`
+}
+
 func Bytes2SubscriptionRaw(b []byte) (*SubscriptionRaw, error) {
 	var s SubscriptionRaw
 	if err := json.Unmarshal(b, &s); err != nil {
@@ -57,6 +68,35 @@ func GetSubscriptions() []SubscriptionRaw {
 	return result
 }
 
+func GetSubscriptionSummaries() []SubscriptionSummary {
+	result := make([]SubscriptionSummary, 0)
+	raw, err := db.ListGetAll("touch", "subscriptions")
+	if err != nil {
+		return result
+	}
+	for _, item := range raw {
+		var stored struct {
+			ID            string             `json:"id"`
+			Name          string             `json:"name"`
+			URL           string             `json:"url"`
+			Format        SubscriptionFormat `json:"format"`
+			UpdatedAt     time.Time          `json:"updatedAt"`
+			GroupID       string             `json:"groupId"`
+			ProxyOutbound string             `json:"proxyOutbound,omitempty"`
+			Servers       []json.RawMessage  `json:"servers"`
+		}
+		if err := json.Unmarshal(item, &stored); err != nil {
+			continue
+		}
+		result = append(result, SubscriptionSummary{
+			ID: stored.ID, Name: stored.Name, URL: stored.URL, Format: stored.Format,
+			UpdatedAt: stored.UpdatedAt, GroupID: stored.GroupID, ProxyOutbound: stored.ProxyOutbound,
+			ServerCount: len(stored.Servers),
+		})
+	}
+	return result
+}
+
 func GetSubscription(index int) *SubscriptionRaw {
 	b, err := db.ListGet("touch", "subscriptions", index)
 	if err != nil {
@@ -71,7 +111,28 @@ func AppendSubscriptions(subs []*SubscriptionRaw) error {
 }
 
 func SetSubscription(index int, sub *SubscriptionRaw) error {
-	return db.ListSet("touch", "subscriptions", index, sub)
+	return db.ListUpdate("touch", "subscriptions", index, func(raw []byte) ([]byte, error) {
+		current, err := Bytes2SubscriptionRaw(raw)
+		if err != nil {
+			return nil, err
+		}
+		PreserveServerRuntimeResults(current.Servers, sub.Servers)
+		return json.Marshal(sub)
+	})
+}
+
+func UpdateSubscriptionServer(subIndex, serverIndex int, update func(*ServerRaw)) error {
+	return db.ListUpdate("touch", "subscriptions", subIndex, func(raw []byte) ([]byte, error) {
+		sub, err := Bytes2SubscriptionRaw(raw)
+		if err != nil {
+			return nil, err
+		}
+		if serverIndex < 0 || serverIndex >= len(sub.Servers) {
+			return nil, fmt.Errorf("server index %d out of range", serverIndex)
+		}
+		update(&sub.Servers[serverIndex])
+		return json.Marshal(sub)
+	})
 }
 
 func RemoveSubscriptions(indexes []int) error {
@@ -94,6 +155,17 @@ func GetLenSubscriptionServers(index int) int {
 // PreserveServerProbeResults copies latency metadata from old subscription nodes
 // to newly parsed nodes when they represent the same server.
 func PreserveServerProbeResults(oldServers, newServers []ServerRaw) {
+	preserveServerResults(oldServers, newServers, true)
+}
+
+// PreserveServerRuntimeResults merges fields produced by background probes.
+// It intentionally leaves FrontProxy untouched so explicit node edits and
+// outbound renames are not reverted by the merge.
+func PreserveServerRuntimeResults(oldServers, newServers []ServerRaw) {
+	preserveServerResults(oldServers, newServers, false)
+}
+
+func preserveServerResults(oldServers, newServers []ServerRaw, preserveFrontProxy bool) {
 	if len(oldServers) == 0 || len(newServers) == 0 {
 		return
 	}
@@ -110,8 +182,25 @@ func PreserveServerProbeResults(oldServers, newServers []ServerRaw) {
 			if old, ok := byKey[key]; ok {
 				newServers[i].Latency = old.Latency
 				newServers[i].LastProbeTime = old.LastProbeTime
-				// 订阅刷新会整体覆盖节点，用户手动设的前置代理需要跟着保留
-				newServers[i].FrontProxy = old.FrontProxy
+				if preserveFrontProxy {
+					// 订阅刷新会整体覆盖节点，用户手动设的前置代理需要跟着保留
+					newServers[i].FrontProxy = old.FrontProxy
+				}
+				// IP 类型检测有外部接口的频率限制，不能因为订阅刷新就丢掉重新查
+				newServers[i].IPType = old.IPType
+				newServers[i].IPTypeAddr = old.IPTypeAddr
+				newServers[i].IPTypeISP = old.IPTypeISP
+				newServers[i].IPTypeCheckedAt = old.IPTypeCheckedAt
+				// 评分同理：外部服务限速严格，重查代价高
+				newServers[i].IPScore = old.IPScore
+				newServers[i].IPScoreGrade = old.IPScoreGrade
+				newServers[i].IPScoreRisk = old.IPScoreRisk
+				newServers[i].IPScoreProvider = old.IPScoreProvider
+				newServers[i].IPScoreAt = old.IPScoreAt
+				newServers[i].IPGeoCountry = old.IPGeoCountry
+				newServers[i].IPGeoCountryCode = old.IPGeoCountryCode
+				newServers[i].IPGeoRegion = old.IPGeoRegion
+				newServers[i].IPGeoCity = old.IPGeoCity
 				break
 			}
 		}

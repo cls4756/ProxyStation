@@ -25,6 +25,25 @@ type ServerRaw struct {
 	Source string `json:"source"`
 	// 前置代理出站名（用于链式代理，如 "proxy"），为空表示不使用前置
 	FrontProxy string `json:"frontProxy,omitempty"`
+	// 地址类型：idc（机房）| residential（家宽）| mobile（移动网络）| unknown，空表示未检测
+	IPType string `json:"ipType,omitempty"`
+	// 检测时解析到的 IP 与运营商，用于展示判定依据
+	IPTypeAddr string `json:"ipTypeAddr,omitempty"`
+	IPTypeISP  string `json:"ipTypeIsp,omitempty"`
+	// 上次检测时间（Unix 时间戳）
+	IPTypeCheckedAt int64 `json:"ipTypeCheckedAt,omitempty"`
+	// IP 纯净度评分 0-100，越高越可信。0 值无意义，用指针区分"未检测"与"真的 0 分"
+	IPScore *int `json:"ipScore,omitempty"`
+	// 评分等级与风险描述，以及产出该评分的服务商，便于界面说明依据
+	IPScoreGrade    string `json:"ipScoreGrade,omitempty"`
+	IPScoreRisk     string `json:"ipScoreRisk,omitempty"`
+	IPScoreProvider string `json:"ipScoreProvider,omitempty"`
+	IPScoreAt       int64  `json:"ipScoreAt,omitempty"`
+	// IP 评分接口同一次响应附带的地理位置
+	IPGeoCountry     string `json:"ipGeoCountry,omitempty"`
+	IPGeoCountryCode string `json:"ipGeoCountryCode,omitempty"`
+	IPGeoRegion      string `json:"ipGeoRegion,omitempty"`
+	IPGeoCity        string `json:"ipGeoCity,omitempty"`
 }
 
 func Bytes2ServerRaw(b []byte) (*ServerRaw, error) {
@@ -70,6 +89,17 @@ func SetServers(servers []ServerRaw) error {
 
 func SetServer(index int, server *ServerRaw) error {
 	return db.ListSet("touch", "servers", index, server)
+}
+
+func UpdateServer(index int, update func(*ServerRaw)) error {
+	return db.ListUpdate("touch", "servers", index, func(raw []byte) ([]byte, error) {
+		server, err := Bytes2ServerRaw(raw)
+		if err != nil {
+			return nil, err
+		}
+		update(server)
+		return json.Marshal(server)
+	})
 }
 
 func RemoveServers(indexes []int) error {

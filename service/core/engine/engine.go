@@ -1140,6 +1140,98 @@ func copyFile(src, dst string, mode os.FileMode) error {
 type logWriter struct {
 	buffer bytes.Buffer
 	mu     sync.Mutex
+	inb    inboundTagCache
+}
+
+// inboundTagCache 按连接 ID 记住 sing-box 的入站标签。
+//
+// sing-box 把一次连接拆成多行日志，只有 inbound 行带入站标签、只有 outbound 行带目标地址，
+// 两者靠行首的连接 ID 关联：
+//
+//	[3867926420 0ms]   inbound/socks[socks-in]: inbound connection to www.example.com:443
+//	[3867926420 231ms] outbound/direct[direct]: outbound connection to www.example.com:443
+//
+// 这里把 inbound 行的标签暂存下来，等 outbound 行出现时补回去，
+// 使单行日志就能看出"从哪个入站进、走哪个出站出"。
+//
+// 用两代 map 做有界缓存：连接可能中途夭折而没有对应的 outbound 行，
+// 若无上限会随运行时间无限增长。超过阈值就整体降级为上一代，
+// 查找时两代都看，代价 O(1)，内存上限约 2*maxInboundTagEntries 条。
+type inboundTagCache struct {
+	cur, prev map[string]string
+}
+
+const maxInboundTagEntries = 4096
+
+func (c *inboundTagCache) put(id, tag string) {
+	if c.cur == nil {
+		c.cur = make(map[string]string, 64)
+	}
+	if len(c.cur) >= maxInboundTagEntries {
+		c.prev = c.cur
+		c.cur = make(map[string]string, 64)
+	}
+	c.cur[id] = tag
+}
+
+// take 取出并删除，正常情况下一个连接只需补一次
+func (c *inboundTagCache) take(id string) (string, bool) {
+	if tag, ok := c.cur[id]; ok {
+		delete(c.cur, id)
+		return tag, true
+	}
+	if tag, ok := c.prev[id]; ok {
+		delete(c.prev, id)
+		return tag, true
+	}
+	return "", false
+}
+
+// parseSingboxConnID 取出 "[连接ID 耗时]" 中的连接 ID。
+// 行首通常还有 "INFO[0016]" 这类前缀，所以要逐个方括号试，
+// 取第一个"左括号后到空格之间全是数字"的组。
+// 不是该格式（如 xray 日志、启动日志）时返回空串。
+func parseSingboxConnID(line string) string {
+	for i := 0; i < len(line); i++ {
+		if line[i] != '[' {
+			continue
+		}
+		rest := line[i+1:]
+		end := strings.IndexByte(rest, ' ')
+		if end <= 0 {
+			continue
+		}
+		id := rest[:end]
+		allDigits := true
+		for j := 0; j < len(id); j++ {
+			if id[j] < '0' || id[j] > '9' {
+				allDigits = false
+				break
+			}
+		}
+		if allDigits {
+			return id
+		}
+	}
+	return ""
+}
+
+// parseBracketTag 取出 prefix 之后紧跟的 "[tag]" 内容，如 "inbound/socks[socks-in]" -> "socks-in"
+func parseBracketTag(line, prefix string) string {
+	i := strings.Index(line, prefix)
+	if i < 0 {
+		return ""
+	}
+	rest := line[i+len(prefix):]
+	open := strings.IndexByte(rest, '[')
+	if open < 0 {
+		return ""
+	}
+	close := strings.IndexByte(rest[open:], ']')
+	if close <= 1 {
+		return ""
+	}
+	return rest[open+1 : open+close]
 }
 
 func (w *logWriter) Write(p []byte) (n int, err error) {
@@ -1163,13 +1255,34 @@ func (w *logWriter) Write(p []byte) (n int, err error) {
 		lineStr := string(bytes.TrimSuffix(line, []byte("\n")))
 		lineStr = stripANSI(lineStr)
 		lineStr = strings.TrimSpace(lineStr)
-		if lineStr != "" && LogCallback != nil {
-			// 过滤掉 inbound 连接日志（冗余，outbound 行已包含完整信息）
-			if !strings.Contains(lineStr, "inbound connection from ") &&
-				!strings.Contains(lineStr, "inbound connection to ") {
-				LogCallback(lineStr)
+		if lineStr == "" || LogCallback == nil {
+			continue
+		}
+
+		// inbound 行本身信息冗余（目标地址会在 outbound 行重复），不直接展示，
+		// 但要先把入站标签记下来，供随后的 outbound 行使用。
+		isInbound := strings.Contains(lineStr, "inbound connection from ") ||
+			strings.Contains(lineStr, "inbound connection to ")
+		if isInbound {
+			if id := parseSingboxConnID(lineStr); id != "" {
+				if tag := parseBracketTag(lineStr, "inbound/"); tag != "" {
+					w.inb.put(id, tag)
+				}
+			}
+			continue
+		}
+
+		// outbound 行补上来源入站。xray 自带 "[入站 -> 出站]"，其日志没有连接 ID，
+		// parseSingboxConnID 会返回空串，天然跳过。
+		if strings.Contains(lineStr, "outbound") {
+			if id := parseSingboxConnID(lineStr); id != "" {
+				if tag, ok := w.inb.take(id); ok {
+					lineStr += " [from: " + tag + "]"
+				}
 			}
 		}
+
+		LogCallback(lineStr)
 	}
 
 	return len(p), nil

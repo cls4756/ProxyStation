@@ -84,6 +84,7 @@
             <span class="inbound-addr">127.0.0.1:{{ socksPort }}</span>
             <span class="inbound-tag-badge">tag: socks-in</span>
             <span v-if="builtinSocks.accounts?.length" class="inbound-auth-badge">🔒 认证</span>
+            <span v-if="builtinSocks.sniffEnabled" class="inbound-auth-badge">🔍 嗅探</span>
           </div>
           <div class="rule-ops">
             <button class="icon-btn" @click="editBuiltinInbound('socks')" title="编辑">✏</button>
@@ -96,6 +97,7 @@
             <span class="inbound-addr">127.0.0.1:{{ httpPort }}</span>
             <span class="inbound-tag-badge">tag: http-in</span>
             <span v-if="builtinHttp.accounts?.length" class="inbound-auth-badge">🔒 认证</span>
+            <span v-if="builtinHttp.sniffEnabled" class="inbound-auth-badge">🔍 嗅探</span>
           </div>
           <div class="rule-ops">
             <button class="icon-btn" @click="editBuiltinInbound('http')" title="编辑">✏</button>
@@ -161,6 +163,13 @@
           <div class="form-group">
             <label class="form-label">监听端口</label>
             <input class="input" type="number" v-model.number="builtinForm.port" />
+          </div>
+          <div class="form-group">
+            <label class="form-label" style="display:flex;align-items:center;gap:8px">
+              <input type="checkbox" v-model="builtinForm.sniffEnabled" />
+              启用流量嗅探
+            </label>
+            <div class="form-hint" style="margin-left:0">从 TLS SNI / HTTP Host 还原真实域名。关闭后，客户端自行解析的连接在日志和域名分流规则里只有 IP。</div>
           </div>
           <div class="form-group">
             <label class="form-label">
@@ -600,11 +609,11 @@ const httpPort = computed(() => store.setting?.httpPort || 20261)
 const outbounds = computed(() => store.outbounds)
 
 // 内置入站状态
-const builtinSocks = reactive({ port: 20260, username: '', password: '', accounts: [] })
-const builtinHttp = reactive({ port: 20261, username: '', password: '', accounts: [] })
+const builtinSocks = reactive({ port: 20260, username: '', password: '', accounts: [], sniffEnabled: false })
+const builtinHttp = reactive({ port: 20261, username: '', password: '', accounts: [], sniffEnabled: false })
 const showBuiltinModal = ref(false)
 const builtinEditType = ref('socks')
-const builtinForm = reactive({ port: 20260, accounts: [] })
+const builtinForm = reactive({ port: 20260, accounts: [], sniffEnabled: false })
 const builtinStatusMap = reactive({})
 const builtinRestarting = reactive({})
 
@@ -699,22 +708,33 @@ const inboundModalTitle = computed(() => {
 })
 
 onMounted(async () => {
-  await Promise.all([loadRules(), loadInbounds(), checkDataFiles()])
-  store.fetchAll()
-  api.getRuleSetInfos().then(r => { ruleSetInfos.value = r.data.infos || [] }).catch(() => {})
-  api.getSetting().then(r => {
-    const s = r.data.setting || {}
+  await Promise.all([
+    loadRules(),
+    loadInbounds(),
+    checkDataFiles(),
+    store.fetchOutbounds(),
+    api.getRuleSetInfos().then(r => { ruleSetInfos.value = r.data.infos || [] }).catch(() => {}),
+    loadBuiltinSettings(),
+  ])
+})
+
+async function loadBuiltinSettings() {
+  try {
+    const { data } = await api.getSetting()
+    const s = data.setting || {}
     githubMirror.value = s.githubMirror || ''
     builtinSocks.port = s.socks5Port || 20260
     builtinSocks.accounts = normalizeAccounts(s.socks5Accounts, s.socks5Username, s.socks5Password)
     builtinSocks.username = builtinSocks.accounts[0]?.username || ''
     builtinSocks.password = builtinSocks.accounts[0]?.password || ''
+    builtinSocks.sniffEnabled = s.socks5SniffEnabled ?? !!s.enableSniff
     builtinHttp.port = s.httpPort || 20261
     builtinHttp.accounts = normalizeAccounts(s.httpAccounts, s.httpUsername, s.httpPassword)
     builtinHttp.username = builtinHttp.accounts[0]?.username || ''
     builtinHttp.password = builtinHttp.accounts[0]?.password || ''
-  }).catch(() => {})
-})
+    builtinHttp.sniffEnabled = s.httpSniffEnabled ?? !!s.enableSniff
+  } catch {}
+}
 
 async function loadRules() {
   const { data } = await api.getRoutingRules()
@@ -722,15 +742,22 @@ async function loadRules() {
 }
 
 async function loadInbounds() {
-  const { data } = await api.getCustomInbounds()
+  const [{ data }, statuses] = await Promise.all([
+    api.getCustomInbounds(),
+    api.getBuiltinProxyStatuses().catch(() => null),
+  ])
   inbounds.value = (data.inbounds || []).map(normalizeInbound)
-  await loadBuiltinProxyStatuses().catch(() => {})
+  if (statuses) applyBuiltinProxyStatuses(statuses.data.statuses || [])
 }
 
 async function loadBuiltinProxyStatuses() {
   const { data } = await api.getBuiltinProxyStatuses()
+  applyBuiltinProxyStatuses(data.statuses || [])
+}
+
+function applyBuiltinProxyStatuses(statuses) {
   const next = {}
-  ;(data.statuses || []).forEach(s => {
+  statuses.forEach(s => {
     next[s.id] = s
   })
   Object.keys(builtinStatusMap).forEach(key => {
@@ -760,6 +787,7 @@ function actionLabel(rule) {
 function openAddRule() {
   editingRuleIdx.value = -1
   ruleForm.value = defaultRuleForm()
+  inboundTagInput.value = ''
   showRuleModal.value = true
 }
 
@@ -768,9 +796,11 @@ function editRule(i) {
   const r = rules.value[i]
   ruleForm.value = {
     ...r,
+    inboundTags: [...(r.inboundTags || [])],
     domainsText: (r.domains || []).join('\n'),
     ipsText: (r.ips || []).join('\n'),
   }
+  inboundTagInput.value = ''
   showRuleModal.value = true
 }
 
@@ -787,8 +817,10 @@ function addTagIfAbsent(arr, tag) {
 }
 
 async function saveRule() {
+  addInboundTag()
   const r = {
     ...ruleForm.value,
+    inboundTags: [...ruleForm.value.inboundTags],
     domains: ruleForm.value.domainsText.split('\n').map(s => s.trim()).filter(Boolean),
     ips: ruleForm.value.ipsText.split('\n').map(s => s.trim()).filter(Boolean),
   }
@@ -874,9 +906,17 @@ async function exportRules() {
 function editBuiltinInbound(type) {
   builtinEditType.value = type
   if (type === 'socks') {
-    Object.assign(builtinForm, { port: builtinSocks.port, accounts: cloneAccounts(builtinSocks.accounts) })
+    Object.assign(builtinForm, {
+      port: builtinSocks.port,
+      accounts: cloneAccounts(builtinSocks.accounts),
+      sniffEnabled: !!builtinSocks.sniffEnabled,
+    })
   } else {
-    Object.assign(builtinForm, { port: builtinHttp.port, accounts: cloneAccounts(builtinHttp.accounts) })
+    Object.assign(builtinForm, {
+      port: builtinHttp.port,
+      accounts: cloneAccounts(builtinHttp.accounts),
+      sniffEnabled: !!builtinHttp.sniffEnabled,
+    })
   }
   if (!builtinForm.accounts.length) addBuiltinAccount()
   showBuiltinModal.value = true
@@ -895,16 +935,18 @@ async function saveBuiltinInbound() {
       s.socks5Accounts = accounts
       s.socks5Username = first.username
       s.socks5Password = first.password
-      Object.assign(builtinSocks, { port: builtinForm.port, username: first.username, password: first.password, accounts: cloneAccounts(accounts) })
+      s.socks5SniffEnabled = !!builtinForm.sniffEnabled
+      Object.assign(builtinSocks, { port: builtinForm.port, username: first.username, password: first.password, accounts: cloneAccounts(accounts), sniffEnabled: !!builtinForm.sniffEnabled })
     } else {
       s.httpPort = builtinForm.port
       s.httpAccounts = accounts
       s.httpUsername = first.username
       s.httpPassword = first.password
-      Object.assign(builtinHttp, { port: builtinForm.port, username: first.username, password: first.password, accounts: cloneAccounts(accounts) })
+      s.httpSniffEnabled = !!builtinForm.sniffEnabled
+      Object.assign(builtinHttp, { port: builtinForm.port, username: first.username, password: first.password, accounts: cloneAccounts(accounts), sniffEnabled: !!builtinForm.sniffEnabled })
     }
     await api.setSetting(s)
-    await store.fetchAll()
+    await Promise.all([store.fetchStatus(), store.fetchCustomInbounds()])
     showBuiltinModal.value = false
   } catch (e) {
     alert('保存失败: ' + (e?.response?.data?.error || e.message))
@@ -1030,7 +1072,7 @@ async function saveInbound() {
   await api.setCustomInbounds(inbounds.value)
   showInboundModal.value = false
   await loadInbounds()
-  await store.fetchAll()
+  await Promise.all([store.fetchServers(), store.fetchOutbounds(), store.fetchCustomInbounds()])
 }
 
 async function deleteInbound(i) {
@@ -1039,7 +1081,7 @@ async function deleteInbound(i) {
   if (idx >= 0) inbounds.value.splice(idx, 1)
   await api.setCustomInbounds(inbounds.value)
   await loadInbounds()
-  await store.fetchAll()
+  await Promise.all([store.fetchServers(), store.fetchOutbounds(), store.fetchCustomInbounds()])
 }
 
 async function deleteBuiltinProxy(i) {
@@ -1048,7 +1090,7 @@ async function deleteBuiltinProxy(i) {
   if (idx >= 0) inbounds.value.splice(idx, 1)
   await api.setCustomInbounds(inbounds.value)
   await loadInbounds()
-  await store.fetchAll()
+  await Promise.all([store.fetchServers(), store.fetchOutbounds(), store.fetchCustomInbounds()])
 }
 
 function builtinStatusText(id) {
@@ -1073,7 +1115,7 @@ async function restartBuiltinProxy(ib) {
   try {
     await api.restartBuiltinProxy(ib.id)
     await loadInbounds()
-    await store.fetchAll()
+    await Promise.all([store.fetchServers(), store.fetchOutbounds(), store.fetchCustomInbounds()])
   } catch (e) {
     alert('重启失败: ' + (e?.response?.data?.error || e.message))
   } finally {
@@ -1091,7 +1133,7 @@ async function createRuleOutboundForProxy(ib) {
   if (!ib?.id) return
   try {
     await loadInbounds()
-    const { data } = await api.getServers()
+    const { data } = await api.getServers('catalog')
     const servers = data.servers || []
     const sourcePrefix = `inbound:${ib.id}`
     const index = servers.findIndex(s => s.source === sourcePrefix || String(s.source || '').startsWith(sourcePrefix + ':'))
@@ -1100,7 +1142,7 @@ async function createRuleOutboundForProxy(ib) {
       return
     }
     const outboundName = suggestedProxyOutboundName(ib)
-    await store.fetchAll()
+    await store.fetchOutbounds()
     if (!store.outbounds.some(o => o.name === outboundName)) {
       await api.createOutbound({ name: outboundName })
     }
@@ -1108,7 +1150,7 @@ async function createRuleOutboundForProxy(ib) {
       targetType: 'node',
       nodeRef: { type: 'server', index, sub: 0 },
     })
-    await store.fetchAll()
+    await Promise.all([store.fetchOutbounds(), store.fetchStatus()])
     alert(`已创建/更新出站「${outboundName}」，分流规则中可选择该出站`)
   } catch (e) {
     alert('创建分流出站失败: ' + (e?.response?.data?.error || e.message))

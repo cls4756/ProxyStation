@@ -189,7 +189,7 @@ func BuildSingboxConfig(setting *configure.Setting) (*SingboxConfig, error) {
 		setting = configure.GetSettingNotNil()
 	}
 	listenAddr := configure.BuiltinProxyListenAddress(setting)
-	dnsServers, dnsRules, routeRules, autoDetectInterface, defaultDomainResolver := buildSingboxDefaults(setting)
+	dnsServers, dnsRules, headRules, tailRules, autoDetectInterface, defaultDomainResolver := buildSingboxDefaults(setting)
 
 	cfg := &SingboxConfig{
 		Log: &SingboxLog{Level: singboxLogLevel(setting.LogLevel)},
@@ -201,17 +201,13 @@ func BuildSingboxConfig(setting *configure.Setting) (*SingboxConfig, error) {
 		Inbounds: []SingboxInbound{
 			buildSingboxInbound("socks", "socks-in", listenAddr, setting.Socks5Port, setting.Socks5AuthAccounts()),
 			buildSingboxInbound("http", "http-in", listenAddr, setting.HttpPort, setting.HTTPAuthAccounts()),
-			buildSingboxInbound("socks", ProbeInboundTag, ProbeInboundListen, ProbeInboundSocksPort, nil),
 		},
 		Outbounds: []SingboxOutbound{
-			{Type: "direct", Tag: ProbeOutboundName},
 			{Type: "direct", Tag: "direct"},
 			{Type: "block", Tag: "block"},
 		},
 		Route: &SingboxRoute{
-			Rules: append([]SingboxRouteRule{
-				{InboundTag: []string{ProbeInboundTag}, Outbound: ProbeOutboundName},
-			}, routeRules...),
+			Rules: append([]SingboxRouteRule{}, headRules...),
 			RuleSet: []SingboxRuleSet{
 				makeRuleSet("geosite-cn", "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/cn.srs"),
 				makeRuleSet("geoip-cn", "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/cn.srs"),
@@ -278,21 +274,7 @@ func BuildSingboxConfig(setting *configure.Setting) (*SingboxConfig, error) {
 		if LogCallback != nil {
 			LogCallback(fmt.Sprintf("📘 singbox outbound %s => type=%s server=%s port=%d", name, ob.Type, ob.Server, ob.ServerPort))
 		}
-		if name == ProbeOutboundName {
-			replaced := false
-			for i := range cfg.Outbounds {
-				if cfg.Outbounds[i].Tag == ProbeOutboundName {
-					cfg.Outbounds[i] = ob
-					replaced = true
-					break
-				}
-			}
-			if !replaced {
-				cfg.Outbounds = append([]SingboxOutbound{ob}, cfg.Outbounds...)
-			}
-		} else {
-			cfg.Outbounds = append([]SingboxOutbound{ob}, cfg.Outbounds...)
-		}
+		cfg.Outbounds = append([]SingboxOutbound{ob}, cfg.Outbounds...)
 		validOutboundTags[name] = true
 		if firstProxyOutbound == "" {
 			firstProxyOutbound = name
@@ -458,6 +440,9 @@ func BuildSingboxConfig(setting *configure.Setting) (*SingboxConfig, error) {
 		}
 	}
 
+	// 默认分流策略追加在用户规则之后，确保用户显式规则优先级更高
+	cfg.Route.Rules = append(cfg.Route.Rules, tailRules...)
+
 	// download_detour 必须在所有 rule-set 收集完之后统一赋值：
 	// 用户自定义规则的 rule-set 是在上面的循环里才追加的，早于此处赋值会漏掉它们，
 	// 导致这些 rule-set 以直连方式下载而在被墙环境下静默失败。
@@ -472,7 +457,7 @@ func BuildSingboxConfig(setting *configure.Setting) (*SingboxConfig, error) {
 	cfg.Experimental = &SingboxExperimental{
 		CacheFile: &SingboxCacheFile{Enabled: true, Path: "cache.db"},
 	}
-	cfg.Route.Rules = optimizeSingboxRules(cfg.Route.Rules)
+	cfg.Route.Rules = dedupSingboxRules(cfg.Route.Rules)
 
 	return cfg, nil
 }
@@ -1020,7 +1005,7 @@ func singboxLogLevel(level string) string {
 	}
 }
 
-func buildSingboxDefaults(setting *configure.Setting) ([]SingboxDNSServer, []SingboxDNSRule, []SingboxRouteRule, bool, string) {
+func buildSingboxDefaults(setting *configure.Setting) ([]SingboxDNSServer, []SingboxDNSRule, []SingboxRouteRule, []SingboxRouteRule, bool, string) {
 	dnsMode := strings.ToLower(setting.DNSMode)
 	if dnsMode == "" {
 		dnsMode = "lightweight"
@@ -1048,20 +1033,27 @@ func buildSingboxDefaults(setting *configure.Setting) ([]SingboxDNSServer, []Sin
 	}
 
 	dnsRules := []SingboxDNSRule{{RuleSet: []string{"geosite-cn"}, Server: "local"}}
-	routeRules := []SingboxRouteRule{}
-	if setting.EnableSniff {
-		routeRules = append(routeRules, SingboxRouteRule{Action: "sniff"})
+	// headRules 先于用户规则：sniff/hijack-dns 属于流量处理动作而非路由决策，
+	// 私有地址直连是安全兜底（该规则不在界面上，被用户的宽泛规则吃掉会静默切断内网访问）。
+	// 嗅探按入站单独下发，与自定义入站的处理方式保持一致。
+	headRules := []SingboxRouteRule{}
+	if setting.Socks5SniffOn() {
+		headRules = append(headRules, SingboxRouteRule{InboundTag: []string{"socks-in"}, Action: "sniff"})
+	}
+	if setting.HttpSniffOn() {
+		headRules = append(headRules, SingboxRouteRule{InboundTag: []string{"http-in"}, Action: "sniff"})
 	}
 	if setting.EnableHijackDNS {
-		routeRules = append(routeRules, SingboxRouteRule{Protocol: "dns", Action: "hijack-dns"})
+		headRules = append(headRules, SingboxRouteRule{Protocol: "dns", Action: "hijack-dns"})
 	}
-	routeRules = append(routeRules,
-		SingboxRouteRule{IPIsPrivate: true, Outbound: "direct"},
-		SingboxRouteRule{RuleSet: []string{"geosite-cn"}, Outbound: "direct"},
-		SingboxRouteRule{RuleSet: []string{"geoip-cn"}, Outbound: "direct"},
-	)
+	headRules = append(headRules, SingboxRouteRule{IPIsPrivate: true, Outbound: "direct"})
+	// tailRules 后于用户规则：这些只是缺省分流策略，用户显式规则应当能覆盖它们。
+	tailRules := []SingboxRouteRule{
+		{RuleSet: []string{"geosite-cn"}, Outbound: "direct"},
+		{RuleSet: []string{"geoip-cn"}, Outbound: "direct"},
+	}
 
-	return dnsServers, dnsRules, routeRules, autoDetectInterface, defaultDomainResolver
+	return dnsServers, dnsRules, headRules, tailRules, autoDetectInterface, defaultDomainResolver
 }
 
 // appendRuleSetIfAbsent 如果 rule-set 不存在则添加
@@ -1229,6 +1221,10 @@ func sbTLS(enabled bool, sni, fp, alpn, pbk, sid string, isReality bool) *Singbo
 	if alpn != "" {
 		tls.ALPN = strings.Split(alpn, ",")
 	}
+	// REALITY 客户端在 sing-box 中强制要求启用 uTLS，缺省 fingerprint 时回退到 chrome
+	if isReality && fp == "" {
+		fp = "chrome"
+	}
 	if fp != "" {
 		tls.UTLS = &SingboxUTLS{Enabled: true, Fingerprint: fp}
 	}
@@ -1240,8 +1236,12 @@ func sbTLS(enabled bool, sni, fp, alpn, pbk, sid string, isReality bool) *Singbo
 
 // sbTransport 构建 sing-box Transport 配置
 func sbTransport(network, path, host, serviceName string) *SingboxTransport {
+	// ws / http / httpupgrade 缺省 path 时补 "/"，订阅方常省略根路径，空 path 可能导致握手失败或 404
 	switch strings.ToLower(network) {
 	case "ws":
+		if path == "" {
+			path = "/"
+		}
 		t := &SingboxTransport{Type: "ws", Path: path}
 		if host != "" {
 			t.Headers = map[string]string{"Host": host}
@@ -1250,12 +1250,18 @@ func sbTransport(network, path, host, serviceName string) *SingboxTransport {
 	case "grpc":
 		return &SingboxTransport{Type: "grpc", ServiceName: serviceName}
 	case "http", "h2":
+		if path == "" {
+			path = "/"
+		}
 		t := &SingboxTransport{Type: "http", Path: path}
 		if host != "" {
 			t.Host = []string{host}
 		}
 		return t
 	case "httpupgrade":
+		if path == "" {
+			path = "/"
+		}
 		return &SingboxTransport{Type: "httpupgrade", Path: path}
 	}
 	return nil
@@ -1342,6 +1348,10 @@ func nodeTLS(m map[string]interface{}, host string, forceTLS bool) *SingboxTLS {
 			Enabled:   true,
 			PublicKey: mapString(reality, "public-key"),
 			ShortID:   mapString(reality, "short-id"),
+		}
+		// REALITY 客户端在 sing-box 中强制要求启用 uTLS，缺省 fingerprint 时回退到 chrome
+		if tls.UTLS == nil {
+			tls.UTLS = &SingboxUTLS{Enabled: true, Fingerprint: "chrome"}
 		}
 	}
 	return tls

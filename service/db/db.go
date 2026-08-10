@@ -183,6 +183,41 @@ func ListSet(bucket, key string, index int, value interface{}) error {
 	})
 }
 
+// ListUpdate atomically updates one item in a JSON array. The callback runs
+// inside the write transaction, so callers do not lose concurrent changes by
+// reading an old snapshot and later replacing the whole item.
+func ListUpdate(bucket, key string, index int, update func([]byte) ([]byte, error)) error {
+	return database.Update(func(tx *bolt.Tx) error {
+		b, err := tx.CreateBucketIfNotExists([]byte(bucket))
+		if err != nil {
+			return err
+		}
+		var existing []json.RawMessage
+		if data := b.Get([]byte(key)); data != nil {
+			if err := json.Unmarshal(data, &existing); err != nil {
+				return err
+			}
+		}
+		if index < 0 || index >= len(existing) {
+			return fmt.Errorf("index %d out of range", index)
+		}
+		current := append([]byte(nil), existing[index]...)
+		updated, err := update(current)
+		if err != nil {
+			return err
+		}
+		if !json.Valid(updated) {
+			return fmt.Errorf("updated item is not valid JSON")
+		}
+		existing[index] = append(json.RawMessage(nil), updated...)
+		data, err := json.Marshal(existing)
+		if err != nil {
+			return err
+		}
+		return b.Put([]byte(key), data)
+	})
+}
+
 func ListRemove(bucket, key string, indexes []int) error {
 	return database.Update(func(tx *bolt.Tx) error {
 		b, err := tx.CreateBucketIfNotExists([]byte(bucket))

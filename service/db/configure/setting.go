@@ -13,10 +13,16 @@ const (
 )
 
 type Setting struct {
-	LogLevel                           string `json:"logLevel"`
-	KernelMode                         string `json:"kernelMode"`
-	EnableSniff                        bool   `json:"enableSniff"`
-	EnableHijackDNS                    bool   `json:"enableHijackDNS"`
+	LogLevel   string `json:"logLevel"`
+	KernelMode string `json:"kernelMode"`
+	// EnableSniff 是内置入站嗅探的旧全局开关。已被下面两个按入站的开关取代，
+	// 保留仅用于把老配置迁移过去（GetSettingNotNil 负责），不再参与配置生成。
+	EnableSniff bool `json:"enableSniff"`
+	// 内置 socks/http 入站各自的嗅探开关。指针用于区分"从未设置"（需从 EnableSniff 迁移）
+	// 和"显式关闭"，否则老用户开着的嗅探会在升级后被静默关掉。
+	Socks5SniffEnabled *bool `json:"socks5SniffEnabled,omitempty"`
+	HttpSniffEnabled   *bool `json:"httpSniffEnabled,omitempty"`
+	EnableHijackDNS    bool  `json:"enableHijackDNS"`
 	DNSMode                            string `json:"dnsMode"`
 	SubscriptionAutoUpdateMode         string `json:"subscriptionAutoUpdateMode"`
 	SubscriptionAutoUpdateIntervalHour int    `json:"subscriptionAutoUpdateIntervalHour"`
@@ -36,12 +42,23 @@ type Setting struct {
 	GroupRealProbeIntervalSec int `json:"groupRealProbeIntervalSec,omitempty"`
 	// 分组/订阅更新后的默认测速方式：real | fast
 	GroupProbeMode string `json:"groupProbeMode,omitempty"`
+	// 真连测试的并发实例数（1-8），每个节点一个独立探测内核。0 表示用默认值 4
+	GroupProbeConcurrency int `json:"groupProbeConcurrency,omitempty"`
 	// 分组出站自动切换阈值（ms），仅当当前节点比最快节点慢超过该阈值才切换
 	GroupSwitchThresholdMs int `json:"groupSwitchThresholdMs,omitempty"`
 	// 分组出站切换冷却时间（秒），冷却期内不重复切换
 	GroupSwitchCooldownSec int `json:"groupSwitchCooldownSec,omitempty"`
 	// 订阅分组更新测速后，向指定本地分组复制节点的规则
 	SubscriptionBestNodeCopyRules []SubscriptionNodeCopyRule `json:"subscriptionBestNodeCopyRules,omitempty"`
+	// IP 纯净度评分。默认关闭：评分要把节点地址发给第三方服务，且这些服务都没有
+	// 面向第三方调用的正式授权，是否启用必须由用户自己决定。
+	IPScoreEnabled bool `json:"ipScoreEnabled,omitempty"`
+	// 评分服务商：cleanip | custom
+	IPScoreProvider string `json:"ipScoreProvider,omitempty"`
+	// 评分接口地址。cleanip 留空用默认地址；custom 必填，可用 {ip} 占位符
+	IPScoreEndpoint string `json:"ipScoreEndpoint,omitempty"`
+	// 两次评分请求的最小间隔（毫秒），防止触发第三方限流
+	IPScoreMinIntervalMs int `json:"ipScoreMinIntervalMs,omitempty"`
 	// 默认入站认证
 	Socks5Username string           `json:"socks5Username,omitempty"`
 	Socks5Password string           `json:"socks5Password,omitempty"`
@@ -113,9 +130,28 @@ func NewSetting() *Setting {
 		GroupProbeMode:                     "real",
 		GroupSwitchThresholdMs:             100,
 		GroupSwitchCooldownSec:             600,
+		IPScoreEnabled:                     false,
+		IPScoreProvider:                    "cleanip",
+		IPScoreMinIntervalMs:               1500,
 		WebUsername:                        DefaultWebUsername,
 		WebPassword:                        defaultPassword,
 	}
+}
+
+// Socks5SniffOn 内置 socks 入站是否启用嗅探。未显式设置时回落到旧的全局开关。
+func (s *Setting) Socks5SniffOn() bool {
+	if s.Socks5SniffEnabled != nil {
+		return *s.Socks5SniffEnabled
+	}
+	return s.EnableSniff
+}
+
+// HttpSniffOn 内置 http 入站是否启用嗅探。未显式设置时回落到旧的全局开关。
+func (s *Setting) HttpSniffOn() bool {
+	if s.HttpSniffEnabled != nil {
+		return *s.HttpSniffEnabled
+	}
+	return s.EnableSniff
 }
 
 func GetSettingNotNil() *Setting {
@@ -146,6 +182,10 @@ func GetSettingNotNil() *Setting {
 		s.GroupProbeMode = "real"
 		changed = true
 	}
+	if s.GroupProbeConcurrency < 1 || s.GroupProbeConcurrency > 8 {
+		s.GroupProbeConcurrency = 4
+		changed = true
+	}
 	if s.GroupSwitchThresholdMs < 0 {
 		s.GroupSwitchThresholdMs = 100
 		changed = true
@@ -154,7 +194,27 @@ func GetSettingNotNil() *Setting {
 		s.GroupSwitchCooldownSec = 600
 		changed = true
 	}
+	if s.IPScoreProvider != "cleanip" && s.IPScoreProvider != "custom" {
+		s.IPScoreProvider = "cleanip"
+		changed = true
+	}
+	// 低于 500ms 的间隔会把第三方免费服务打成洪水，强制抬到安全下限
+	if s.IPScoreMinIntervalMs < 500 {
+		s.IPScoreMinIntervalMs = 1500
+		changed = true
+	}
 	if migrateNodeCopyRules(s.SubscriptionBestNodeCopyRules) {
+		changed = true
+	}
+	// 旧配置只有全局 EnableSniff，落库成两个按入站的开关，之后由界面各自控制
+	if s.Socks5SniffEnabled == nil {
+		v := s.EnableSniff
+		s.Socks5SniffEnabled = &v
+		changed = true
+	}
+	if s.HttpSniffEnabled == nil {
+		v := s.EnableSniff
+		s.HttpSniffEnabled = &v
 		changed = true
 	}
 	if changed {

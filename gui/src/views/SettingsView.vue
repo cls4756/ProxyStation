@@ -62,12 +62,11 @@
             自动模式下，支持高级协议时优先使用 sing-box；若未安装 sing-box，则回退到 Xray。手动模式会严格使用你选择的内核。
           </div>
         </div>
-        <div class="field-row">
-          <label class="field-label">全局流量探测</label>
-          <label class="toggle-wrap">
-            <input type="checkbox" v-model="form.enableSniff" />
-            <span>{{ form.enableSniff ? '已开启，按需识别 SNI/Host' : '已关闭，减少首包处理开销' }}</span>
-          </label>
+        <div class="field-row field-row-tip">
+          <label class="field-label">流量嗅探</label>
+          <div class="field-tip">
+            已移至「分流规则 → 出入站」，每个入站单独控制。
+          </div>
         </div>
         <div class="field-row">
           <label class="field-label">DNS 劫持</label>
@@ -124,19 +123,14 @@
           </div>
         </div>
         <div class="field-row">
-          <label class="field-label">分组测速间隔（秒）</label>
+          <label class="field-label">分组测速间隔默认值（秒）</label>
           <input type="number" class="input field-input" v-model.number="form.groupRealProbeIntervalSec" min="10" />
-        </div>
-        <div class="field-row">
-          <label class="field-label">默认测速方式</label>
-          <select class="input field-input" v-model="form.groupProbeMode">
-            <option value="real">真连测试</option>
-            <option value="fast">快速测试</option>
-          </select>
         </div>
         <div class="field-row field-row-tip">
           <label class="field-label"></label>
-          <div class="field-tip">用于分组周期测速和订阅更新后的自动测速；手动点击检测按钮不受影响。</div>
+          <div class="field-tip">
+            仅作为出站首次绑定分组时界面自动填写的默认值，不驱动定时任务。实际生效的间隔在出站绑定分组时单独设置。
+          </div>
         </div>
         <div class="field-row">
           <label class="field-label">切换阈值（ms）</label>
@@ -175,6 +169,17 @@
         <div class="field-row" v-if="form.subscriptionAutoUpdateMode === 'on'">
           <label class="field-label">更新间隔（小时）</label>
           <input type="number" class="input field-input" v-model.number="form.subscriptionAutoUpdateIntervalHour" />
+        </div>
+        <div class="field-row">
+          <label class="field-label">测速方式</label>
+          <select class="input field-input" v-model="form.groupProbeMode">
+            <option value="real">真连测试</option>
+            <option value="fast">快速测速</option>
+          </select>
+        </div>
+        <div class="field-row field-row-tip">
+          <label class="field-label"></label>
+          <div class="field-tip">订阅更新后自动测速使用的方式。出站分组的周期测速在绑定分组时单独设置，手动点击检测按钮不受影响。</div>
         </div>
         <div class="field-row field-row-tip">
           <label class="field-label">节点复制规则</label>
@@ -227,6 +232,74 @@
             <button class="action-btn action-btn-add" @click="addCopyRule">+ 添加规则</button>
           </div>
         </div>
+      </div>
+
+      <div class="settings-block" v-if="activeTab === 'other'">
+        <div class="block-header">
+          <span class="block-title">IP 纯净度评分</span>
+        </div>
+        <div class="field-row">
+          <label class="field-label">启用</label>
+          <label class="toggle-wrap">
+            <input type="checkbox" v-model="form.ipScoreEnabled" />
+            <span>{{ form.ipScoreEnabled ? '已开启' : '已关闭' }}</span>
+          </label>
+        </div>
+        <div class="field-row field-row-tip">
+          <label class="field-label"></label>
+          <div class="field-tip">
+            默认关闭。开启后在节点列表点「IP 评分」，会把<strong>节点的服务器地址</strong>发送给下方选择的第三方服务查询评分（不含密码等节点凭据）。
+            这些服务都没有面向第三方调用的正式授权，接口随时可能变更或失效，请自行斟酌后启用。
+          </div>
+        </div>
+        <template v-if="form.ipScoreEnabled">
+          <div class="field-row">
+            <label class="field-label">评分服务商</label>
+            <select class="input field-input" v-model="form.ipScoreProvider">
+              <option value="cleanip">CleanIP.io（内置，评分口径公开）</option>
+              <option value="custom">自定义接口</option>
+            </select>
+          </div>
+          <div class="field-row field-row-tip" v-if="form.ipScoreProvider === 'cleanip'">
+            <label class="field-label"></label>
+            <div class="field-tip">
+              6 个维度加权（身份可信 20% / 匿名规避 25% / 滥用历史 20% / 黑名单 15% / 攻击行为 10% / 本地信誉 10%），
+              再按 IP 用途乘子修正，返回 0–100 分值与等级。
+            </div>
+          </div>
+          <template v-if="form.ipScoreProvider === 'custom'">
+            <div class="field-row">
+              <label class="field-label">接口地址</label>
+              <input
+                class="input field-input"
+                v-model="form.ipScoreCustomEndpoint"
+                placeholder="https://example.com/api/{ip}"
+                style="max-width:520px"
+              />
+            </div>
+            <div class="field-row field-row-tip">
+              <label class="field-label"></label>
+              <div class="field-tip">
+                用 <code>{ip}</code> 标记待查 IP 的位置（如放在路径上）；不写占位符则自动追加 <code>?ip=</code> 参数。
+                响应需为 JSON，会自动查找评分字段（<code>trust_score</code> / <code>purity_score</code> / <code>score</code> 等，支持嵌套），
+                并顺带读取 <code>grade</code>、<code>risk_level</code> 等可选字段。<br />
+                例：Net.Coffee 填 <code>https://ip.net.coffee/api/ip/lookup/{ip}</code>
+                （该站 robots.txt 声明了 <code>Disallow: /api/</code>，是否使用请自行判断）。
+              </div>
+            </div>
+          </template>
+          <div class="field-row">
+            <label class="field-label">请求间隔（毫秒）</label>
+            <input type="number" class="input field-input" v-model.number="form.ipScoreMinIntervalMs" min="500" step="100" />
+          </div>
+          <div class="field-row field-row-tip">
+            <label class="field-label"></label>
+            <div class="field-tip">
+              评分在后台<strong>串行</strong>执行，每查一个等待该间隔，避免短时间大量请求触发第三方保护。最低 500ms，默认 1500ms。
+              节点多时耗时较长，可随时中止；相同地址只查一次。
+            </div>
+          </div>
+        </template>
       </div>
 
       <div v-if="activeTab === 'inbounds'" class="settings-rules-host">
@@ -330,6 +403,11 @@ const form = reactive({
   groupProbeMode: 'real',
   groupSwitchThresholdMs: 100,
   groupSwitchCooldownSec: 600,
+  ipScoreEnabled: false,
+  ipScoreProvider: 'cleanip',
+  // 自定义地址单独存一份，切到 cleanip 再切回来时不会丢
+  ipScoreCustomEndpoint: '',
+  ipScoreMinIntervalMs: 1500,
   socks5Port: 20260,
   httpPort: 20261,
   maxLogLines: 500,
@@ -353,6 +431,10 @@ const localGroups = computed(() => groups.value.filter(g => !g.fromSub))
 let fullSetting = {}
 
 onMounted(async () => {
+  await Promise.all([loadSetting(), loadGroups(), refreshKernelStatus()])
+})
+
+async function loadSetting() {
   try {
     const { data } = await api.getSetting()
     const s = data.setting
@@ -373,6 +455,10 @@ onMounted(async () => {
       groupProbeMode: s.groupProbeMode || 'real',
       groupSwitchThresholdMs: typeof s.groupSwitchThresholdMs === 'number' ? s.groupSwitchThresholdMs : 100,
       groupSwitchCooldownSec: typeof s.groupSwitchCooldownSec === 'number' ? s.groupSwitchCooldownSec : 600,
+      ipScoreEnabled: !!s.ipScoreEnabled,
+      ipScoreProvider: s.ipScoreProvider || 'cleanip',
+      ipScoreCustomEndpoint: s.ipScoreEndpoint || '',
+      ipScoreMinIntervalMs: s.ipScoreMinIntervalMs || 1500,
       socks5Port: s.socks5Port || 20260,
       httpPort: s.httpPort || 20261,
       maxLogLines: s.maxLogLines || 500,
@@ -380,9 +466,7 @@ onMounted(async () => {
       githubMirror: s.githubMirror || '',
     })
   } catch {}
-  await loadGroups()
-  await refreshKernelStatus()
-})
+}
 
 async function loadGroups() {
   try {
@@ -496,6 +580,12 @@ function kernelActionClass(k) {
   return k.installed ? 'btn-light' : 'btn-primary'
 }
 
+// 自定义地址始终随设置保存，这样切到 cleanip 再切回来还在。
+// 后端只在服务商为 custom 时使用它，内置服务商固定用自己的地址。
+function ipScoreEndpointToSave() {
+  return (form.ipScoreCustomEndpoint || '').trim()
+}
+
 async function saveSettings() {
   saving.value = true
   saveMsg.value = null
@@ -518,6 +608,10 @@ async function saveSettings() {
       groupProbeMode: form.groupProbeMode,
       groupSwitchThresholdMs: form.groupSwitchThresholdMs,
       groupSwitchCooldownSec: form.groupSwitchCooldownSec,
+      ipScoreEnabled: form.ipScoreEnabled,
+      ipScoreProvider: form.ipScoreProvider,
+      ipScoreEndpoint: ipScoreEndpointToSave(),
+      ipScoreMinIntervalMs: form.ipScoreMinIntervalMs,
       maxLogLines: form.maxLogLines,
       maxLogFileSize: Math.round(form.maxLogFileSizeMB * 1024 * 1024),
       githubMirror: form.githubMirror,
@@ -541,6 +635,10 @@ async function saveSettings() {
       groupProbeMode: form.groupProbeMode,
       groupSwitchThresholdMs: form.groupSwitchThresholdMs,
       groupSwitchCooldownSec: form.groupSwitchCooldownSec,
+      ipScoreEnabled: form.ipScoreEnabled,
+      ipScoreProvider: form.ipScoreProvider,
+      ipScoreEndpoint: ipScoreEndpointToSave(),
+      ipScoreMinIntervalMs: form.ipScoreMinIntervalMs,
       maxLogLines: form.maxLogLines,
       maxLogFileSize: Math.round(form.maxLogFileSizeMB * 1024 * 1024),
       githubMirror: form.githubMirror,
@@ -916,4 +1014,3 @@ async function saveSettings() {
   margin: 0;
 }
 </style>
-

@@ -11,18 +11,18 @@ import (
 // ServerRef 指向一个具体节点的引用
 type ServerRef struct {
 	// "server"（手动导入）或 "sub_server"（来自订阅）
-	Type  string `json:"type"`
+	Type string `json:"type"`
 	// 当 Type == "server" 时，是 servers 列表的下标（从0开始）
-	Index int    `json:"index"`
+	Index int `json:"index"`
 	// 当 Type == "sub_server" 时，是 subscriptions 列表的下标
-	Sub   int    `json:"sub"`
+	Sub int `json:"sub"`
 }
 
 // Group 是用户自定义的节点分组，与订阅解耦
 // 订阅导入时会自动创建一个对应的 Group，手动节点也可以加入任意 Group
 type Group struct {
-	ID        string      `json:"id"`
-	Name      string      `json:"name"`
+	ID   string `json:"id"`
+	Name string `json:"name"`
 	// 是否由订阅自动创建（自动创建的 Group 名称跟随订阅）
 	FromSub   bool        `json:"fromSub"`
 	SubID     string      `json:"subId,omitempty"`
@@ -92,32 +92,54 @@ func GetLenGroups() int {
 
 // AddServerToGroup 将节点引用加入分组
 func AddServerToGroup(groupIndex int, ref ServerRef) error {
-	g := GetGroup(groupIndex)
-	if g == nil {
-		return fmt.Errorf("group index %d not found", groupIndex)
-	}
-	// 去重
-	for _, existing := range g.Servers {
-		if existing == ref {
-			return nil
+	return AddServersToGroup(groupIndex, []ServerRef{ref})
+}
+
+// AddServersToGroup 将多个节点引用一次性加入分组。
+func AddServersToGroup(groupIndex int, refs []ServerRef) error {
+	return db.ListUpdate("touch", "groups", groupIndex, func(raw []byte) ([]byte, error) {
+		group, err := Bytes2Group(raw)
+		if err != nil {
+			return nil, err
 		}
-	}
-	g.Servers = append(g.Servers, ref)
-	return SetGroup(groupIndex, g)
+		existing := make(map[ServerRef]struct{}, len(group.Servers)+len(refs))
+		for _, ref := range group.Servers {
+			existing[ref] = struct{}{}
+		}
+		for _, ref := range refs {
+			if _, ok := existing[ref]; ok {
+				continue
+			}
+			group.Servers = append(group.Servers, ref)
+			existing[ref] = struct{}{}
+		}
+		return json.Marshal(group)
+	})
 }
 
 // RemoveServerFromGroup 从分组中移除节点引用
 func RemoveServerFromGroup(groupIndex int, ref ServerRef) error {
-	g := GetGroup(groupIndex)
-	if g == nil {
-		return fmt.Errorf("group index %d not found", groupIndex)
+	return RemoveServersFromGroup(groupIndex, []ServerRef{ref})
+}
+
+// RemoveServersFromGroup 将多个节点引用一次性移出分组。
+func RemoveServersFromGroup(groupIndex int, refs []ServerRef) error {
+	remove := make(map[ServerRef]struct{}, len(refs))
+	for _, ref := range refs {
+		remove[ref] = struct{}{}
 	}
-	newServers := make([]ServerRef, 0, len(g.Servers))
-	for _, s := range g.Servers {
-		if s != ref {
-			newServers = append(newServers, s)
+	return db.ListUpdate("touch", "groups", groupIndex, func(raw []byte) ([]byte, error) {
+		group, err := Bytes2Group(raw)
+		if err != nil {
+			return nil, err
 		}
-	}
-	g.Servers = newServers
-	return SetGroup(groupIndex, g)
+		servers := make([]ServerRef, 0, len(group.Servers))
+		for _, ref := range group.Servers {
+			if _, ok := remove[ref]; !ok {
+				servers = append(servers, ref)
+			}
+		}
+		group.Servers = servers
+		return json.Marshal(group)
+	})
 }

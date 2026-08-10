@@ -29,22 +29,27 @@ export const api = {
   changePassword: (data) => http.post('/auth/change-password', data),
 
   // 状态
+  getBootstrap: () => http.get('/bootstrap'),
   getStatus: () => http.get('/status'),
   startProxy: () => http.post('/start'),
   stopProxy: () => http.post('/stop'),
 
   // 节点
-  getServers: () => http.get('/servers'),
-  searchServers: (q) => http.get('/servers/search', { params: { q } }),
+  getServers: (view = 'list') => http.get('/servers', { params: { view } }),
+  queryServers: (refs) => http.post('/servers/query', { refs }),
+  searchServers: (q, limit = 100, signal) => http.get('/servers/search', { params: { q, limit }, signal }),
   import: (data) => http.post('/import', data),
   importServers: (links, groupId) => http.post('/servers', { links, groupId }),
   deleteServers: (indexes) => http.delete('/servers', { data: { indexes } }),
   editServer: (index, data) => http.put(`/servers/${index}`, data),
   getServerLink: (type, index, sub = 0) => http.get('/server/link', { params: { type, index, sub } }),
   copyServerToGroup: (ref, groupId, clone = true) => http.post('/server/copy-to-group', { ref, groupId, clone }),
+  batchCopyServersToGroup: (refs, groupId, clone = true) => http.post('/servers/batch-copy-to-group', { refs, groupId, clone }),
+  batchMoveServersToGroup: (refs, sourceGroupId, targetGroupId) => http.post('/servers/batch-move-to-group', { refs, sourceGroupId, targetGroupId }),
 
   // 订阅
-  getSubscriptions: () => http.get('/subscriptions'),
+  getSubscriptions: (view = 'summary') => http.get('/subscriptions', { params: { view } }),
+  getSubscriptionServers: (index, page, pageSize) => http.get(`/subscriptions/${index}/servers`, { params: { page, pageSize } }),
   addSubscription: (data) => http.post('/subscriptions', data),
   updateSubscription: (index, data) => http.put(`/subscriptions/${index}`, data),
   deleteSubscription: (index) => http.delete(`/subscriptions/${index}`),
@@ -57,13 +62,26 @@ export const api = {
   deleteGroup: (index) => http.delete(`/groups/${index}`),
   addServerToGroup: (index, ref) => http.post(`/groups/${index}/servers`, ref),
   removeServerFromGroup: (index, ref) => http.delete(`/groups/${index}/servers`, { data: ref }),
+  removeServersFromGroup: (index, refs) => http.post(`/groups/${index}/servers/batch-remove`, { refs }),
+  // 分组测速跑完后，按绑定该分组的出站策略决定是否切换活跃节点
+  applyGroupSwitch: (index, mode) => http.post(`/groups/${index}/apply-switch`, null, { params: { mode } }),
+
+  // 节点 IP 类型检测
+  detectServerIPType: (refs) => http.post('/servers/detect-ip-type', { refs }),
+
+  // 节点 IP 评分：后台异步任务，提交后轮询 status
+  scoreServerIP: (refs) => http.post('/servers/ip-score', { refs }),
+  getIPScoreStatus: () => http.get('/servers/ip-score/status'),
+  cancelIPScore: () => http.post('/servers/ip-score/cancel'),
 
   // 出站
   getOutbounds: () => http.get('/outbounds'),
   createOutbound: (data) => http.post('/outbounds', data),
   updateOutbound: (name, data) => http.put(`/outbounds/${name}`, data),
+  renameOutbound: (name, newName) => http.put(`/outbounds/${encodeURIComponent(name)}/rename`, { name: newName }),
   deleteOutbound: (name) => http.delete(`/outbounds/${name}`),
-  connectOutbound: (name, target) => http.post(`/outbounds/${name}/connect`, target),
+  // target 之外的 extra 承载出站顶层字段（probeInterval / probeMode），后端按需读取
+  connectOutbound: (name, target, extra = {}) => http.post(`/outbounds/${name}/connect`, { ...target, ...extra }),
   disconnectOutbound: (name) => http.post(`/outbounds/${name}/disconnect`),
   downloadCfGoodNetCA: () => window.open('/api/cfgoodnet/ca/download', '_blank'),
   importCfGoodNetCA: () => http.post('/cfgoodnet/ca/import'),
@@ -114,14 +132,54 @@ export const api = {
       }
     })
   },
-  pingNodes: (refs, mode = 'fast', config = {}) => http.post('/ping', { refs, mode }, config),
+  // 批量测速：后端为 SSE 流式接口（POST），逐节点推送 running/done 进度。
+  // EventSource 只支持 GET，这里用 fetch + ReadableStream 手动解析 SSE。
+  // onEvent(event, payload) 会在每个事件到达时回调。
+  pingNodes: async (refs, mode = 'fast', { signal, onEvent } = {}) => {
+    const resp = await fetch('/api/ping', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ refs, mode }),
+      signal,
+    })
+    if (!resp.ok) {
+      if (resp.status === 401) unauthorizedHandler?.({ response: resp })
+      throw new Error(`ping 失败: ${resp.status}`)
+    }
+    const reader = resp.body.getReader()
+    const decoder = new TextDecoder()
+    let buf = ''
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += decoder.decode(value, { stream: true })
+      // SSE 事件以空行分隔
+      let sep
+      while ((sep = buf.indexOf('\n\n')) !== -1) {
+        const chunk = buf.slice(0, sep)
+        buf = buf.slice(sep + 2)
+        let evt = 'message'
+        let data = ''
+        for (const line of chunk.split('\n')) {
+          if (line.startsWith('event:')) evt = line.slice(6).trim()
+          else if (line.startsWith('data:')) data += line.slice(5).trim()
+        }
+        if (!data) continue
+        try {
+          onEvent?.(evt, JSON.parse(data))
+        } catch {}
+      }
+    }
+  },
   pingGroup: (index, mode = 'fast') => http.post(`/groups/${index}/ping`, null, { params: { mode } }),
 
   // 日志
-  getLogs: () => http.get('/logs'),
-  getLogsStream: (onMessage) => {
+  getLogs: (params = {}) => http.get('/logs', { params }),
+  getLogsStream: (onMessage, params = {}) => {
     return new Promise((resolve, reject) => {
-      const es = new EventSource('/api/logs/stream')
+      const query = new URLSearchParams(params).toString()
+      const es = new EventSource(`/api/logs/stream${query ? `?${query}` : ''}`)
       es.onmessage = (e) => {
         try {
           const data = JSON.parse(e.data)

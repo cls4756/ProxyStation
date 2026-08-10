@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ProxyStation/proxystation/db/configure"
@@ -13,9 +14,12 @@ import (
 )
 
 const (
-	authCookieName = "proxystation_session"
-	authSessionTTL = 3 * 24 * time.Hour // 3 天内有访问就自动续期
+	authCookieName             = "proxystation_session"
+	authSessionTTL             = 3 * 24 * time.Hour // 3 天内有访问就自动续期
+	authSessionRefreshInterval = 5 * time.Minute
 )
+
+var authSessionRefreshMu sync.Mutex
 
 func AuthRequired() gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -159,35 +163,57 @@ func validateSession(c *gin.Context) (string, bool) {
 		return "", false
 	}
 
-	now := time.Now()
-
 	session, err := configure.GetSession(sessionID)
 	if err != nil {
 		return "", false
 	}
 
-	// 检查是否超过过期时间（从最后访问时间算起）
-	if now.Sub(session.LastAccess) > authSessionTTL {
-		_ = configure.DeleteSession(sessionID)
-		return "", false
-	}
-
+	now := time.Now()
 	setting := configure.GetSettingNotNil()
-	if session.Username != setting.WebUsername {
+	if !sessionIsValid(session, setting.WebUsername, now) {
 		_ = configure.DeleteSession(sessionID)
 		return "", false
 	}
 
-	// 滑动过期：更新最后访问时间和过期时间
+	if now.Sub(session.LastAccess) < authSessionRefreshInterval {
+		return session.Username, true
+	}
+
+	authSessionRefreshMu.Lock()
+	defer authSessionRefreshMu.Unlock()
+
+	// 并发请求可能已经完成续期，锁内重新读取，避免重复触发 bbolt 同步写。
+	session, err = configure.GetSession(sessionID)
+	if err != nil {
+		return "", false
+	}
+	now = time.Now()
+	setting = configure.GetSettingNotNil()
+	if !sessionIsValid(session, setting.WebUsername, now) {
+		_ = configure.DeleteSession(sessionID)
+		return "", false
+	}
+	if now.Sub(session.LastAccess) < authSessionRefreshInterval {
+		return session.Username, true
+	}
+
 	session.LastAccess = now
 	session.ExpiresAt = now.Add(authSessionTTL)
-	_ = configure.SetSession(session)
+	if err := configure.SetSession(session); err != nil {
+		return "", false
+	}
 
-	// 同时更新 cookie 的过期时间
 	c.SetSameSite(http.SameSiteLaxMode)
 	c.SetCookie(authCookieName, sessionID, int(authSessionTTL.Seconds()), "/", "", false, true)
 
 	return session.Username, true
+}
+
+func sessionIsValid(session *configure.Session, username string, now time.Time) bool {
+	if session == nil || now.Sub(session.LastAccess) > authSessionTTL {
+		return false
+	}
+	return session.Username == username
 }
 
 func validCredentialPair(setting *configure.Setting, username string, password string) bool {

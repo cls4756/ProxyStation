@@ -19,8 +19,10 @@ func BuildXrayConfig(setting *configure.Setting) (*coreObj.Config, error) {
 	listenAddr := configure.BuiltinProxyListenAddress(setting)
 	builtinSocksSniffing := coreObj.Sniffing{}
 	builtinHTTPSniffing := coreObj.Sniffing{}
-	if setting.EnableSniff {
+	if setting.Socks5SniffOn() {
 		builtinSocksSniffing = coreObj.Sniffing{Enabled: true, DestOverride: []string{"http", "tls", "quic"}}
+	}
+	if setting.HttpSniffOn() {
 		builtinHTTPSniffing = coreObj.Sniffing{Enabled: true, DestOverride: []string{"http", "tls"}}
 	}
 	cfg := &coreObj.Config{
@@ -28,21 +30,16 @@ func BuildXrayConfig(setting *configure.Setting) (*coreObj.Config, error) {
 		Routing: coreObj.Routing{DomainStrategy: "IPIfNonMatch"},
 		Inbounds: []coreObj.Inbound{
 			{
-				Tag: "socks", Port: setting.Socks5Port, Listen: listenAddr, Protocol: "socks",
+				Tag: "socks-in", Port: setting.Socks5Port, Listen: listenAddr, Protocol: "socks",
 				Settings: &coreObj.InboundSettings{UDP: true},
 				Sniffing: builtinSocksSniffing,
 			},
 			{
-				Tag: "http", Port: setting.HttpPort, Listen: listenAddr, Protocol: "http",
+				Tag: "http-in", Port: setting.HttpPort, Listen: listenAddr, Protocol: "http",
 				Sniffing: builtinHTTPSniffing,
-			},
-			{
-				Tag: ProbeInboundTag, Port: ProbeInboundSocksPort, Listen: ProbeInboundListen, Protocol: "socks",
-				Settings: &coreObj.InboundSettings{UDP: false},
 			},
 		},
 		Outbounds: []coreObj.OutboundObject{
-			{Tag: ProbeOutboundName, Protocol: "freedom"},
 			{Tag: "direct", Protocol: "freedom"},
 			{Tag: "block", Protocol: "blackhole"},
 		},
@@ -107,7 +104,6 @@ func BuildXrayConfig(setting *configure.Setting) (*coreObj.Config, error) {
 
 	// 基础路由规则：私有 IP 直连
 	cfg.Routing.Rules = []coreObj.RoutingRule{
-		{Type: "field", OutboundTag: ProbeOutboundName, InboundTag: []string{ProbeInboundTag}},
 		{Type: "field", OutboundTag: "direct", IP: []string{
 			"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
 			"127.0.0.0/8", "169.254.0.0/16", "224.0.0.0/4", "240.0.0.0/4",
@@ -119,6 +115,7 @@ func BuildXrayConfig(setting *configure.Setting) (*coreObj.Config, error) {
 
 	// 先收集有效出站 tag，再注入路由规则
 	validOutboundTags := collectValidOutboundTags()
+	hasProxyCatchAll := false
 	for _, name := range configure.GetOutboundNames() {
 		o := configure.GetOutbound(name)
 		if o == nil {
@@ -157,25 +154,11 @@ func BuildXrayConfig(setting *configure.Setting) (*coreObj.Config, error) {
 			}
 			LogCallback(fmt.Sprintf("📘 xray outbound %s => protocol=%s server=%s port=%d", name, ob.Protocol, server, port))
 		}
-		if name == ProbeOutboundName {
-			replaced := false
-			for i := range cfg.Outbounds {
-				if cfg.Outbounds[i].Tag == ProbeOutboundName {
-					cfg.Outbounds[i] = ob
-					replaced = true
-					break
-				}
-			}
-			if !replaced {
-				cfg.Outbounds = append([]coreObj.OutboundObject{ob}, cfg.Outbounds...)
-			}
-		} else {
-			cfg.Outbounds = append([]coreObj.OutboundObject{ob}, cfg.Outbounds...)
-		}
+		cfg.Outbounds = append([]coreObj.OutboundObject{ob}, cfg.Outbounds...)
 		validOutboundTags[name] = true
 		if name == "proxy" {
-			cfg.Routing.Rules = append(cfg.Routing.Rules,
-				coreObj.RoutingRule{Type: "field", OutboundTag: name, Port: "0-65535"})
+			// catch-all 兜底：必须排在用户规则之后，否则会吃掉全部流量
+			hasProxyCatchAll = true
 		}
 	}
 
@@ -213,7 +196,13 @@ func BuildXrayConfig(setting *configure.Setting) (*coreObj.Config, error) {
 		cfg.Routing.Rules = append(cfg.Routing.Rules, rule)
 	}
 
-	cfg.Routing.Rules = optimizeXrayRules(cfg.Routing.Rules)
+	// 兜底规则放在最后：用户规则未命中的流量才走 proxy
+	if hasProxyCatchAll {
+		cfg.Routing.Rules = append(cfg.Routing.Rules,
+			coreObj.RoutingRule{Type: "field", OutboundTag: "proxy", Port: "0-65535"})
+	}
+
+	cfg.Routing.Rules = dedupXrayRules(cfg.Routing.Rules)
 
 	return cfg, nil
 }

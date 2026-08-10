@@ -36,7 +36,7 @@
               @click="activeTab = 'sub-' + si"
             >
               {{ sub.name || sub.host }}
-              <span class="tab-badge">{{ sub.servers?.length || 0 }}</span>
+              <span class="tab-badge">{{ sub.serverCount ?? sub.servers?.length ?? 0 }}</span>
             </span>
           </div>
         </div>
@@ -161,10 +161,13 @@
               <button class="action-btn action-btn-danger" @click="deleteSub(si)">删除</button>
             </div>
           </div>
-          <div v-if="!sub.servers?.length" class="empty-hint">
+          <div v-if="!sub.serversLoaded" class="empty-hint">
+            <p class="empty-sub">正在加载订阅节点…</p>
+          </div>
+          <div v-else-if="!sub.servers.length" class="empty-hint">
             <p class="empty-sub">订阅为空，点击「更新节点」拉取</p>
           </div>
-          <div class="table-scroll" v-if="getSortedSubEntries(sub, si).length">
+          <div class="table-scroll" v-if="sub.serversLoaded && getSortedSubEntries(sub, si).length">
             <ServerListHead
               :columns="listColumns"
               :sort-key="sortKey"
@@ -191,6 +194,11 @@
               @copy-to-group="ref => openSingleCopy(ref)"
             />
           </div>
+          <div class="node-pagination" v-if="currentNodeTotal > NODE_PAGE_SIZE">
+            <button class="action-btn" :disabled="nodePage <= 1" @click="changeNodePage(nodePage - 1)">‹ 上一页</button>
+            <span>第 {{ nodePage }} / {{ nodeTotalPages }} 页，共 {{ currentNodeTotal }} 个</span>
+            <button class="action-btn" :disabled="nodePage >= nodeTotalPages" @click="changeNodePage(nodePage + 1)">下一页 ›</button>
+          </div>
         </div>
       </template>
 
@@ -200,7 +208,7 @@
           <div class="info-bar">
             <div class="info-bar-left">
               <span class="group-name-display">{{ group.name }}</span>
-              <span class="info-count">{{ getSortedGroupEntries(group).length }} 个节点</span>
+              <span class="info-count">{{ group.servers?.length || 0 }} 个节点</span>
             </div>
             <div class="info-bar-right">
               <input
@@ -264,6 +272,11 @@
               @move-to-group="ref => openSingleMove(ref)"
             />
           </div>
+          <div class="node-pagination" v-if="currentNodeTotal > NODE_PAGE_SIZE">
+            <button class="action-btn" :disabled="nodePage <= 1" @click="changeNodePage(nodePage - 1)">‹ 上一页</button>
+            <span>第 {{ nodePage }} / {{ nodeTotalPages }} 页，共 {{ currentNodeTotal }} 个</span>
+            <button class="action-btn" :disabled="nodePage >= nodeTotalPages" @click="changeNodePage(nodePage + 1)">下一页 ›</button>
+          </div>
         </div>
       </template>
 
@@ -276,7 +289,6 @@
       :ref-obj="nodeMenuRef"
       :server="nodeMenuServer"
       @close="nodeMenuMode = ''"
-      @updated="store.fetchAll()"
     />
 
     <!-- 新建分组弹窗 -->
@@ -327,11 +339,11 @@
           <span class="modal-close" @click="showAddToGroup = -1">✕</span>
         </div>
         <div style="padding:8px 16px; border-bottom:1px solid #f0f0f0">
-          <input class="input" v-model="addSearch" placeholder="搜索节点名称…" style="font-size:12px" />
+          <input class="input" v-model="addSearch" placeholder="输入名称、地址或协议搜索…" style="font-size:12px" />
         </div>
         <div class="modal-body" style="padding:0; max-height:400px; overflow-y:auto">
           <div
-            v-for="(s, i) in filteredSelectableServers" :key="i"
+            v-for="(s, i) in filteredSelectableServers" :key="refKey(s._ref)"
             :class="['sel-row', selectedAddIdx === i ? 'sel-row-active' : '']"
             @click="selectedAddIdx = i"
           >
@@ -340,7 +352,7 @@
             <span class="sel-addr">{{ s.host }}:{{ s.port }}</span>
           </div>
           <div v-if="!filteredSelectableServers.length" style="padding:20px; text-align:center; color:#b5b5b5; font-size:13px">
-            无匹配节点
+            {{ addSearch.trim() ? '无匹配节点' : '输入关键字后从服务端查询节点' }}
           </div>
         </div>
         <div class="modal-footer">
@@ -506,6 +518,7 @@ import axios from 'axios'
 const store = useProxyStore()
 const openImport = inject('openImport')
 const currentOutbound = inject('currentOutbound')
+const outboundSelectionVersion = inject('outboundSelectionVersion', ref(0))
 
 const activeTab = ref('group-0')
 const pinging = ref(false)
@@ -523,6 +536,8 @@ const isSearching = ref(false)
 const pingProgress = ref({ total: 0, done: 0, current: '' })
 const pingStates = ref({})
 const FAST_PING_CONCURRENCY = 6
+const NODE_PAGE_SIZE = 100
+const nodePage = ref(1)
 
 // ---- 列宽 ----
 // 操作列也是一列：6 个按钮实际要 220px 左右，之前固定 180px 且右对齐 + 裁剪，
@@ -530,6 +545,7 @@ const FAST_PING_CONCURRENCY = 6
 const COLUMN_DEFS = [
   { key: 'name', label: '节点', min: 80, def: 200, sortable: true },
   { key: 'addr', label: '地址', min: 90, def: 220, sortable: true },
+  { key: 'geo', label: '地区', min: 80, def: 150, sortable: true },
   { key: 'type', label: '协议', min: 50, def: 76, sortable: true },
   { key: 'iptype', label: 'IP 类型', min: 46, def: 62, sortable: true },
   { key: 'ipscore', label: '评分', min: 46, def: 62, sortable: true },
@@ -648,6 +664,11 @@ function compareText(a, b) {
 function compareServers(key, a, b) {
   if (key === 'name') return compareText(a?.name, b?.name)
   if (key === 'type') return compareText(a?.type, b?.type)
+  if (key === 'geo') {
+    return compareText(a?.ipGeoCountry, b?.ipGeoCountry) ||
+      compareText(a?.ipGeoRegion, b?.ipGeoRegion) ||
+      compareText(a?.ipGeoCity, b?.ipGeoCity)
+  }
   if (key === 'addr') {
     return compareText(a?.host, b?.host) || (Number(a?.port) || 0) - (Number(b?.port) || 0)
   }
@@ -669,55 +690,81 @@ function latencyValue(server) {
   return lat
 }
 
-// 对所有节点（手动 + 全部订阅）统一算名次，这样切换 tab 时排序依然生效。
-// 名次按节点身份存储而非下标：删节点或刷新订阅会让下标整体前移，用下标当键会把
-// 名次张冠李戴到别的节点上。
+// 只在点击表头时，对当前可见行生成一次 ref -> 名次快照。
+// 后续延迟、评分、地区等字段变化只更新单元格，不重新计算名次。
 function captureSortOrder() {
   if (!sortKey.value) {
     sortRanks.value = null
     return
   }
-  const items = []
-  store.servers.forEach((server) => items.push(server))
-  store.subscriptions.forEach((sub) => {
-    (sub?.servers || []).forEach((server) => items.push(server))
+  const entries = getCurrentEntriesForSort().map((entry, index) => ({ entry, index }))
+  const dir = sortDir.value === 'desc' ? -1 : 1
+  entries.sort((a, b) => {
+    const result = compareServers(sortKey.value, a.entry.server, b.entry.server) * dir
+    return result || a.index - b.index
   })
 
-  const dir = sortDir.value === 'desc' ? -1 : 1
-  items.sort((a, b) => compareServers(sortKey.value, a, b) * dir)
-
   const ranks = new Map()
-  items.forEach((server, i) => {
-    const id = nodeIdentity(server)
-    if (!ranks.has(id)) ranks.set(id, i)
+  entries.forEach(({ entry }, index) => {
+    ranks.set(refKey(entry.ref), index)
   })
   sortRanks.value = ranks
 }
 
-// 与后端 serverProbeKeys 同样的思路：优先用链接，退回协议/地址/端口/名称组合
-function nodeIdentity(server) {
-  const link = (server?.link || '').trim()
-  if (link) return `link:${link}`
-  const type = (server?.type || '').toLowerCase().trim()
-  const host = (server?.host || '').toLowerCase().trim()
-  return `srv:${type}|${host}|${server?.port || 0}|${(server?.name || '').trim()}`
+function getCurrentEntriesForSort() {
+  if (isSearching.value) return searchResults.value
+  if (activeTab.value.startsWith('sub-')) {
+    const si = parseInt(activeTab.value.replace('sub-', ''))
+    return getSubServerEntries(store.subscriptions[si], si)
+  }
+  if (activeTab.value.startsWith('group-')) {
+    const gi = parseInt(activeTab.value.replace('group-', ''))
+    return getGroupServerEntries(manualGroups.value[gi])
+  }
+  return []
 }
 
-// 按点击表头时固定下来的名次排列。新导入、排序后才出现的节点没有名次，排在末尾。
+// 按点击表头时固定下来的名次排列。之后出现的新行没有名次，保持在末尾。
 function applySortOrder(entries) {
   const ranks = sortRanks.value
   if (!ranks) return entries
-  return [...entries].sort((a, b) => {
-    const ra = ranks.get(nodeIdentity(a.server))
-    const rb = ranks.get(nodeIdentity(b.server))
-    if (ra === undefined && rb === undefined) return 0
-    if (ra === undefined) return 1
-    if (rb === undefined) return -1
-    return ra - rb
-  })
+  const decorated = entries.map(entry => ({
+    entry,
+    rank: ranks.get(refKey(entry.ref)) ?? Number.POSITIVE_INFINITY,
+  }))
+  decorated.sort((a, b) => a.rank - b.rank)
+  return decorated.map(item => item.entry)
 }
 const pingAbortController = ref(null)
 const pingAborted = ref(false)
+let pendingPingStates = {}
+let pendingPingPatches = []
+let pingFlushFrame = 0
+
+function schedulePingFlush(key, state, refObj, patch) {
+  pendingPingStates[key] = state
+  if (refObj && patch) pendingPingPatches.push({ ref: refObj, patch })
+  if (pingFlushFrame) return
+  pingFlushFrame = window.requestAnimationFrame(flushPendingPingUpdates)
+}
+
+function flushPendingPingUpdates() {
+  if (pingFlushFrame) window.cancelAnimationFrame(pingFlushFrame)
+  if (Object.keys(pendingPingStates).length) {
+    pingStates.value = { ...pingStates.value, ...pendingPingStates }
+  }
+  if (pendingPingPatches.length) store.patchNodes(pendingPingPatches)
+  pendingPingStates = {}
+  pendingPingPatches = []
+  pingFlushFrame = 0
+}
+
+function cancelPingFlush() {
+  if (pingFlushFrame) window.cancelAnimationFrame(pingFlushFrame)
+  pingFlushFrame = 0
+  pendingPingStates = {}
+  pendingPingPatches = []
+}
 
 // IP 类型检测状态
 const detectingIPType = ref(false)
@@ -742,14 +789,13 @@ async function refreshPanel() {
   try {
     // 根据当前 tab 只刷新表格数据
     if (activeTab.value.startsWith('sub-')) {
-      // 订阅 tab：只刷新订阅数据
-      await store.fetchSubscriptions()
+      const si = parseInt(activeTab.value.replace('sub-', ''))
+      await store.fetchSubscriptionServers(si, true, nodePage.value, NODE_PAGE_SIZE)
     } else if (activeTab.value.startsWith('group-')) {
-      // 分组 tab：只刷新服务器数据（分组结构不变）
-      await store.fetchServers()
+      const gi = parseInt(activeTab.value.replace('group-', ''))
+      await store.fetchNodes(getGroupPageRefs(manualGroups.value[gi]))
     } else {
-      // 其他情况刷新全部
-      await store.fetchAll()
+      await Promise.all([store.fetchServers(), store.fetchSubscriptions(false)])
     }
   } catch (e) {
     showNotice('刷新失败：' + (e?.response?.data?.error || e?.message || '未知错误'), true)
@@ -775,6 +821,7 @@ const nodeMenuServer = ref(null)
 
 // 多选状态
 const selectedRefs = ref([])
+const selectedKeys = computed(() => new Set(selectedRefs.value.map(refKey)))
 const selectionAnchorKey = ref('')
 const dragSelecting = ref(false)
 const dragSelectChecked = ref(true)
@@ -837,6 +884,7 @@ onMounted(() => {
   window.addEventListener('blur', endDragSelect)
   // 评分任务跑在后端，刷新页面后要接回进度显示
   resumeIPScoreIfRunning()
+  ensureActiveTabNodes()
 })
 
 onBeforeUnmount(() => {
@@ -846,12 +894,19 @@ onBeforeUnmount(() => {
   window.removeEventListener('pointercancel', endDragSelect)
   window.removeEventListener('blur', endDragSelect)
   stopIPScorePoll()
+  clearTimeout(addSearchTimer)
+  clearTimeout(searchTimer)
+  searchAbortController?.abort()
+  addSearchAbortController?.abort()
+  cancelPingFlush()
 })
 
 async function resumeIPScoreIfRunning() {
   try {
     const { data } = await api.getIPScoreStatus()
-    if (data?.running) startIPScorePoll()
+    const state = data.state || data
+    ipScoreTask.value = state
+    if (state?.running) startIPScorePoll()
   } catch {}
 }
 
@@ -859,7 +914,7 @@ function refKey(ref) {
   return `${ref.type}:${ref.index}:${ref.sub || 0}`
 }
 function isSelected(ref) {
-  return selectedRefs.value.some(r => refKey(r) === refKey(ref))
+  return selectedKeys.value.has(refKey(ref))
 }
 
 function setSelected(ref, checked) {
@@ -956,21 +1011,24 @@ function endDragSelect() {
 // 全选功能
 const showSelectAll = ref(false)
 const allSelected = computed(() => {
-  if (!selectedRefs.value.length) return false
   const currentTabServers = getCurrentTabServers()
-  return selectedRefs.value.length === currentTabServers.length
+  return currentTabServers.length > 0 && currentTabServers.every(ref => selectedKeys.value.has(refKey(ref)))
 })
 
 function getCurrentTabServers() {
   if (activeTab.value.startsWith('sub-')) {
     const si = parseInt(activeTab.value.replace('sub-', ''))
     const sub = store.subscriptions[si]
-    return (sub?.servers || []).map((_, i) => ({ type: 'sub_server', index: i, sub: si }))
+    const start = (nodePage.value - 1) * NODE_PAGE_SIZE
+    const end = Math.min(start + NODE_PAGE_SIZE, Number(sub?.serverCount || 0))
+    return Array.from({ length: Math.max(0, end - start) }, (_, offset) => ({
+      type: 'sub_server', index: start + offset, sub: si,
+    }))
   }
   if (activeTab.value.startsWith('group-')) {
     const gi = parseInt(activeTab.value.replace('group-', ''))
     const group = manualGroups.value[gi]
-    return (group?.servers || []).map(ref => ref)
+    return getGroupPageRefs(group)
   }
   return []
 }
@@ -1001,47 +1059,76 @@ function selectAll() {
 
 // 切换 tab 时清空选择
 watch(activeTab, async () => {
+  nodePage.value = 1
+  clearSortOrder()
   selectedRefs.value = []
   showSelectAll.value = false
   selectionAnchorKey.value = ''
   endDragSelect()
+  await ensureActiveTabNodes()
   await nextTick()
   scrollActiveTabIntoView()
 })
 
-watch(
-	() => [currentOutbound?.value, manualGroups.value.map(g => g.id).join(','), store.outbounds],
-	() => {
-		const outboundName = currentOutbound?.value || 'proxy'
-		const outbound = store.outbounds.find(o => o.name === outboundName)
-    const target = outbound?.target
-    if (!target?.targetType) return
+async function ensureActiveTabNodes() {
+  if (activeTab.value.startsWith('sub-')) {
+    const si = parseInt(activeTab.value.replace('sub-', ''))
+    await store.fetchSubscriptionServers(si, false, nodePage.value, NODE_PAGE_SIZE)
+    return
+  }
+  if (activeTab.value.startsWith('group-')) {
+    const gi = parseInt(activeTab.value.replace('group-', ''))
+    await store.fetchNodes(getGroupPageRefs(manualGroups.value[gi]))
+  }
+}
 
-    if (target.targetType === 'group' && target.groupId) {
-      const gi = manualGroups.value.findIndex(g => g.id === target.groupId)
-      if (gi >= 0) activeTab.value = 'group-' + gi
-      return
-    }
+const manualGroups = computed(() => {
+  const groups = store.groups.filter(group => !group.fromSub)
+  const serverGroup = groups.find(group => group.name === 'SERVER')
+  const otherGroups = groups.filter(group => group.name !== 'SERVER')
+  otherGroups.sort((a, b) => {
+    const timeA = new Date(a.createdAt || 0).getTime()
+    const timeB = new Date(b.createdAt || 0).getTime()
+    return timeA - timeB
+  })
+  return serverGroup ? [serverGroup, ...otherGroups] : otherGroups
+})
 
-    if (target.targetType === 'node' && target.nodeRef) {
-      const ref = target.nodeRef
-      if (ref.type === 'sub_server') {
-        const si = Number(ref.sub || 0)
-        if (si >= 0 && si < store.subscriptions.length) {
-          activeTab.value = 'sub-' + si
-        }
-        return
-      }
-      if (ref.type === 'server') {
-        const gi = manualGroups.value.findIndex(g =>
-          (g.servers || []).some(r => r.type === 'server' && r.index === ref.index)
-        )
-        if (gi >= 0) activeTab.value = 'group-' + gi
-      }
-    }
-	},
-	{ immediate: true }
-)
+const currentNodeTotal = computed(() => {
+  if (activeTab.value.startsWith('sub-')) {
+    const si = parseInt(activeTab.value.replace('sub-', ''))
+    return Number(store.subscriptions[si]?.serverCount || 0)
+  }
+  if (activeTab.value.startsWith('group-')) {
+    const gi = parseInt(activeTab.value.replace('group-', ''))
+    return manualGroups.value[gi]?.servers?.length || 0
+  }
+  return 0
+})
+
+const nodeTotalPages = computed(() => Math.max(1, Math.ceil(currentNodeTotal.value / NODE_PAGE_SIZE)))
+
+watch(currentNodeTotal, () => {
+  if (nodePage.value > nodeTotalPages.value) {
+    nodePage.value = nodeTotalPages.value
+    ensureActiveTabNodes()
+  }
+})
+
+async function changeNodePage(page) {
+  nodePage.value = Math.min(Math.max(1, page), nodeTotalPages.value)
+  clearSortOrder()
+  selectedRefs.value = []
+  await ensureActiveTabNodes()
+}
+
+function clearSortOrder() {
+  sortKey.value = ''
+  sortDir.value = ''
+  sortRanks.value = null
+}
+
+watch(isSearching, clearSortOrder)
 
 // 当前 tab 是否可批量删除（只有手动分组可删）
 const canBulkRemove = computed(() => {
@@ -1070,15 +1157,18 @@ async function pingRefsWithProgress(refs, mode = 'fast') {
         if (!ref) return
         const key = refKey({ type: ref.type, index: ref.index, sub: ref.sub || 0 })
         if (evt === 'running') {
-          pingStates.value[key] = { status: 'running' }
+          schedulePingFlush(key, { status: 'running' })
         } else if (evt === 'done') {
           const lat = payload.latency
-          pingStates.value[key] = { status: 'done', latency: typeof lat === 'number' ? lat : -1 }
+          const latency = typeof lat === 'number' ? lat : -1
+          schedulePingFlush(key, { status: 'done', latency }, ref, { latency })
           pingProgress.value.done += 1
         }
       },
     })
+    flushPendingPingUpdates()
   } catch (e) {
+    flushPendingPingUpdates()
     if (e?.name === 'AbortError' || pingAbortController.value?.signal?.aborted) {
       pingAborted.value = true
       return
@@ -1099,8 +1189,6 @@ async function pingSelected(mode = 'fast') {
   pinging.value = true
   try {
     await pingRefsWithProgress(selectedRefs.value, mode)
-    // 测速只影响节点延迟
-    await Promise.all([store.fetchServers(), store.fetchSubscriptions()])
   } finally {
     pingAbortController.value = null
     pingProgress.value = { total: 0, done: 0, current: '' }
@@ -1110,18 +1198,32 @@ async function pingSelected(mode = 'fast') {
 }
 
 async function shareSelected() {
-  // 批量分享：逐个获取链接，拼成多行文本复制到剪贴板
-  const links = []
-  for (const ref of selectedRefs.value) {
+  const links = await mapWithConcurrency(selectedRefs.value, async (ref) => {
     try {
       const { data } = await api.getServerLink(ref.type, ref.index, ref.sub || 0)
-      if (data.link) links.push(data.link)
-    } catch {}
+      return data.link || ''
+    } catch {
+      return ''
+    }
+  }, 8)
+  const available = links.filter(Boolean)
+  if (available.length) {
+    await navigator.clipboard.writeText(available.join('\n'))
+    alert(`已复制 ${available.length} 个节点链接到剪贴板`)
   }
-  if (links.length) {
-    await navigator.clipboard.writeText(links.join('\n'))
-    alert(`已复制 ${links.length} 个节点链接到剪贴板`)
-  }
+}
+
+async function mapWithConcurrency(items, worker, concurrency) {
+  const results = new Array(items.length)
+  let cursor = 0
+  const runners = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor++
+      results[index] = await worker(items[index])
+    }
+  })
+  await Promise.all(runners)
+  return results
 }
 
 async function removeSelected() {
@@ -1130,13 +1232,19 @@ async function removeSelected() {
   if (activeTab.value.startsWith('group-')) {
     const gi = parseInt(activeTab.value.replace('group-', ''))
     const group = manualGroups.value[gi]
-    for (const ref of selectedRefs.value) {
-      await api.removeServerFromGroup(realGroupIndex(group), ref)
+    const groupIndex = realGroupIndex(group)
+    const refs = [...selectedRefs.value]
+    const removeKeys = new Set(refs.map(refKey))
+    store.patchGroup({ ...group, servers: (group.servers || []).filter(ref => !removeKeys.has(refKey(ref))) })
+    try {
+      const { data } = await api.removeServersFromGroup(groupIndex, refs)
+      store.patchGroup(data.group)
+    } catch (error) {
+      store.patchGroup(group)
+      throw error
     }
   }
   selectedRefs.value = []
-  // 删除只影响分组数据
-  await store.fetchGroups()
 }
 
 function openNodeMenu(mode, refObj, server) {
@@ -1146,55 +1254,72 @@ function openNodeMenu(mode, refObj, server) {
 }
 
 let searchTimer = null
+let searchAbortController = null
 async function onSearch() {
   if (!searchQuery.value.trim()) {
+    searchAbortController?.abort()
     isSearching.value = false
     searchResults.value = []
     return
   }
   clearTimeout(searchTimer)
   searchTimer = setTimeout(async () => {
+    searchAbortController?.abort()
+    searchAbortController = new AbortController()
+    const query = searchQuery.value.trim()
     isSearching.value = true
     try {
-      const { data } = await api.searchServers(searchQuery.value.trim())
+      const { data } = await api.searchServers(query, 100, searchAbortController.signal)
+      if (searchQuery.value.trim() !== query) return
       searchResults.value = data.results || []
-    } catch {
+    } catch (error) {
+      if (error?.code === 'ERR_CANCELED') return
       searchResults.value = []
     }
   }, 300)
 }
 
-const manualServers = computed(() =>
-  store.servers.filter(s => !s.source || s.source === 'manual')
-)
-const manualRefs = computed(() =>
-  manualServers.value.map((_, i) => ({
-    type: 'server',
-    index: store.servers.indexOf(manualServers.value[i]),
-    sub: 0
-  }))
-)
-const manualGroups = computed(() => {
-  const groups = store.groups.filter(g => !g.fromSub)
-  // 分离 SERVER 分组和其他分组
-  const serverGroup = groups.find(g => g.name === 'SERVER')
-  const otherGroups = groups.filter(g => g.name !== 'SERVER')
-  // 其他分组按创建时间排序
-  otherGroups.sort((a, b) => {
-    const timeA = new Date(a.createdAt || 0).getTime()
-    const timeB = new Date(b.createdAt || 0).getTime()
-    return timeA - timeB
-  })
-  // SERVER 分组始终排在最前
-  return serverGroup ? [serverGroup, ...otherGroups] : otherGroups
-})
-
 // tab 数量变化后要重算溢出状态（须在 manualGroups 定义之后注册，watch 的 getter 会立即求值）
 watch(
   () => [manualGroups.value.length, store.subscriptions.length],
   async () => {
+    await ensureActiveTabNodes()
     await nextTick()
     updateTabScrollState()
+  }
+)
+
+watch(
+  () => outboundSelectionVersion.value,
+  (version) => {
+    if (!version) return
+    const outboundName = currentOutbound?.value || 'proxy'
+    const outbound = store.outbounds.find(item => item.name === outboundName)
+    const target = outbound?.target
+    if (!target?.targetType) return
+
+    if (target.targetType === 'group' && target.groupId) {
+      const groupIndex = manualGroups.value.findIndex(group => group.id === target.groupId)
+      if (groupIndex >= 0) activeTab.value = 'group-' + groupIndex
+      return
+    }
+
+    if (target.targetType === 'node' && target.nodeRef) {
+      const ref = target.nodeRef
+      if (ref.type === 'sub_server') {
+        const subscriptionIndex = Number(ref.sub || 0)
+        if (subscriptionIndex >= 0 && subscriptionIndex < store.subscriptions.length) {
+          activeTab.value = 'sub-' + subscriptionIndex
+        }
+        return
+      }
+      if (ref.type === 'server') {
+        const groupIndex = manualGroups.value.findIndex(group =>
+          (group.servers || []).some(item => item.type === 'server' && item.index === ref.index)
+        )
+        if (groupIndex >= 0) activeTab.value = 'group-' + groupIndex
+      }
+    }
   }
 )
 
@@ -1226,10 +1351,7 @@ async function switchToGroupMode() {
     groupId: group.id,
     mode: 'leastping',
   })
-  // 只刷新出站数据
-  await store.fetchOutbounds()
-  // 刷新代理状态，因为 connectOutbound 可能会触发 Restart
-  await store.fetchStatus()
+  await Promise.all([store.fetchOutbounds(), store.fetchStatus()])
 }
 
 function realGroupIndex(group) {
@@ -1245,7 +1367,7 @@ function getGroupServers(group) {
 }
 
 function getGroupServerEntries(group) {
-  return (group.servers || []).map(ref => {
+  return getGroupPageRefs(group).map(ref => {
     if (ref.type === 'server') return { ref, server: store.servers[ref.index] }
     const sub = store.subscriptions[ref.sub]
     return { ref, server: sub?.servers?.[ref.index] }
@@ -1257,10 +1379,24 @@ function getSortedGroupEntries(group) {
 }
 
 function getSubServerEntries(sub, si) {
-  return (sub?.servers || []).map((server, index) => ({
-    ref: { type: 'sub_server', index, sub: si },
-    server,
-  }))
+  const start = (nodePage.value - 1) * NODE_PAGE_SIZE
+  const end = Math.min(start + NODE_PAGE_SIZE, Number(sub?.serverCount || 0))
+  const entries = []
+  for (let index = start; index < end; index += 1) {
+    const server = sub?.servers?.[index]
+    if (server) entries.push({ ref: { type: 'sub_server', index, sub: si }, server })
+  }
+  return entries
+}
+
+function getGroupPageRefs(group) {
+  const start = (nodePage.value - 1) * NODE_PAGE_SIZE
+  return (group?.servers || []).slice(start, start + NODE_PAGE_SIZE)
+}
+
+function getSubscriptionRefs(si) {
+  const total = Number(store.subscriptions[si]?.serverCount || 0)
+  return Array.from({ length: total }, (_, index) => ({ type: 'sub_server', index, sub: si }))
 }
 
 function getSortedSubEntries(sub, si) {
@@ -1276,6 +1412,31 @@ const filteredSelectableServers = computed(() => {
     (s.name || '').toLowerCase().includes(q) ||
     (s.host || '').toLowerCase().includes(q)
   )
+})
+
+let addSearchTimer = null
+let addSearchAbortController = null
+watch(addSearch, (raw) => {
+  clearTimeout(addSearchTimer)
+  addSearchAbortController?.abort()
+  selectedAddIdx.value = -1
+  const query = raw.trim()
+  if (!query) {
+    selectableServers.value = []
+    return
+  }
+  addSearchTimer = setTimeout(async () => {
+    addSearchAbortController = new AbortController()
+    try {
+      const { data } = await api.searchServers(query, 100, addSearchAbortController.signal)
+      if (addSearch.value.trim() !== query) return
+      selectableServers.value = (data.results || []).map(item => ({ ...item.server, _ref: item.ref }))
+    } catch (error) {
+      if (error?.code === 'ERR_CANCELED') return
+      if (addSearch.value.trim() !== query) return
+      selectableServers.value = []
+    }
+  }, 250)
 })
 
 function formatTime(t) {
@@ -1301,16 +1462,11 @@ async function connectNode(ref) {
   } else {
     await api.connectOutbound(currentOutbound.value, { targetType: 'node', nodeRef: { type: ref.type, index: ref.index, sub: ref.sub || 0 } })
   }
-  // 只刷新出站数据，不需要拉取订阅、分组等
-  await store.fetchOutbounds()
-  // 刷新代理状态，因为 connectOutbound 可能会触发 Restart
-  await store.fetchStatus()
+  await Promise.all([store.fetchOutbounds(), store.fetchStatus()])
 }
 
 async function pingSingleNode(ref) {
-  await api.pingNodes([{ type: ref.type, index: ref.index, sub: ref.sub || 0 }], 'fast')
-  // 测速只影响节点延迟，只刷新服务器和订阅数据
-  await Promise.all([store.fetchServers(), store.fetchSubscriptions()])
+  await pingRefsWithProgress([{ type: ref.type, index: ref.index, sub: ref.sub || 0 }], 'fast')
 }
 
 async function pingCurrentTab(mode = 'fast') {
@@ -1321,9 +1477,7 @@ async function pingCurrentTab(mode = 'fast') {
     if (activeTab.value.startsWith('sub-')) {
       const si = parseInt(activeTab.value.replace('sub-', ''))
       const sub = store.subscriptions[si]
-      if (sub?.servers?.length) {
-        refs = sub.servers.map((_, i) => ({ type: 'sub_server', index: i, sub: si }))
-      }
+      refs = getSubscriptionRefs(si)
       group = store.groups.find(g => g.id === sub?.groupId) || null
     } else if (activeTab.value.startsWith('group-')) {
       const gi = parseInt(activeTab.value.replace('group-', ''))
@@ -1335,8 +1489,6 @@ async function pingCurrentTab(mode = 'fast') {
     if (refs.length && group && !pingAborted.value) {
       await applyGroupSwitchAfterPing(group, mode)
     }
-    // 测速只影响节点延迟，只刷新服务器和订阅数据
-    await Promise.all([store.fetchServers(), store.fetchSubscriptions()])
   } finally {
     pingAbortController.value = null
     pingProgress.value = { total: 0, done: 0, current: '' }
@@ -1362,8 +1514,7 @@ async function detectIPTypeForCurrentTab() {
   let refs = []
   if (activeTab.value.startsWith('sub-')) {
     const si = parseInt(activeTab.value.replace('sub-', ''))
-    const sub = store.subscriptions[si]
-    refs = (sub?.servers || []).map((_, i) => ({ type: 'sub_server', index: i, sub: si }))
+    refs = getSubscriptionRefs(si)
   } else if (activeTab.value.startsWith('group-')) {
     const gi = parseInt(activeTab.value.replace('group-', ''))
     const group = manualGroups.value[gi]
@@ -1381,8 +1532,7 @@ async function detectIPTypeForRefs(refs) {
   ipTypeStates.value = states
   try {
     await api.detectServerIPType(queue)
-    // IP 类型检测只影响节点的 ipType 字段，只刷新服务器和订阅数据
-    await Promise.all([store.fetchServers(), store.fetchSubscriptions()])
+    await store.fetchNodes(queue)
   } catch (e) {
     console.error('IP 类型检测失败', e)
   } finally {
@@ -1396,8 +1546,7 @@ async function scoreIPForCurrentTab() {
   let refs = []
   if (activeTab.value.startsWith('sub-')) {
     const si = parseInt(activeTab.value.replace('sub-', ''))
-    const sub = store.subscriptions[si]
-    refs = (sub?.servers || []).map((_, i) => ({ type: 'sub_server', index: i, sub: si }))
+    refs = getSubscriptionRefs(si)
   } else if (activeTab.value.startsWith('group-')) {
     const gi = parseInt(activeTab.value.replace('group-', ''))
     const group = manualGroups.value[gi]
@@ -1439,16 +1588,16 @@ function stopIPScorePoll() {
 async function pollIPScore() {
   try {
     const { data } = await api.getIPScoreStatus()
+    const state = data.state || data
     const wasRunning = ipScoreTask.value.running
-    ipScoreTask.value = data
-    if (!data.running) {
+    ipScoreTask.value = state
+    if (!state.running) {
       stopIPScorePoll()
       ipScoringRefs.value = {}
-      // IP 评分只影响节点的 ipScore 字段，只刷新服务器和订阅数据
-      await Promise.all([store.fetchServers(), store.fetchSubscriptions()])
+      await store.fetchNodes(state.refs || [])
       if (wasRunning) {
-        const failed = data.failed ? `，${data.failed} 个失败` : ''
-        showNotice(`IP 评分完成：成功 ${Math.max(data.done - data.failed, 0)}/${data.total}${failed}。`)
+        const failed = state.failed ? `，${state.failed} 个失败` : ''
+        showNotice(`IP 评分完成：成功 ${Math.max(state.done - state.failed, 0)}/${state.total}${failed}。`)
       }
     }
   } catch (e) {
@@ -1479,8 +1628,9 @@ async function removeFromGroup(groupIndex, ref) {
 
 async function refreshSub(si) {
   await api.refreshSubscription(si)
-  // 刷新订阅只影响订阅数据
-  await store.fetchSubscriptions()
+  store.invalidateSubscriptions()
+  await store.fetchSubscriptions(false, true)
+  await ensureActiveTabNodes()
 }
 
 function openEditSub(si) {
@@ -1499,15 +1649,16 @@ async function saveEditSub() {
   if (editSubIdx.value < 0) return
   await api.updateSubscription(editSubIdx.value, editSubForm.value)
   editSubIdx.value = -1
-  // 只刷新订阅数据
-  await store.fetchSubscriptions()
+  store.invalidateSubscriptions()
+  await store.fetchSubscriptions(false, true)
 }
 
 async function deleteSub(si) {
   await api.deleteSubscription(si)
   activeTab.value = 'group-0'
+  store.invalidateSubscriptions()
   // 删除订阅需要刷新订阅和分组数据
-  await Promise.all([store.fetchSubscriptions(), store.fetchGroups()])
+  await Promise.all([store.fetchSubscriptions(false, true), store.fetchGroups()])
 }
 
 async function deleteGroup(gi) {
@@ -1546,13 +1697,7 @@ async function openAddToGroup(gi) {
   showAddToGroup.value = gi
   selectedAddIdx.value = -1
   addSearch.value = ''
-  const [sRes, subRes] = await Promise.all([api.getServers(), api.getSubscriptions()])
-  const result = []
-  ;(sRes.data.servers || []).forEach((s, i) => result.push({ ...s, _ref: { type: 'server', index: i, sub: 0 } }))
-  ;(subRes.data.subscriptions || []).forEach((sub, si) => {
-    ;(sub.servers || []).forEach((s, i) => result.push({ ...s, _ref: { type: 'sub_server', index: i, sub: si } }))
-  })
-  selectableServers.value = result
+  selectableServers.value = []
 }
 
 async function confirmAddToGroup() {
@@ -1568,14 +1713,12 @@ async function confirmAddToGroup() {
 
 async function confirmBulkCopy() {
   if (!bulkCopyGroupId.value || !selectedRefs.value.length) return
-  for (const ref of selectedRefs.value) {
-    await api.copyServerToGroup(ref, bulkCopyGroupId.value)
-  }
+  const { data } = await api.batchCopyServersToGroup(selectedRefs.value, bulkCopyGroupId.value)
+  store.patchGroup(data.group)
   showBulkCopyModal.value = false
   bulkCopyGroupId.value = ''
   selectedRefs.value = []
-  // 复制节点需要刷新分组和服务器数据
-  await Promise.all([store.fetchGroups(), store.fetchServers()])
+  await ensureActiveTabNodes()
 }
 
 // 移动到分组（从当前分组移除，加入目标分组）
@@ -1589,23 +1732,16 @@ const singleTargetGroupId = ref('')
 
 async function confirmBulkMove() {
   if (!bulkMoveGroupId.value || !selectedRefs.value.length) return
-  // 先复制到目标分组
-  for (const ref of selectedRefs.value) {
-    await api.copyServerToGroup(ref, bulkMoveGroupId.value, false)
-  }
-  // 再从当前分组移除
-  if (activeTab.value.startsWith('group-')) {
-    const gi = parseInt(activeTab.value.replace('group-', ''))
-    const group = manualGroups.value[gi]
-    for (const ref of selectedRefs.value) {
-      await api.removeServerFromGroup(realGroupIndex(group), ref)
-    }
-  }
+  if (!activeTab.value.startsWith('group-')) return
+  const gi = parseInt(activeTab.value.replace('group-', ''))
+  const group = manualGroups.value[gi]
+  const { data } = await api.batchMoveServersToGroup(selectedRefs.value, group.id, bulkMoveGroupId.value)
+  store.patchGroup(data.sourceGroup)
+  store.patchGroup(data.targetGroup)
   showBulkMoveModal.value = false
   bulkMoveGroupId.value = ''
   selectedRefs.value = []
-  // 移动节点需要刷新分组和服务器数据
-  await Promise.all([store.fetchGroups(), store.fetchServers()])
+  await ensureActiveTabNodes()
 }
 
 function openSingleCopy(ref) {
@@ -1624,8 +1760,8 @@ async function confirmSingleCopy() {
   if (!singleTargetGroupId.value || !singleCopyRef.value) return
   await api.copyServerToGroup(singleCopyRef.value, singleTargetGroupId.value)
   showSingleCopyModal.value = false
-  // 复制节点需要刷新分组和服务器数据
-  await Promise.all([store.fetchGroups(), store.fetchServers()])
+  await store.fetchGroups()
+  await ensureActiveTabNodes()
 }
 
 async function confirmSingleMove() {
@@ -1638,8 +1774,8 @@ async function confirmSingleMove() {
     await api.removeServerFromGroup(realGroupIndex(group), singleMoveRef.value)
   }
   showSingleMoveModal.value = false
-  // 移动节点需要刷新分组和服务器数据
-  await Promise.all([store.fetchGroups(), store.fetchServers()])
+  await store.fetchGroups()
+  await ensureActiveTabNodes()
 }</script>
 
 <style scoped>
@@ -1930,6 +2066,7 @@ async function confirmSingleMove() {
 }
 .info-time { font-size: 11px; color: #bfbfbf; white-space: nowrap; }
 .info-count { font-size: 12px; color: #8c8c8c; }
+.node-pagination { display:flex; align-items:center; justify-content:center; gap:12px; padding:10px 12px; color:#666; font-size:12px; border-top:1px solid #eee; }
 .group-name-display { font-size: 14px; font-weight: 600; color: #262626; }
 
 /* 空状态 */

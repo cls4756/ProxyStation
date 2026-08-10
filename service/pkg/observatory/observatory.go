@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ProxyStation/proxystation/core/engine"
@@ -21,6 +22,8 @@ import (
 const (
 	defaultProbeIntervalSec = 300
 	defaultSwitchThreshold  = 100
+	// minProbeInterval 测速任务的最小间隔，与界面上的提示保持一致
+	minProbeInterval = 10 * time.Second
 )
 
 // Observatory 管理所有出站的测速任务
@@ -46,8 +49,17 @@ var global = &Observatory{
 	stopCh: make(chan struct{}),
 }
 
-// 串行化真连接探测，避免隐藏探测出站互相覆盖。
-var probeCoreMu sync.Mutex
+var nodeMetadataEnricher func([]configure.NodeRef)
+
+// SetNodeMetadataEnricher registers the server-side metadata completion hook.
+func SetNodeMetadataEnricher(enricher func([]configure.NodeRef)) {
+	nodeMetadataEnricher = enricher
+}
+
+// 独立探测实例的端口在 [基址+1, 基址+probePortSpan] 内轮转，避免并发碰撞。
+const probePortSpan = 64
+
+var probePortCounter uint32
 var switchStateMu sync.Mutex
 var lastSwitchAt = map[string]time.Time{}
 var pendingBestCopyMu sync.Mutex
@@ -74,6 +86,7 @@ func Start() {
 			continue
 		}
 		if o.Target.TargetType == "group" {
+			ensureOutboundSwitchSettings(name, o)
 			global.startTask(name, o)
 		}
 	}
@@ -108,6 +121,7 @@ func OnOutboundUpdated(name string) {
 
 	o := configure.GetOutbound(name)
 	if o != nil && o.Target.TargetType == "group" {
+		ensureOutboundSwitchSettings(name, o)
 		global.startTask(name, o)
 	}
 }
@@ -135,13 +149,23 @@ func OnGroupUpdated(groupID string) {
 	}
 }
 
-func (obs *Observatory) startTask(name string, o *configure.Outbound) {
+// resolveTaskInterval 优先用出站自己配置的探测间隔，非法或缺失时回退到设置里的默认值。
+// 过小的间隔会让测速任务一直占着内核，所以钳到 minProbeInterval。
+func resolveTaskInterval(raw string) time.Duration {
 	interval := resolveProbeInterval()
-	if o.ProbeInterval != "" {
-		if d, err := time.ParseDuration(o.ProbeInterval); err == nil && d > 0 {
+	if raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
 			interval = d
 		}
 	}
+	if interval < minProbeInterval {
+		interval = minProbeInterval
+	}
+	return interval
+}
+
+func (obs *Observatory) startTask(name string, o *configure.Outbound) {
+	interval := resolveTaskInterval(o.ProbeInterval)
 
 	task := &probeTask{
 		outboundName: name,
@@ -183,6 +207,11 @@ func selectBestNodeFromExisting(outboundName string, o *configure.Outbound) {
 		return
 	}
 
+	// 已有活跃节点时交给统一切换判定处理，避免重启任务时绕过阈值直接切换。
+	if o.Target.ActiveNodeRef != nil && groupContainsRef(group.Servers, *o.Target.ActiveNodeRef) {
+		return
+	}
+
 	var available []probeResult
 
 	for _, ref := range group.Servers {
@@ -202,6 +231,81 @@ func selectBestNodeFromExisting(outboundName string, o *configure.Outbound) {
 	}
 }
 
+// resolveProbeConcurrencyForMode 返回测速的并发实例数。fast 模式是纯 TCP 拨测、
+// 开销极低，用更高并发；real 模式每个节点起一个独立内核，用设置里的值（默认 4）。
+// mode 为空时回退到全局设置 GroupProbeMode。
+func resolveProbeConcurrencyForMode(mode string) int {
+	setting := configure.GetSettingNotNil()
+	if mode == "" {
+		mode = setting.GroupProbeMode
+	}
+	if mode == "fast" {
+		return 16
+	}
+	n := setting.GroupProbeConcurrency
+	if n < 1 || n > 8 {
+		n = 4
+	}
+	return n
+}
+
+// probeNodesConcurrent 并发测速一组节点，保持返回结果与输入顺序一致。
+// 每个 worker 独立处理一个节点：fast 模式走 TCP 拨测，real 模式起独立探测内核。
+func probeNodesConcurrent(refs []configure.NodeRef) []probeResult {
+	return probeNodesWithProgress(refs, "", nil, nil)
+}
+
+// ProbeProgressStart 在某个节点开始测速时回调，i 为其在 refs 中的索引。
+type ProbeProgressStart func(i int, ref configure.NodeRef)
+
+// ProbeProgressDone 在某个节点测速完成时回调，latency 为结果（-1 表示失败）。
+type ProbeProgressDone func(i int, ref configure.NodeRef, latency int)
+
+// ProbeNodesWithProgress 与 probeNodesConcurrent 相同的并发调度，额外在每个节点
+// 开始/完成时触发回调，供 HTTP 层推送 SSE 进度。mode 显式指定 fast/real（为空回退
+// 全局设置），并发上限由 resolveProbeConcurrencyForMode(mode) 控制，与定时任务、
+// 出站探测共用同一节流设置。onStart/onDone 可能被多个 worker 并发调用，调用方需
+// 自行保证回调内的并发安全。
+func ProbeNodesWithProgress(refs []configure.NodeRef, mode string, onStart ProbeProgressStart, onDone ProbeProgressDone) []probeResult {
+	return probeNodesWithProgress(refs, mode, onStart, onDone)
+}
+
+func probeNodesWithProgress(refs []configure.NodeRef, mode string, onStart ProbeProgressStart, onDone ProbeProgressDone) []probeResult {
+	results := make([]probeResult, len(refs))
+	if len(refs) == 0 {
+		return results
+	}
+	workers := resolveProbeConcurrencyForMode(mode)
+	if workers > len(refs) {
+		workers = len(refs)
+	}
+	var idx int64 = -1
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				i := int(atomic.AddInt64(&idx, 1))
+				if i >= len(refs) {
+					return
+				}
+				if onStart != nil {
+					onStart(i, refs[i])
+				}
+				latency := probeNodeByMode(refs[i], mode)
+				results[i] = probeResult{ref: refs[i], latency: latency}
+				saveLatency(refs[i], latency)
+				if onDone != nil {
+					onDone(i, refs[i], latency)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	return results
+}
+
 // probeAndUpdate 对出站绑定 Group 的所有节点测速，按阈值更新最优节点
 func probeAndUpdate(outboundName string) {
 	o := configure.GetOutbound(outboundName)
@@ -214,13 +318,12 @@ func probeAndUpdate(outboundName string) {
 		return
 	}
 
-	results := make([]probeResult, 0, len(group.Servers))
+	refs := make([]configure.NodeRef, 0, len(group.Servers))
 	for _, ref := range group.Servers {
-		nodeRef := configure.NodeRef{Type: ref.Type, Index: ref.Index, Sub: ref.Sub}
-		latency := probeNodeByDefaultMode(nodeRef)
-		results = append(results, probeResult{ref: nodeRef, latency: latency})
-		saveLatency(nodeRef, latency)
+		refs = append(refs, configure.NodeRef{Type: ref.Type, Index: ref.Index, Sub: ref.Sub})
 	}
+	// 出站绑定分组时可单独指定测速方式，为空才回退到设置里的默认测速方式
+	results := probeNodesWithProgress(refs, o.ProbeMode, nil, nil)
 
 	available := make([]probeResult, 0, len(results))
 	for _, r := range results {
@@ -253,7 +356,8 @@ func probeAndUpdate(outboundName string) {
 		addLog(fmt.Sprintf("✅ [%s] 当前已是最优节点 (%dms)，不切换", outboundName, best.latency))
 		return
 	}
-	ok, reason := shouldSwitch(outboundName, *current, available, best)
+	threshold, cooldown := resolveSwitchSettings(o)
+	ok, reason := shouldSwitchWithSettings(outboundName, o.Target.Mode, *current, available, best, threshold, cooldown)
 	if ok {
 		_ = configure.SetOutboundActiveNode(outboundName, &best.ref)
 		restartEngineIfRunning(outboundName)
@@ -264,18 +368,142 @@ func probeAndUpdate(outboundName string) {
 	}
 }
 
+// GroupSwitchOutcome 一次手动测速后，某个绑定该分组的出站的切换判定结果。
+type GroupSwitchOutcome struct {
+	Outbound  string `json:"outbound"`
+	Switched  bool   `json:"switched"`
+	Reason    string `json:"reason"`
+	ProbeMode string `json:"probeMode"`
+}
+
+// ApplyGroupProbeResults 在界面上手动测完一个分组后调用，按绑定该分组的出站各自的
+// 策略（手动/最低延迟/稳定优先）与阈值、冷却决定是否切换活跃节点。
+//
+// mode 是本次界面测速用的方式。出站的周期测速方式与之不同时直接跳过：两种方式的
+// 延迟口径不同（fast 只做 TCP 握手，real 走完整代理链路），拿 fast 的数字去和按
+// real 阈值调好的配置比较会导致误切换。
+func ApplyGroupProbeResults(groupID string, mode string) []GroupSwitchOutcome {
+	groupID = strings.TrimSpace(groupID)
+	if groupID == "" {
+		return nil
+	}
+	_, group := configure.GetGroupByID(groupID)
+	if group == nil {
+		return nil
+	}
+
+	mode = normalizeProbeMode(mode)
+	outcomes := make([]GroupSwitchOutcome, 0, 2)
+	switched := make([]string, 0, 2)
+	for _, name := range configure.GetOutboundNames() {
+		o := configure.GetOutbound(name)
+		if o == nil || o.Target.TargetType != "group" || o.Target.GroupID != groupID {
+			continue
+		}
+		outboundMode := normalizeProbeMode(o.ProbeMode)
+		if outboundMode != mode {
+			reason := fmt.Sprintf("本次为%s，出站绑定的测速方式是%s，不参与切换判定",
+				probeModeLabel(mode), probeModeLabel(outboundMode))
+			addLog(fmt.Sprintf("⏸ [%s] 不切换：%s", name, reason))
+			outcomes = append(outcomes, GroupSwitchOutcome{Outbound: name, Reason: reason, ProbeMode: outboundMode})
+			continue
+		}
+
+		ok, reason := applyOutboundSwitch(name, o, group)
+		if ok {
+			switched = append(switched, name)
+		}
+		outcomes = append(outcomes, GroupSwitchOutcome{
+			Outbound:  name,
+			Switched:  ok,
+			Reason:    reason,
+			ProbeMode: outboundMode,
+		})
+	}
+	// 多个出站可能绑定同一分组，重启内核只做一次
+	if len(switched) > 0 {
+		restartEngineIfRunning(strings.Join(switched, ", "))
+	}
+	return outcomes
+}
+
+// applyOutboundSwitch 复用周期测速的切换判定，但延迟取自存储里刚写回的测速结果，
+// 因此不会重新发起探测。
+func applyOutboundSwitch(name string, o *configure.Outbound, group *configure.Group) (bool, string) {
+	available := make([]probeResult, 0, len(group.Servers))
+	for _, ref := range group.Servers {
+		nodeRef := configure.NodeRef{Type: ref.Type, Index: ref.Index, Sub: ref.Sub}
+		if latency := readLatency(nodeRef); latency > 0 {
+			available = append(available, probeResult{ref: nodeRef, latency: latency})
+		}
+	}
+	if len(available) == 0 {
+		reason := "分组内无可用节点，保持当前节点"
+		addLog(fmt.Sprintf("🔎 [%s] %s", name, reason))
+		return false, reason
+	}
+	sort.Slice(available, func(i, j int) bool {
+		return available[i].latency < available[j].latency
+	})
+	best := available[0]
+
+	current := o.Target.ActiveNodeRef
+	if current == nil {
+		_ = configure.SetOutboundActiveNode(name, &best.ref)
+		markSwitched(name)
+		reason := fmt.Sprintf("初次选择为 %dms 的节点", best.latency)
+		addLog(fmt.Sprintf("🔁 [%s] 切换节点：%s", name, reason))
+		return true, reason
+	}
+	if nodeRefEqual(current, &best.ref) {
+		reason := fmt.Sprintf("当前已是最优节点（%dms）", best.latency)
+		addLog(fmt.Sprintf("✅ [%s] %s，不切换", name, reason))
+		return false, reason
+	}
+
+	threshold, cooldown := resolveSwitchSettings(o)
+	ok, reason := shouldSwitchWithSettings(name, o.Target.Mode, *current, available, best, threshold, cooldown)
+	if !ok {
+		addLog(fmt.Sprintf("⏸ [%s] 不切换：%s", name, reason))
+		return false, reason
+	}
+	_ = configure.SetOutboundActiveNode(name, &best.ref)
+	markSwitched(name)
+	addLog(fmt.Sprintf("🔁 [%s] 切换节点：%s:%d:%d -> %s:%d:%d（%dms）",
+		name, current.Type, current.Sub, current.Index, best.ref.Type, best.ref.Sub, best.ref.Index, best.latency))
+	return true, reason
+}
+
+// normalizeProbeMode 把空值折叠成设置里的默认测速方式，让「未配置」和「配置成默认值」
+// 在比较时等价。
+func normalizeProbeMode(mode string) string {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode != "fast" && mode != "real" {
+		mode = configure.GetSettingNotNil().GroupProbeMode
+	}
+	if mode != "fast" {
+		return "real"
+	}
+	return "fast"
+}
+
+func probeModeLabel(mode string) string {
+	if mode == "fast" {
+		return "快速测速"
+	}
+	return "真连接测速"
+}
+
 func probeGroupLatency(groupID string) {
 	_, group := configure.GetGroupByID(groupID)
 	if group == nil {
 		return
 	}
-	results := make([]probeResult, 0, len(group.Servers))
+	refs := make([]configure.NodeRef, 0, len(group.Servers))
 	for _, ref := range group.Servers {
-		nodeRef := configure.NodeRef{Type: ref.Type, Index: ref.Index, Sub: ref.Sub}
-		latency := probeNodeByDefaultMode(nodeRef)
-		saveLatency(nodeRef, latency)
-		results = append(results, probeResult{ref: nodeRef, latency: latency})
+		refs = append(refs, configure.NodeRef{Type: ref.Type, Index: ref.Index, Sub: ref.Sub})
 	}
+	results := probeNodesConcurrent(refs)
 	copyNodesByRules(groupID, results)
 }
 
@@ -350,6 +578,7 @@ func copyNodesToGroup(sourceGroupID, targetGroupID string, picked []probeResult)
 	}
 
 	copied := 0
+	copiedRefs := make([]configure.NodeRef, 0, len(picked))
 	for _, r := range picked {
 		server := serverRawByRef(r.ref)
 		if server == nil {
@@ -363,6 +592,7 @@ func copyNodesToGroup(sourceGroupID, targetGroupID string, picked []probeResult)
 			continue
 		}
 		targetGroup.Servers = append(targetGroup.Servers, localRef)
+		copiedRefs = append(copiedRefs, configure.NodeRef{Type: localRef.Type, Index: localRef.Index, Sub: localRef.Sub})
 		copied++
 	}
 	if copied == 0 {
@@ -373,6 +603,9 @@ func copyNodesToGroup(sourceGroupID, targetGroupID string, picked []probeResult)
 		return
 	}
 	addLog(fmt.Sprintf("📋 已复制 %d 个节点到分组：%s -> %s", copied, sourceGroupID, targetGroup.Name))
+	if nodeMetadataEnricher != nil {
+		nodeMetadataEnricher(copiedRefs)
+	}
 }
 
 func containsGroupID(ids []string, target string) bool {
@@ -393,8 +626,6 @@ func ensureLocalCopy(server configure.ServerRaw) (configure.ServerRef, bool) {
 	}
 
 	server.Source = "manual"
-	server.Latency = -1
-	server.LastProbeTime = 0
 	index := len(servers)
 	if err := configure.AppendServers([]*configure.ServerRaw{&server}); err != nil {
 		addLog(fmt.Sprintf("⚠️ 创建本地节点副本失败：%v", err))
@@ -437,6 +668,8 @@ func sameServer(a, b configure.ServerRaw) bool {
 		strings.TrimSpace(a.Name) == strings.TrimSpace(b.Name)
 }
 
+// resolveProbeInterval 是出站未设置 ProbeInterval 时的兜底间隔。绑定分组时界面会把
+// 设置里的值预填成出站自己的间隔，所以正常情况下走的是出站级配置，这里只兜历史数据。
 func resolveProbeInterval() time.Duration {
 	setting := configure.GetSettingNotNil()
 	sec := setting.GroupRealProbeIntervalSec
@@ -462,7 +695,51 @@ func resolveSwitchCooldown() time.Duration {
 	return time.Duration(setting.GroupSwitchCooldownSec) * time.Second
 }
 
-func shouldSwitch(outboundName string, current configure.NodeRef, available []probeResult, best probeResult) (bool, string) {
+func resolveSwitchSettings(o *configure.Outbound) (int, time.Duration) {
+	if o == nil || o.SwitchThresholdMs == nil || o.SwitchCooldownSec == nil {
+		return resolveSwitchThreshold(), resolveSwitchCooldown()
+	}
+	threshold := *o.SwitchThresholdMs
+	if threshold < 0 {
+		threshold = 0
+	}
+	cooldown := time.Duration(*o.SwitchCooldownSec) * time.Second
+	if cooldown < 0 {
+		cooldown = 0
+	}
+	return threshold, cooldown
+}
+
+// ensureOutboundSwitchSettings 给缺失的切换参数补上默认值并落库。
+// name 必须由调用方传入：存量记录的 Name 字段可能为空，而 SetOutbound 会把空名字
+// 归一成 "proxy"，用 o.Name 落库会把本出站的配置整个写进默认出站。
+func ensureOutboundSwitchSettings(name string, o *configure.Outbound) {
+	if o == nil || o.Target.TargetType != "group" {
+		return
+	}
+	if o.SwitchThresholdMs != nil && o.SwitchCooldownSec != nil {
+		return
+	}
+	threshold, cooldown := resolveSwitchThreshold(), int(resolveSwitchCooldown()/time.Second)
+	if o.SwitchThresholdMs == nil {
+		o.SwitchThresholdMs = &threshold
+	}
+	if o.SwitchCooldownSec == nil {
+		o.SwitchCooldownSec = &cooldown
+	}
+	if o.Name == "" {
+		o.Name = name
+	}
+	_ = configure.SetOutbound(name, o)
+}
+
+func shouldSwitch(outboundName string, mode configure.SelectionMode, current configure.NodeRef, available []probeResult, best probeResult) (bool, string) {
+	threshold := resolveSwitchThreshold()
+	cooldown := resolveSwitchCooldown()
+	return shouldSwitchWithSettings(outboundName, mode, current, available, best, threshold, cooldown)
+}
+
+func shouldSwitchWithSettings(outboundName string, mode configure.SelectionMode, current configure.NodeRef, available []probeResult, best probeResult, threshold int, cooldown time.Duration) (bool, string) {
 	currentLatency := -1
 	for _, item := range available {
 		if nodeRefEqual(&current, &item.ref) {
@@ -471,13 +748,21 @@ func shouldSwitch(outboundName string, current configure.NodeRef, available []pr
 		}
 	}
 	if currentLatency <= 0 {
+		if mode == configure.ModeManual {
+			return false, "手动指定：当前节点不可用，但不会自动切换"
+		}
 		return true, "当前节点无有效延迟，允许切换"
 	}
-	threshold := resolveSwitchThreshold()
+	if mode == configure.ModeManual {
+		return false, fmt.Sprintf("手动指定：当前节点仍连通（%dms），不自动切换", currentLatency)
+	}
+	// 稳定优先：当前节点连通就不切换，延迟高也不动，只有掉线才会走到上面的分支
+	if mode == configure.ModeStable {
+		return false, fmt.Sprintf("稳定优先：当前节点仍连通（%dms），不主动切换", currentLatency)
+	}
 	if (currentLatency - best.latency) < threshold {
 		return false, fmt.Sprintf("延迟差值不足（当前 %dms，最优 %dms，阈值 %dms）", currentLatency, best.latency, threshold)
 	}
-	cooldown := resolveSwitchCooldown()
 	if cooldown <= 0 {
 		return true, "满足阈值且未设置冷却"
 	}
@@ -502,6 +787,15 @@ func markSwitched(outboundName string) {
 	switchStateMu.Lock()
 	lastSwitchAt[outboundName] = time.Now()
 	switchStateMu.Unlock()
+}
+
+func groupContainsRef(refs []configure.ServerRef, target configure.NodeRef) bool {
+	for _, ref := range refs {
+		if ref.Type == target.Type && ref.Index == target.Index && ref.Sub == target.Sub {
+			return true
+		}
+	}
+	return false
 }
 
 func nodeRefEqual(a, b *configure.NodeRef) bool {
@@ -530,29 +824,35 @@ func readLatency(ref configure.NodeRef) int {
 	}
 }
 
-func probeNodeViaCore(ref configure.NodeRef) int {
-	probeCoreMu.Lock()
-	defer probeCoreMu.Unlock()
+func allocProbePort() int {
+	n := atomic.AddUint32(&probePortCounter, 1)
+	return engine.ProbeInboundSocksPort + int(n%probePortSpan) + 1
+}
 
-	if !engine.Manager.IsRunning() {
-		return -1
-	}
+func probeNodeViaCore(ref configure.NodeRef) int {
 	if !fastReachableRef(ref) {
 		return -1
 	}
-	if err := ensureProbeOutboundForNode(ref); err != nil {
+	s := serverRawByRef(ref)
+	if s == nil {
 		return -1
 	}
-	return probeViaCoreTargets()
+	socksPort := allocProbePort()
+	inst, err := engine.StartProbeInstance(s, socksPort)
+	if err != nil {
+		return -1
+	}
+	defer inst.Close()
+	return probeViaCoreTargets(socksPort)
 }
 
-func probeViaCoreTargets() int {
+func probeViaCoreTargets(socksPort int) int {
 	targets := parseProbeTargets(configure.GetSettingNotNil().ProbeTargets)
 	if len(targets) == 0 {
 		targets = []string{"www.gstatic.com", "www.google.com", "www.youtube.com", "cp.cloudflare.com", "example.com"}
 	}
 	for _, host := range targets {
-		if ms := probeViaCoreSocks(host, 4500*time.Millisecond); ms > 0 {
+		if ms := probeViaCoreSocks(host, socksPort, 4500*time.Millisecond); ms > 0 {
 			return ms
 		}
 	}
@@ -587,11 +887,16 @@ func probeNodeFast(ref configure.NodeRef) int {
 	return ms
 }
 
-func probeNodeByDefaultMode(ref configure.NodeRef) int {
-	if configure.GetSettingNotNil().GroupProbeMode == "fast" {
+// probeNodeByMode 按显式 mode 探测；mode 为空时回退全局设置 GroupProbeMode。
+func probeNodeByMode(ref configure.NodeRef, mode string) int {
+	if mode == "" {
+		mode = configure.GetSettingNotNil().GroupProbeMode
+	}
+	if mode == "fast" {
 		return probeNodeFast(ref)
 	}
-	return probeNodeDirect(ref)
+	// real 模式：经内核走完整代理链路做真连测试，仅 TCP 可达但无法真正代理的节点会被判定失败
+	return probeNodeViaCore(ref)
 }
 
 func serverRawByRef(ref configure.NodeRef) *configure.ServerRaw {
@@ -637,26 +942,6 @@ func fastReachableRef(ref configure.NodeRef) bool {
 	}
 }
 
-func ensureProbeOutboundForNode(ref configure.NodeRef) error {
-	_ = configure.AddOutbound(engine.ProbeOutboundName)
-	if cur := configure.GetOutbound(engine.ProbeOutboundName); cur != nil &&
-		cur.Target.TargetType == "node" && nodeRefEqual(cur.Target.NodeRef, &ref) {
-		return nil
-	}
-	o := &configure.Outbound{
-		Name: engine.ProbeOutboundName,
-		Target: configure.OutboundTarget{
-			TargetType: "node",
-			NodeRef:    &ref,
-		},
-	}
-	if err := configure.SetOutbound(engine.ProbeOutboundName, o); err != nil {
-		return err
-	}
-	OnOutboundUpdated(engine.ProbeOutboundName)
-	return engine.Manager.Restart()
-}
-
 func restartEngineIfRunning(outboundName string) {
 	if !engine.Manager.IsRunning() {
 		return
@@ -695,9 +980,9 @@ func parseProbeTargets(raw string) []string {
 	return out
 }
 
-func probeViaCoreSocks(host string, timeout time.Duration) int {
+func probeViaCoreSocks(host string, socksPort int, timeout time.Duration) int {
 	start := time.Now()
-	dialSocksProxy, err := xproxy.SOCKS5("tcp", net.JoinHostPort(engine.ProbeInboundListen, strconv.Itoa(engine.ProbeInboundSocksPort)), nil, xproxy.Direct)
+	dialSocksProxy, err := xproxy.SOCKS5("tcp", net.JoinHostPort(engine.ProbeInboundListen, strconv.Itoa(socksPort)), nil, xproxy.Direct)
 	if err != nil {
 		return -1
 	}
@@ -728,22 +1013,18 @@ func probeViaCoreSocks(host string, timeout time.Duration) int {
 // saveLatency 将测速结果写回存储
 func saveLatency(ref configure.NodeRef, latency int) {
 	now := time.Now().Unix()
+	apply := func(server *configure.ServerRaw) {
+		server.Latency = latency
+		server.LastProbeTime = now
+	}
+	var err error
 	switch ref.Type {
 	case "server":
-		s := configure.GetServer(ref.Index)
-		if s == nil {
-			return
-		}
-		s.Latency = latency
-		s.LastProbeTime = now
-		_ = configure.SetServer(ref.Index, s)
+		err = configure.UpdateServer(ref.Index, apply)
 	case "sub_server":
-		sub := configure.GetSubscription(ref.Sub)
-		if sub == nil || ref.Index >= len(sub.Servers) {
-			return
-		}
-		sub.Servers[ref.Index].Latency = latency
-		sub.Servers[ref.Index].LastProbeTime = now
-		_ = configure.SetSubscription(ref.Sub, sub)
+		err = configure.UpdateSubscriptionServer(ref.Sub, ref.Index, apply)
+	}
+	if err != nil {
+		addLog(fmt.Sprintf("⚠️ 保存节点测速结果失败（%s:%d:%d）：%v", ref.Type, ref.Sub, ref.Index, err))
 	}
 }

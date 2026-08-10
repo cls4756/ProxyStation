@@ -41,6 +41,11 @@
           ⚠ {{ startError }}
           <span style="cursor:pointer; margin-left:4px" @click="startError=''">✕</span>
         </span>
+        <span v-if="appInitializing" class="app-init-status">正在加载数据...</span>
+        <span v-else-if="appInitError" class="start-error" :title="appInitError">
+          ⚠ {{ appInitError }}
+          <span style="cursor:pointer; margin-left:4px" @click="initAuthenticatedApp">重试</span>
+        </span>
 
         <!-- 出站选择下拉 -->
         <div class="outbound-dropdown" v-if="store.outbounds.length">
@@ -66,6 +71,12 @@
                 </span>
               </span>
               <span class="dd-edit-btn" @click.stop="openOutboundEdit(o); showOutboundMenu = false" title="配置">⚙</span>
+              <span
+                v-if="o.name !== 'proxy'"
+                class="dd-edit-btn"
+                @click.stop="openOutboundRename(o); showOutboundMenu = false"
+                title="重命名"
+              >✏</span>
               <span
                 v-if="o.name !== 'proxy'"
                 class="dd-del-btn"
@@ -102,6 +113,31 @@
           </div>
         </div>
 
+        <!-- 重命名出站弹窗 -->
+        <div class="modal-overlay" v-if="renamingOutbound" @mousedown.self="closeOutboundRename">
+          <div class="modal-box" style="width:380px">
+            <div class="modal-header">
+              <span class="modal-title">重命名出站：{{ renamingOutbound }}</span>
+              <span class="modal-close" @click="closeOutboundRename">✕</span>
+            </div>
+            <div class="modal-body">
+              <div class="form-group">
+                <label class="form-label">新名称</label>
+                <input class="input" v-model="renameOutboundName" @keyup.enter="submitOutboundRename" autofocus />
+                <div class="form-tip">名称同时是内核配置里的出站标签，不能含空格或 / \ ? # % " ' `</div>
+                <div class="form-tip">引用了该出站的节点前置代理、订阅拉取代理与路由规则会一起更新</div>
+              </div>
+              <div class="form-tip" style="color:#f14668" v-if="renameOutboundError">{{ renameOutboundError }}</div>
+            </div>
+            <div class="modal-footer">
+              <button class="btn btn-light" @click="closeOutboundRename">取消</button>
+              <button class="btn btn-primary" :disabled="renamingOutboundBusy" @click="submitOutboundRename">
+                {{ renamingOutboundBusy ? '保存中...' : '保存' }}
+              </button>
+            </div>
+          </div>
+        </div>
+
         <!-- 配置出站弹窗 -->
         <div class="modal-overlay" v-if="editingOutbound" @mousedown.self="editingOutbound = null">
           <div class="modal-box" style="width:480px">
@@ -117,7 +153,7 @@
                     <input type="radio" v-model="outboundForm.targetType" value="node" /> 指定节点
                   </label>
                   <label style="display:flex; align-items:center; gap:6px; cursor:pointer; font-size:13px">
-                    <input type="radio" v-model="outboundForm.targetType" value="group" /> 指定分组（自动选优）
+                    <input type="radio" v-model="outboundForm.targetType" value="group" /> 指定分组
                   </label>
                 </div>
               </div>
@@ -127,7 +163,7 @@
                   <select class="input" v-model="outboundForm.nodeKey">
                     <option value="">-- 请选择 --</option>
                     <optgroup label="手动节点">
-                      <option v-for="(s, i) in editServers" :key="`s-${i}`" :value="`server:${i}:0`">
+                      <option v-for="(s, i) in editServers" :key="`s-${s._index ?? i}`" :value="`server:${s._index ?? i}:0`">
                         [{{ s.type }}] {{ s.name || '未命名' }} — {{ s.host }}:{{ s.port }}
                       </option>
                     </optgroup>
@@ -149,16 +185,55 @@
                     </option>
                   </select>
                 </div>
+                <div class="form-group" v-if="outboundForm.groupId">
+                  <label class="form-label">分组节点</label>
+                  <select class="input" v-model="outboundForm.activeNodeKey">
+                    <option value="">自动选择（按策略）</option>
+                    <option v-for="ref in groupNodeOptions" :key="nodeKeyForRef(ref)" :value="nodeKeyForRef(ref)">
+                      {{ editNodeLabel(ref) }}
+                    </option>
+                  </select>
+                  <div class="form-tip">自动策略下作为初始/当前节点；手动指定策略下固定使用该节点。</div>
+                </div>
                 <div class="form-group">
                   <label class="form-label">策略</label>
                   <select class="input" v-model="outboundForm.mode">
+                    <option value="manual">手动指定（不自动切换）</option>
                     <option value="leastping">最低延迟（自动切换）</option>
-                    <option value="roundrobin">轮询</option>
+                    <option value="stable">稳定优先（在线就不切换）</option>
                   </select>
+                  <div class="form-tip" v-if="outboundForm.mode === 'manual'">
+                    固定使用上面选择的节点，不会因测速结果自动切换。
+                  </div>
+                  <div class="form-tip" v-else-if="outboundForm.mode === 'stable'">
+                    当前节点只要仍连通就保持不变，延迟再高也不主动切换；只有掉线时才会换到最快的节点。
+                  </div>
+                  <div class="form-tip" v-else-if="outboundForm.mode === 'leastping'">
+                    每轮测速后，当前节点比最快节点慢超过本出站阈值、且已过本出站冷却时间才切换。
+                  </div>
                 </div>
                 <div class="form-group">
                   <label class="form-label">探测间隔</label>
                   <input class="input" v-model="outboundForm.probeInterval" placeholder="30s" />
+                  <div class="form-tip">每到间隔时间自动测速一次，并按上面的策略决定是否切换节点。支持 30s / 5m / 1h，最小 10s。</div>
+                </div>
+                <div class="form-group" v-if="outboundForm.mode === 'leastping'">
+                  <label class="form-label">切换阈值（毫秒）</label>
+                  <input class="input" type="number" min="0" step="1" v-model.number="outboundForm.switchThresholdMs" />
+                  <div class="form-tip">只有当前节点比最低延迟节点慢至少这个数值才切换，避免小幅波动导致频繁切换。</div>
+                </div>
+                <div class="form-group" v-if="outboundForm.mode !== 'manual'">
+                  <label class="form-label">切换冷却时间（秒）</label>
+                  <input class="input" type="number" min="0" step="1" v-model.number="outboundForm.switchCooldownSec" />
+                  <div class="form-tip">切换后至少等待这段时间，才允许再次自动切换。</div>
+                </div>
+                <div class="form-group">
+                  <label class="form-label">测速方式</label>
+                  <select class="input" v-model="outboundForm.probeMode">
+                    <option value="real">真连测试</option>
+                    <option value="fast">快速测速</option>
+                  </select>
+                  <div class="form-tip">仅用于本出站的周期测速，与设置里订阅更新的测速方式互不影响。</div>
                 </div>
               </template>
             </div>
@@ -234,6 +309,18 @@
           <div v-if="!logs.length" class="log-empty">暂无日志</div>
         </div>
         <div class="logs-actions">
+          <select class="logs-filter" v-model="logsInboundFilter" @click.stop @change="refreshLogsFilter">
+            <option value="">全部入站</option>
+            <option value="socks-in">默认 SOCKS5</option>
+            <option value="http-in">默认 HTTP</option>
+            <option v-for="ib in logInboundOptions" :key="ib.id" :value="ib.id">
+              {{ ib.name || ib.tag }}
+            </option>
+          </select>
+          <label class="logs-system-filter" @click.stop>
+            <input type="checkbox" v-model="logsIncludeSystem" @change="refreshLogsFilter" />
+            系统日志
+          </label>
           <button class="btn btn-sm btn-light" @click="clearLogs">清空</button>
           <button class="btn btn-sm" :class="logsAutoScroll ? 'btn-success' : 'btn-light'" @click="toggleAutoScroll" title="打开自动滚动到最新日志">
             {{ logsAutoScroll ? '📌 自动滚动' : '📍 手动滚动' }}
@@ -315,19 +402,26 @@ const authError = ref('')
 const loginLoading = ref(false)
 const loginForm = ref({ username: 'admin', password: 'admin' })
 const appInitialized = ref(false)
+const appInitializing = ref(false)
+const appInitError = ref('')
 const showOutboundMenu = ref(false)
 const showUserMenu = ref(false)
 const userMenuRef = ref(null)
 const showImport = ref(false)
 const showAccountModal = ref(false)
 const currentOutbound = ref('proxy')
+const outboundSelectionVersion = ref(0)
 const startError = ref('')
 const showCreateOutbound = ref(false)
 const newOutboundName = ref('')
 const creatingOutbound = ref(false)
 const savingOutbound = ref(false)
 const editingOutbound = ref(null)
-const outboundForm = ref({ targetType: 'node', nodeKey: '', groupId: '', mode: 'leastping', probeInterval: '30s' })
+const renamingOutbound = ref('')
+const renameOutboundName = ref('')
+const renameOutboundError = ref('')
+const renamingOutboundBusy = ref(false)
+const outboundForm = ref({ targetType: 'node', nodeKey: '', groupId: '', activeNodeKey: '', mode: 'leastping', probeInterval: '30s', probeMode: 'real', switchThresholdMs: 100, switchCooldownSec: 600 })
 const kernels = ref({})
 // 出站弹窗里实时获取的数据（独立于 store 缓存）
 const editGroups = ref([])
@@ -349,12 +443,16 @@ const showLogs = ref(true)  // 默认展开
 const logs = ref([])  // 现在存储对象数组 { time, message, level }
 const logsStreaming = ref(true)
 const logsAutoScroll = ref(true)
+const logsInboundFilter = ref('')
+const logsIncludeSystem = ref(true)
 const logsContainer = ref(null)
 const logsPanel = ref(null)
 let logsStreamPromise = null
 let logsEventSource = null
+let appInitPromise = null
 const logsPanelHeight = ref(null)  // 用户自定义高度
 const logsResizing = ref(false)
+const logInboundOptions = computed(() => store.customInbounds || [])
 
 // 面板高度改用响应式绑定：此前用 nextTick 后手动写 style.height，
 // 而 logsPanel 在 v-else 分支内，首帧未挂载时赋值会丢失，
@@ -445,6 +543,7 @@ const currentOutboundLabel = computed(() => {
 
 provide('openImport', () => { showImport.value = true })
 provide('currentOutbound', currentOutbound)
+provide('outboundSelectionVersion', outboundSelectionVersion)
 
 onMounted(() => {
   setUnauthorizedHandler(() => {
@@ -452,6 +551,8 @@ onMounted(() => {
     authenticated.value = false
     authUsername.value = ''
     authChecking.value = false
+    appInitializing.value = false
+    appInitError.value = ''
     authError.value = '登录已失效，请重新登录'
   })
   checkAuth()
@@ -472,6 +573,7 @@ function handleGlobalClick(event) {
 
 async function selectOutbound(outbound) {
   currentOutbound.value = outbound?.name || 'proxy'
+  outboundSelectionVersion.value += 1
   showOutboundMenu.value = false
   if (router.currentRoute.value.path !== '/') {
     await router.push('/')
@@ -488,7 +590,8 @@ watch(showLogs, (newVal) => {
 
 function onImportDone() {
   showImport.value = false
-  store.fetchAll()
+  store.invalidateSubscriptions()
+  Promise.all([store.fetchServers(), store.fetchSubscriptions(false, true), store.fetchGroups()])
 }
 
 function resetAccountMessages() {
@@ -525,13 +628,13 @@ async function checkAuth() {
     authenticated.value = !!data.authenticated
     authUsername.value = data.username || ''
     authError.value = ''
-    await initAuthenticatedApp()
   } catch {
     authenticated.value = false
     authUsername.value = ''
   } finally {
     authChecking.value = false
   }
+  if (authenticated.value) initAuthenticatedApp()
 }
 
 async function handleLogin() {
@@ -541,7 +644,7 @@ async function handleLogin() {
     const { data } = await api.login(loginForm.value.username, loginForm.value.password)
     authenticated.value = true
     authUsername.value = data.username || loginForm.value.username
-    await initAuthenticatedApp()
+    initAuthenticatedApp()
   } catch (e) {
     authError.value = e?.response?.data?.error || '登录失败'
   } finally {
@@ -565,6 +668,7 @@ async function handleLogoutFromMenu() {
 }
 
 async function initAuthenticatedApp() {
+  if (appInitPromise) return appInitPromise
   if (!appInitialized.value) {
     restoreLogsPanelState()
     // 没有保存过高度时给个默认值，交给 logsPanelStyle 渲染
@@ -573,11 +677,26 @@ async function initAuthenticatedApp() {
     }
     appInitialized.value = true
   }
-  await store.fetchStatus()
-  await store.fetchAll()
-  api.getKernelStatus?.().then(r => { kernels.value = r.data.kernels || {} }).catch(() => {})
-  await loadLogs()
-  startLogsStream()
+  appInitializing.value = true
+  appInitError.value = ''
+  const request = api.getBootstrap()
+    .then(({ data }) => {
+      store.applyBootstrap(data)
+      kernels.value = data.kernels || {}
+      setLogs(data.logs || [])
+      startLogsStream()
+    })
+    .catch((error) => {
+      if (error?.response?.status !== 401) {
+        appInitError.value = error?.response?.data?.error || error?.message || '首页数据加载失败'
+      }
+    })
+    .finally(() => {
+      appInitializing.value = false
+      if (appInitPromise === request) appInitPromise = null
+    })
+  appInitPromise = request
+  return request
 }
 
 async function saveAccountProfile() {
@@ -633,28 +752,74 @@ async function handleToggleProxy() {
   }
 }
 
+// 设置里的分组参数只作为首次绑定分组时的默认填充值，之后由出站自己保存
+async function defaultGroupSettings() {
+  try {
+    const { data } = await api.getSetting()
+    const setting = data?.setting || {}
+    return {
+      probeInterval: typeof setting.groupRealProbeIntervalSec === 'number' && setting.groupRealProbeIntervalSec >= 10
+        ? `${setting.groupRealProbeIntervalSec}s` : '300s',
+      switchThresholdMs: typeof setting.groupSwitchThresholdMs === 'number' && setting.groupSwitchThresholdMs >= 0
+        ? setting.groupSwitchThresholdMs : 100,
+      switchCooldownSec: typeof setting.groupSwitchCooldownSec === 'number' && setting.groupSwitchCooldownSec >= 0
+        ? setting.groupSwitchCooldownSec : 600,
+    }
+  } catch (e) {
+    return { probeInterval: '300s', switchThresholdMs: 100, switchCooldownSec: 600 }
+  }
+}
+
+const groupNodeOptions = computed(() => {
+  const group = editGroups.value.find(item => item.id === outboundForm.value.groupId)
+  return group?.servers || []
+})
+
+function nodeKeyForRef(ref) {
+  return `${ref.type}:${ref.index}:${ref.sub || 0}`
+}
+
+function editNodeLabel(ref) {
+  if (ref.type === 'server') {
+    const server = editServers.value.find(item => item._index === ref.index) || editServers.value[ref.index]
+    return `[${server?.type || '?'}] ${server?.name || '未命名'} — ${server?.host || '?'}:${server?.port || 0}`
+  }
+  if (ref.type === 'sub_server') {
+    const sub = editSubscriptions.value[ref.sub || 0]
+    const server = sub?.servers?.[ref.index]
+    return `[${server?.type || '?'}] ${server?.name || '未命名'} — ${server?.host || '?'}:${server?.port || 0}`
+  }
+  return '未知节点'
+}
+
 async function openOutboundEdit(o) {
   // 先设置表单，弹窗立即打开
   editingOutbound.value = o
   const t = o.target || {}
+  const defaults = await defaultGroupSettings()
   outboundForm.value = {
     targetType: t.targetType || 'node',
     nodeKey: t.nodeRef ? `${t.nodeRef.type}:${t.nodeRef.index}:${t.nodeRef.sub || 0}` : '',
     groupId: t.groupId || '',
-    mode: t.mode || 'leastping',
-    probeInterval: o.probeInterval || '30s',
+    activeNodeKey: t.activeNodeRef ? nodeKeyForRef(t.activeNodeRef) : '',
+    // 轮询策略已移除，历史数据归一到最低延迟，避免下拉显示空白
+    mode: t.mode === 'roundrobin' ? 'leastping' : t.mode || 'leastping',
+    probeInterval: o.probeInterval || defaults.probeInterval,
+    probeMode: o.probeMode || 'real',
+    switchThresholdMs: typeof o.switchThresholdMs === 'number' ? o.switchThresholdMs : defaults.switchThresholdMs,
+    switchCooldownSec: typeof o.switchCooldownSec === 'number' ? o.switchCooldownSec : defaults.switchCooldownSec,
   }
   // 实时从后端获取最新数据，直接写入弹窗专用变量
-  const [gRes, sRes, subRes] = await Promise.all([
+  const [gRes, sRes, subRes, ibRes] = await Promise.all([
     api.getGroups(),
-    api.getServers(),
-    api.getSubscriptions(),
+    api.getServers('catalog'),
+    api.getSubscriptions('catalog'),
+    api.getCustomInbounds(),
   ])
   editGroups.value = gRes.data.groups || []
-  const ibRes = await api.getCustomInbounds()
   const inbounds = ibRes.data.inbounds || []
   const inboundIDSet = new Set(inbounds.map(ib => ib.id))
-  editServers.value = (sRes.data.servers || []).filter(s => {
+  editServers.value = (sRes.data.servers || []).map((server, index) => ({ ...server, _index: index })).filter(s => {
     if (typeof s.source !== 'string' || !s.source.startsWith('inbound:')) return true
     const rest = s.source.slice('inbound:'.length)
     const id = rest.split(':')[0]
@@ -671,7 +836,7 @@ async function createOutbound() {
     await api.createOutbound({ name: newOutboundName.value.trim() })
     showCreateOutbound.value = false
     newOutboundName.value = ''
-    await store.fetchAll()
+    await store.fetchOutbounds()
   } finally {
     creatingOutbound.value = false
   }
@@ -680,7 +845,47 @@ async function createOutbound() {
 async function deleteOutbound(name) {
   await api.deleteOutbound(name)
   if (currentOutbound.value === name) currentOutbound.value = 'proxy'
-  await store.fetchAll()
+  await store.fetchOutbounds()
+}
+
+function openOutboundRename(o) {
+  renamingOutbound.value = o.name
+  renameOutboundName.value = o.name
+  renameOutboundError.value = ''
+}
+
+function closeOutboundRename() {
+  renamingOutbound.value = ''
+  renameOutboundName.value = ''
+  renameOutboundError.value = ''
+}
+
+async function submitOutboundRename() {
+  if (renamingOutboundBusy.value) return
+  const oldName = renamingOutbound.value
+  const newName = renameOutboundName.value.trim()
+  if (!oldName || !newName) return
+  if (newName === oldName) {
+    closeOutboundRename()
+    return
+  }
+  renamingOutboundBusy.value = true
+  renameOutboundError.value = ''
+  try {
+    await api.renameOutbound(oldName, newName)
+    if (currentOutbound.value === oldName) currentOutbound.value = newName
+    closeOutboundRename()
+    await Promise.all([
+      store.fetchOutbounds(),
+      store.fetchServers(),
+      store.fetchSubscriptions(false, true),
+      store.fetchStatus(),
+    ])
+  } catch (e) {
+    renameOutboundError.value = e?.response?.data?.error || e?.message || '重命名失败'
+  } finally {
+    renamingOutboundBusy.value = false
+  }
 }
 
 async function saveOutbound() {
@@ -694,12 +899,23 @@ async function saveOutbound() {
     target = { targetType: 'node', nodeRef: { type, index: parseInt(index), sub: parseInt(sub) } }
   } else if (outboundForm.value.targetType === 'group' && outboundForm.value.groupId) {
     target = { targetType: 'group', groupId: outboundForm.value.groupId, mode: outboundForm.value.mode }
+    if (outboundForm.value.activeNodeKey) {
+      const [type, index, sub] = outboundForm.value.activeNodeKey.split(':')
+      target.activeNodeRef = { type, index: parseInt(index), sub: parseInt(sub) }
+    }
   }
-  await api.connectOutbound(name, target)
+  // 探测间隔与测速方式是出站顶层字段，必须一起提交，否则改了不生效
+  const extra = outboundForm.value.targetType === 'group'
+    ? {
+        probeInterval: outboundForm.value.probeInterval,
+        probeMode: outboundForm.value.probeMode,
+        switchThresholdMs: Number(outboundForm.value.switchThresholdMs),
+        switchCooldownSec: Number(outboundForm.value.switchCooldownSec),
+      }
+    : {}
+  await api.connectOutbound(name, target, extra)
   editingOutbound.value = null
-  await store.fetchAll()
-  // 刷新代理状态，因为 connectOutbound 可能会触发 Restart
-  await store.fetchStatus()
+  await Promise.all([store.fetchOutbounds(), store.fetchStatus()])
   } finally {
     savingOutbound.value = false
   }
@@ -708,37 +924,47 @@ async function saveOutbound() {
 async function disconnectOutbound() {
   await api.disconnectOutbound(editingOutbound.value.name)
   editingOutbound.value = null
-  await store.fetchAll()
+  await Promise.all([store.fetchOutbounds(), store.fetchStatus()])
 }
 
 
 // 日志相关函数
 async function loadLogs() {
   try {
-    const res = await api.getLogs()
-    // 将字符串数组转换为对象数组
-    logs.value = (res.data.logs || []).map(log => {
-      // 如果已经是对象，直接使用；否则解析字符串
-      if (typeof log === 'object') {
-        return log
-      }
-      // 从字符串中提取时间和消息
-      const match = log.match(/^\[(\d{2}:\d{2}:\d{2})\]\s(.*)$/)
-      if (match) {
-        return { time: match[1], message: match[2], level: 'info' }
-      }
-      return { time: '', message: log, level: 'info' }
-    })
-    scrollLogsToBottom(true)
+    const params = {}
+    if (logsInboundFilter.value) params.inbound = logsInboundFilter.value
+    if (logsIncludeSystem.value) params.system = '1'
+    const res = await api.getLogs(params)
+    setLogs(res.data.logs || [])
   } catch (e) {
     console.error('Failed to load logs:', e)
   }
 }
 
+function setLogs(items) {
+  logs.value = items.map(log => {
+    if (typeof log === 'object') return log
+    const match = log.match(/^\[(\d{2}:\d{2}:\d{2})\]\s(.*)$/)
+    if (!match) return { time: '', message: log, level: 'info' }
+    const msg = match[2]
+    let level = 'info'
+    if (msg.includes('ERROR') || msg.includes('error') || msg.includes('❌')) level = 'error'
+    else if (msg.includes('WARN') || msg.includes('warn') || msg.includes('⚠️')) level = 'warn'
+    else if (msg.includes('DEBUG') || msg.includes('debug')) level = 'debug'
+    else if (msg.includes('✅') || msg.includes('success')) level = 'success'
+    return { time: match[1], message: msg, level }
+  })
+  scrollLogsToBottom(true)
+}
+
 function startLogsStream() {
   if (!authenticated.value || logsEventSource) return
   logsStreamPromise = new Promise((resolve, reject) => {
-    const es = new EventSource('/api/logs/stream')
+    const params = new URLSearchParams()
+    if (logsInboundFilter.value) params.set('inbound', logsInboundFilter.value)
+    if (logsIncludeSystem.value) params.set('system', '1')
+    const query = params.toString()
+    const es = new EventSource(`/api/logs/stream${query ? `?${query}` : ''}`)
     logsEventSource = es
     es.onmessage = (e) => {
       try {
@@ -787,6 +1013,13 @@ function toggleLogsStream() {
     startLogsStream()
     loadLogs()
   }
+}
+
+async function refreshLogsFilter() {
+  closeLogsStream()
+  logs.value = []
+  await loadLogs()
+  if (logsStreaming.value) startLogsStream()
 }
 
 function toggleAutoScroll() {
@@ -917,6 +1150,12 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.app-init-status {
+  color: #7a7a7a;
+  font-size: 12px;
+  margin-left: 8px;
 }
 
 /* 出站下拉 */
@@ -1181,6 +1420,7 @@ body {
 
 .form-group { margin-bottom: 14px; }
 .form-label { display: block; font-size: 12px; font-weight: 600; color: #4a4a4a; margin-bottom: 5px; }
+.form-tip { margin-top: 5px; font-size: 11px; line-height: 1.6; color: #8c8c8c; }
 
 /* 延迟颜色 */
 .lat-good  { color: #48c774; font-weight: 600; }
@@ -1269,6 +1509,22 @@ body {
 }
 .log-message {
   flex: 1;
+  font-variant-numeric: tabular-nums;
+}
+/* sing-box 日志格式：INFO[序号] [连接ID 耗时] ...
+   用 ::before 把 INFO/ERROR 填充到固定宽度，让后面内容对齐 */
+.log-info .log-message::before {
+  content: '';
+  display: inline-block;
+  width: 0;
+}
+.log-error .log-message::before {
+  content: '\00a0'; /* 1个空格，补齐 INFO 和 ERROR 的宽度差 */
+  display: inline;
+}
+.log-warn .log-message::before {
+  content: '\00a0\00a0'; /* 2个空格，补齐 INFO 和 WARN 的宽度差 */
+  display: inline;
 }
 .log-info .log-message {
   color: #e0e0e0;
@@ -1297,6 +1553,25 @@ body {
   border-top: 1px solid #f0f0f0;
   background: #fafafa;
   flex-shrink: 0;
+}
+.logs-filter {
+  min-width: 130px;
+  height: 26px;
+  padding: 0 6px;
+  border: 1px solid #d9d9d9;
+  border-radius: 4px;
+  background: #fff;
+  color: #595959;
+  font-size: 12px;
+}
+.logs-system-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: #595959;
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
 }
 
 @media (max-width: 900px) {

@@ -32,17 +32,25 @@ func NewRouter(guiDir string) *gin.Engine {
 	{
 		// 节点管理
 		api.GET("/servers", getServers)
+		api.POST("/servers/query", queryServers)
 		api.GET("/servers/search", searchServers)
 		api.POST("/servers", importServers)
 		api.DELETE("/servers", deleteServers)
 		api.PUT("/servers/:index", editServer)
 		api.GET("/server/link", getServerLink)
 		api.POST("/server/copy-to-group", copyServerToGroup)
+		api.POST("/servers/batch-copy-to-group", batchCopyServersToGroup)
+		api.POST("/servers/batch-move-to-group", batchMoveServersToGroup)
+		api.POST("/servers/detect-ip-type", detectServerIPType)
+		api.POST("/servers/ip-score", scoreServerIP)
+		api.GET("/servers/ip-score/status", getIPScoreStatus)
+		api.POST("/servers/ip-score/cancel", cancelIPScore)
 		// 统一导入入口（自动判断节点/订阅）
 		api.POST("/import", importAuto)
 
 		// 订阅管理
 		api.GET("/subscriptions", getSubscriptions)
+		api.GET("/subscriptions/:index/servers", getSubscriptionServers)
 		api.POST("/subscriptions", addSubscription)
 		api.PUT("/subscriptions/:index", updateSubscription)
 		api.DELETE("/subscriptions/:index", deleteSubscription)
@@ -55,12 +63,14 @@ func NewRouter(guiDir string) *gin.Engine {
 		api.DELETE("/groups/:index", deleteGroup)
 		api.POST("/groups/:index/servers", addServerToGroup)
 		api.DELETE("/groups/:index/servers", removeServerFromGroup)
+		api.POST("/groups/:index/servers/batch-remove", removeServersFromGroup)
 		api.POST("/groups/cleanup-orphan", cleanupOrphanGroups)
 
 		// 出站管理
 		api.GET("/outbounds", getOutbounds)
 		api.POST("/outbounds", createOutbound)
 		api.PUT("/outbounds/:name", updateOutbound)
+		api.PUT("/outbounds/:name/rename", renameOutbound)
 		api.DELETE("/outbounds/:name", deleteOutbound)
 		api.POST("/outbounds/:name/connect", connectOutbound)
 		api.POST("/outbounds/:name/disconnect", disconnectOutbound)
@@ -70,6 +80,7 @@ func NewRouter(guiDir string) *gin.Engine {
 		// 测速
 		api.POST("/ping", pingNodes)
 		api.POST("/groups/:index/ping", pingGroup)
+		api.POST("/groups/:index/apply-switch", applyGroupSwitch)
 
 		// 设置
 		api.GET("/setting", getSetting)
@@ -77,6 +88,7 @@ func NewRouter(guiDir string) *gin.Engine {
 		api.POST("/auth/change-password", changePassword)
 
 		// 代理控制
+		api.GET("/bootstrap", getBootstrap)
 		api.GET("/status", getStatus)
 		api.POST("/start", startProxy)
 		api.POST("/stop", stopProxy)

@@ -59,8 +59,8 @@ const groupId = ref('')
 const loading = ref(false)
 const result = ref(null)
 
-// 打开时立即刷新分组列表，确保和主页面同步
-onMounted(() => store.fetchAll())
+// 打开时只需要刷新分组列表
+onMounted(() => store.fetchGroups())
 
 const hasNodeLinks = computed(() => {
   const nodePrefixes = [

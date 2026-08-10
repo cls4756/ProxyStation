@@ -5,23 +5,35 @@
       type="checkbox"
       class="row-check"
       :checked="selected"
-      @change="$emit('select', refObj, $event.target.checked)"
-      @click.stop
+      @pointerdown.stop.prevent="$emit('select-start', refObj, $event)"
+      @pointerenter="$emit('select-enter', refObj, $event)"
+      @click.stop.prevent
     />
 
     <!-- 连接状态圆点 -->
     <div :class="['dot', connected ? 'dot-on' : 'dot-off']"></div>
 
     <!-- 节点名 -->
-    <div class="row-name" @click="$emit('select', refObj, !selected)">
-      {{ server.name || '未命名' }}
+    <div class="row-name" @click="onNameClick">
+      <span :title="server.name || '未命名'">{{ server.name || '未命名' }}</span>
     </div>
 
     <!-- 地址 -->
-    <div class="row-addr">{{ server.host }}:{{ server.port }}</div>
+    <div class="row-addr"><span :title="`${server.host}:${server.port}`">{{ server.host }}:{{ server.port }}</span></div>
+
+    <!-- IP 地区（评分接口同一次响应附带） -->
+    <div class="row-geo" :title="ipGeoTitle">{{ ipGeoText }}</div>
 
     <!-- 协议 -->
-    <span :class="['tag', `tag-${server.type || 'vmess'}`]">{{ server.type || '?' }}</span>
+    <div class="row-type">
+      <span :class="['tag', `tag-${server.type || 'vmess'}`]">{{ server.type || '?' }}</span>
+    </div>
+
+    <!-- IP 类型 -->
+    <span :class="['row-iptype', ipTypeClass]" :title="ipTypeTitle">{{ ipTypeText }}</span>
+
+    <!-- IP 评分 -->
+    <span :class="['row-ipscore', ipScoreClass]" :title="ipScoreTitle">{{ ipScoreText }}</span>
 
     <!-- 探测状态/延迟 -->
     <span :class="['row-lat', pingStateClass, latClass(server.latency)]">{{ pingStateText }}</span>
@@ -66,8 +78,28 @@ const props = defineProps({
   selected:  { type: Boolean, default: false },
   currentOutbound: { type: String, default: 'proxy' },
   pingState: { type: Object, default: null },
+  ipTypeState: { type: Object, default: null },
+  ipScoreRunning: { type: Boolean, default: false },
 })
-defineEmits(['connect', 'remove', 'edit', 'share', 'select', 'copy-to-group', 'move-to-group'])
+const emit = defineEmits([
+  'connect',
+  'remove',
+  'edit',
+  'share',
+  'select',
+  'select-start',
+  'select-enter',
+  'copy-to-group',
+  'move-to-group',
+])
+
+// 单元格文字可选中后，划词的落点也会触发 click。此时若照常切换行选中，
+// 用户复制节点名的动作就会顺手把行选上，所以有未折叠的选区时直接放过。
+function onNameClick(event) {
+  const selection = window.getSelection?.()
+  if (selection && !selection.isCollapsed && selection.toString().trim()) return
+  emit('select', props.refObj, !props.selected, event)
+}
 
 const connected = computed(() => {
   const outbound = props.outbounds.find(o => o.name === props.currentOutbound)
@@ -108,6 +140,92 @@ const pingStateText = computed(() => {
   return latText(props.server.latency)
 })
 
+const IP_TYPE_LABELS = {
+  idc: '机房',
+  residential: '家宽',
+  mobile: '移动',
+  unknown: '未知',
+}
+
+const ipTypeText = computed(() => {
+  if (props.ipTypeState?.status === 'running') return '检测中'
+  return IP_TYPE_LABELS[props.server.ipType] || '-'
+})
+
+const ipTypeClass = computed(() => {
+  if (props.ipTypeState?.status === 'running') return 'iptype-running'
+  return `iptype-${props.server.ipType || 'empty'}`
+})
+
+const ipTypeTitle = computed(() => {
+  if (props.ipTypeState?.status === 'running') return '正在检测 IP 类型'
+  if (!props.server.ipType) return 'IP 类型未检测'
+  const parts = [IP_TYPE_LABELS[props.server.ipType] || props.server.ipType]
+  if (props.server.ipTypeAddr) parts.push(props.server.ipTypeAddr)
+  if (props.server.ipTypeIsp) parts.push(props.server.ipTypeIsp)
+  if (props.server.ipTypeCheckedAt) {
+    parts.push(`检测于 ${new Date(props.server.ipTypeCheckedAt * 1000).toLocaleString()}`)
+  }
+  return parts.join(' · ')
+})
+
+const ipScoreText = computed(() => {
+  if (props.ipScoreRunning) return '…'
+  const s = props.server.ipScore
+  if (s === null || s === undefined) return '-'
+  return props.server.ipScoreGrade ? `${s} ${props.server.ipScoreGrade}` : String(s)
+})
+
+const ipScoreClass = computed(() => {
+  if (props.ipScoreRunning) return 'ipscore-running'
+  const s = props.server.ipScore
+  if (s === null || s === undefined) return 'ipscore-empty'
+  if (s >= 80) return 'ipscore-good'
+  if (s >= 60) return 'ipscore-fair'
+  if (s >= 40) return 'ipscore-warn'
+  return 'ipscore-bad'
+})
+
+const ipScoreTitle = computed(() => {
+  if (props.ipScoreRunning) return '正在查询 IP 评分'
+  const s = props.server.ipScore
+  if (s === null || s === undefined) return 'IP 评分未查询'
+  const parts = [`纯净度 ${s}/100`]
+  if (props.server.ipScoreGrade) parts.push(`等级 ${props.server.ipScoreGrade}`)
+  if (props.server.ipScoreRisk) parts.push(props.server.ipScoreRisk)
+  if (props.server.ipScoreProvider) parts.push(props.server.ipScoreProvider)
+  if (ipGeoText.value !== '-') parts.push(`地区 ${ipGeoText.value}`)
+  if (props.server.ipScoreAt) {
+    parts.push(`查询于 ${new Date(props.server.ipScoreAt * 1000).toLocaleString()}`)
+  }
+  return parts.join(' · ')
+})
+
+function countryFlag(code) {
+  const normalized = String(code || '').trim().toUpperCase()
+  if (!/^[A-Z]{2}$/.test(normalized)) return ''
+  return String.fromCodePoint(...[...normalized].map(char => 127397 + char.charCodeAt(0)))
+}
+
+const ipGeoParts = computed(() => {
+  const parts = [props.server.ipGeoCountry, props.server.ipGeoRegion, props.server.ipGeoCity]
+    .map(value => String(value || '').trim())
+    .filter(Boolean)
+  return parts.filter((value, index) => parts.indexOf(value) === index)
+})
+
+const ipGeoText = computed(() => {
+  if (!ipGeoParts.value.length) return '-'
+  const flag = countryFlag(props.server.ipGeoCountryCode)
+  return `${flag ? flag + ' ' : ''}${ipGeoParts.value.join(' · ')}`
+})
+
+const ipGeoTitle = computed(() => {
+  if (!ipGeoParts.value.length) return '地区信息将在获取 IP 评分后显示'
+  const code = String(props.server.ipGeoCountryCode || '').trim().toUpperCase()
+  return code ? `${ipGeoText.value} (${code})` : ipGeoText.value
+})
+
 const pingStateClass = computed(() => {
   if (!props.pingState) return ''
   if (props.pingState.status === 'pending') return 'lat-pending'
@@ -120,12 +238,13 @@ const pingStateClass = computed(() => {
 <style scoped>
 .server-row {
   display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 9px 16px;
-  border-bottom: 1px solid #f5f5f5;
+  align-items: stretch;
+  gap: 0;
+  padding: 0 16px;
+  border-bottom: 1px solid #f0f0f0;
   transition: background .1s;
   user-select: none;
+  min-width: max-content;
 }
 .server-row:last-child { border-bottom: none; }
 .server-row:hover { background: #fafafa; }
@@ -133,51 +252,94 @@ const pingStateClass = computed(() => {
 .server-row-connected:hover { background: #edfaf3; }
 .server-row-selected { background: #e6f0ff !important; }
 
+/* 每个单元格左侧一条竖线，与表头的分隔线对齐 */
+.server-row > *:not(.row-check):not(.dot) {
+  padding: 8px;
+  border-left: 1px solid #f2f2f2;
+  display: flex;
+  align-items: center;
+}
+
+/* 文字单元格允许划词，方便右键复制节点名/地址 */
+.row-name, .row-addr, .row-geo, .row-type, .row-iptype, .row-ipscore, .row-lat {
+  user-select: text;
+  -webkit-user-select: text;
+}
+
 .row-check {
   width: 14px; height: 14px;
+  flex: 0 0 14px;
+  margin: auto 10px auto 0;
   cursor: pointer;
-  flex-shrink: 0;
   accent-color: #1677ff;
 }
 
 .dot {
   width: 7px; height: 7px;
   border-radius: 50%;
-  flex-shrink: 0;
+  flex: 0 0 7px;
+  margin: auto 10px auto 0;
 }
 .dot-on  { background: #52c41a; box-shadow: 0 0 4px rgba(82,196,26,.7); }
 .dot-off { background: #d9d9d9; }
 
+/* 各列宽度取自父级 CSS 变量，与 ServerListHead 的同名变量保持一致 */
 .row-name {
-  flex: 1.5;
+  flex: 0 0 var(--col-name);
+  width: var(--col-name);
   font-size: 13px;
   color: #262626;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   cursor: pointer;
-  min-width: 0;
+  border-left: none !important;
+}
+.row-name > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .server-row-connected .row-name { color: #389e0d; font-weight: 500; }
 
 .row-addr {
-  flex: 2;
+  flex: 0 0 var(--col-addr);
+  width: var(--col-addr);
   font-size: 11px;
-  color: #bfbfbf;
+  color: #8c8c8c;
   white-space: nowrap;
   overflow: hidden;
+}
+.row-addr > span {
+  overflow: hidden;
   text-overflow: ellipsis;
-  min-width: 0;
+  white-space: nowrap;
+}
+
+.row-type {
+  flex: 0 0 var(--col-type);
+  width: var(--col-type);
+  overflow: hidden;
+}
+.row-geo {
+  flex: 0 0 var(--col-geo);
+  width: var(--col-geo);
+  font-size: 11px;
+  color: #595959;
+  cursor: default;
 }
 
 .tag {
-  flex-shrink: 0;
   display: inline-block;
+  max-width: 100%;
   padding: 2px 7px;
   border-radius: 3px;
   font-size: 11px;
   font-weight: 600;
-  margin-right: 16px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: middle;
 }
 .tag-vmess  { background: #ebf3ff; color: #3273dc; }
 .tag-vless  { background: #effaf5; color: #257953; }
@@ -191,14 +353,48 @@ const pingStateClass = computed(() => {
 .tag-http, .tag-https, .tag-naive { background: #f7fafc; color: #4a5568; }
 
 .row-lat {
-  flex-shrink: 0;
+  flex: 0 0 var(--col-latency);
+  width: var(--col-latency);
   font-size: 12px;
   font-weight: 600;
-  min-width: 52px;
   text-align: right;
   white-space: nowrap;
-  margin-right: 16px;
+  overflow: hidden;
 }
+.row-iptype {
+  flex: 0 0 var(--col-iptype);
+  width: var(--col-iptype);
+  font-size: 11px;
+  font-weight: 600;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  cursor: default;
+}
+.iptype-idc { color: #3273dc; }
+.iptype-residential { color: #257953; }
+.iptype-mobile { color: #b7791f; }
+.iptype-unknown { color: #bfbfbf; font-weight: 400; }
+.iptype-empty { color: #d9d9d9; font-weight: 400; }
+.iptype-running { color: #1677ff; }
+
+.row-ipscore {
+  flex: 0 0 var(--col-ipscore);
+  width: var(--col-ipscore);
+  font-size: 11px;
+  font-weight: 600;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  cursor: default;
+}
+.ipscore-good  { color: #237804; }
+.ipscore-fair  { color: #52c41a; }
+.ipscore-warn  { color: #faad14; }
+.ipscore-bad   { color: #ff4d4f; }
+.ipscore-empty { color: #d9d9d9; font-weight: 400; }
+.ipscore-running { color: #1677ff; }
+
 .lat-good { color: #52c41a; }
 .lat-ok   { color: #faad14; }
 .lat-bad  { color: #ff4d4f; }
@@ -207,12 +403,13 @@ const pingStateClass = computed(() => {
 .lat-running { color: #1677ff; font-weight: 600; }
 .lat-fail { color: #ff4d4f; font-weight: 600; }
 
-.row-ops { 
-  display: flex; 
-  gap: 4px; 
-  flex-shrink: 0; 
+.row-ops {
+  display: flex;
+  gap: 4px;
+  flex: 0 0 var(--col-ops);
+  width: var(--col-ops);
   align-items: center;
-  margin-left: auto;
+  justify-content: flex-start;
 }
 
 .row-btn {
