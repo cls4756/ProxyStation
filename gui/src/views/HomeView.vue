@@ -48,10 +48,17 @@
           @click="scrollTabs(1)"
           @dblclick="scrollTabsToEdge(1)"
         >›</button>
-        <div class="tab-actions">
+        <div class="tab-actions tab-actions-desktop">
           <button class="action-btn action-btn-primary" @click="openImport">＋ 导入</button>
           <button class="action-btn" @click="showNewGroup = true">📁 新建分组</button>
         </div>
+        <details class="mobile-tab-actions" ref="mobileTabActionsEl">
+          <summary title="更多操作">＋</summary>
+          <div class="mobile-tab-action-menu">
+            <button @click="openMobileImport">＋ 导入</button>
+            <button @click="openMobileNewGroup">📁 新建分组</button>
+          </div>
+        </details>
       </div>
     </div>
 
@@ -849,6 +856,7 @@ const dragMoved = ref(false) // 标记是否真正发生了拖拽移动
 
 // ===== Tab 栏横向滚动 =====
 const tabsWrapEl = ref(null)
+const mobileTabActionsEl = ref(null)
 const tabsOverflow = ref(false)
 const canScrollLeft = ref(false)
 const canScrollRight = ref(false)
@@ -862,6 +870,20 @@ function updateTabScrollState() {
   tabsOverflow.value = maxScroll > 1
   canScrollLeft.value = el.scrollLeft > 1
   canScrollRight.value = el.scrollLeft < maxScroll - 1
+}
+
+function closeMobileTabActions() {
+  mobileTabActionsEl.value?.removeAttribute('open')
+}
+
+function openMobileImport() {
+  closeMobileTabActions()
+  openImport()
+}
+
+function openMobileNewGroup() {
+  closeMobileTabActions()
+  showNewGroup.value = true
 }
 
 function scrollTabs(dir) {
@@ -1976,6 +1998,7 @@ async function confirmSingleMove() {
   padding-left: 16px;
   flex-shrink: 0;
 }
+.mobile-tab-actions { display: none; }
 .ping-progress {
   font-size: 12px;
   color: #1677ff;
@@ -2177,26 +2200,70 @@ async function confirmSingleMove() {
   .home { height: auto; min-height: 100%; }
 
   .tab-bar {
-    display: grid;
-    grid-template-columns: auto minmax(0, 1fr) auto;
-    padding: 0 10px 10px;
+    display: flex;
+    align-items: center;
+    padding: 0 8px;
     min-height: 0;
   }
 
-  .tabs-viewport { min-height: 44px; }
+  .tabs-viewport { min-height: 44px; flex: 1; }
   .tab { height: 44px; padding: 0 14px; }
   .tab-scroll-btn { width: 28px; }
 
-  .tab-actions {
-    grid-column: 1 / -1;
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 8px;
-    width: 100%;
-    padding: 8px 0 0;
+  .tab-actions-desktop { display: none; }
+
+  .mobile-tab-actions {
+    display: block;
+    position: relative;
+    flex: 0 0 auto;
+    margin-left: 4px;
   }
 
-  .tab-actions .action-btn { justify-content: center; min-height: 36px; }
+  .mobile-tab-actions summary {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    border: 1px solid #1677ff;
+    border-radius: 7px;
+    background: #1677ff;
+    color: #fff;
+    font-size: 20px;
+    line-height: 1;
+    cursor: pointer;
+    list-style: none;
+    user-select: none;
+  }
+
+  .mobile-tab-actions summary::-webkit-details-marker { display: none; }
+
+  .mobile-tab-action-menu {
+    position: absolute;
+    top: 38px;
+    right: 0;
+    z-index: 30;
+    display: grid;
+    min-width: 140px;
+    padding: 5px;
+    border: 1px solid #e8e8e8;
+    border-radius: 8px;
+    background: #fff;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, .14);
+  }
+
+  .mobile-tab-action-menu button {
+    border: 0;
+    border-radius: 5px;
+    background: transparent;
+    padding: 9px 10px;
+    color: #262626;
+    font-size: 13px;
+    text-align: left;
+    white-space: nowrap;
+  }
+
+  .mobile-tab-action-menu button:active { background: #f0f5ff; color: #1677ff; }
 
   .content-area {
     overflow: visible;
@@ -2209,50 +2276,64 @@ async function confirmSingleMove() {
   .info-bar {
     align-items: stretch;
     flex-direction: column;
-    padding: 12px;
-    gap: 10px;
+    padding: 7px 8px;
+    gap: 6px;
   }
 
   .info-bar-left {
-    align-items: flex-start;
-    flex-wrap: wrap;
-    gap: 5px 8px;
+    align-items: center;
+    flex-wrap: nowrap;
+    gap: 6px;
+    min-height: 22px;
   }
 
   .info-url {
-    flex-basis: 100%;
-    white-space: normal;
-    overflow-wrap: anywhere;
-    line-height: 1.5;
+    flex: 1;
+    min-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    line-height: 1.3;
   }
 
   .info-bar-right {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 8px;
+    display: flex;
+    align-items: center;
+    flex-wrap: nowrap;
+    gap: 6px;
     width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: none;
+    overscroll-behavior-x: contain;
+    -webkit-overflow-scrolling: touch;
   }
 
+  .info-bar-right::-webkit-scrollbar { display: none; }
+
   .info-bar-right .search-input {
-    grid-column: 1 / -1;
-    width: 100%;
-    height: 36px;
+    flex: 0 0 150px;
+    width: 150px;
+    height: 30px;
     border-radius: 6px;
     background: #fff;
   }
 
-  .search-input:focus { width: 100%; }
+  .search-input:focus { width: 180px; flex-basis: 180px; }
 
   .info-bar-right .action-btn {
+    flex: 0 0 auto;
     justify-content: center;
-    min-height: 36px;
-    padding: 7px 8px;
+    min-height: 30px;
+    padding: 4px 8px;
+    font-size: 11px;
+    white-space: nowrap;
   }
 
   .info-bar-right .ping-progress {
-    grid-column: 1 / -1;
-    max-width: none;
-    text-align: center;
+    flex: 0 0 auto;
+    max-width: 160px;
+    white-space: nowrap;
   }
 
   .table-scroll {
