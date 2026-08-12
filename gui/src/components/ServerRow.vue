@@ -50,19 +50,29 @@
       </button>
       
       <!-- 分享按钮 -->
-      <button class="row-btn" title="分享" @click="$emit('share', refObj, server)">🔗</button>
+      <button class="row-btn" title="分享" @click="$emit('share', refObj, server)">
+        🔗<span class="row-btn-label">分享</span>
+      </button>
       
       <!-- 复制到分组 -->
-      <button class="row-btn" title="复制到分组" @click="$emit('copy-to-group', refObj)">📋</button>
+      <button class="row-btn" title="复制到分组" @click="$emit('copy-to-group', refObj)">
+        📋<span class="row-btn-label">复制</span>
+      </button>
       
       <!-- 移动到分组（仅手动分组节点） -->
-      <button v-if="removable" class="row-btn" title="移动到分组" @click="$emit('move-to-group', refObj)">✂</button>
+      <button v-if="removable" class="row-btn" title="移动到分组" @click="$emit('move-to-group', refObj)">
+        ✂<span class="row-btn-label">移动</span>
+      </button>
       
       <!-- 编辑按钮（仅手动节点） -->
-      <button v-if="refObj.type === 'server'" class="row-btn" title="编辑" @click="$emit('edit', refObj, server)">✏</button>
+      <button v-if="refObj.type === 'server'" class="row-btn" title="编辑" @click="$emit('edit', refObj, server)">
+        ✏<span class="row-btn-label">编辑</span>
+      </button>
       
       <!-- 删除按钮（仅可删除的节点） -->
-      <button v-if="removable" class="row-btn row-btn-danger" title="移除" @click="$emit('remove', refObj)">✕</button>
+      <button v-if="removable" class="row-btn row-btn-danger" title="移除" @click="$emit('remove', refObj)">
+        ✕<span class="row-btn-label">移除</span>
+      </button>
     </div>
   </div>
 </template>
@@ -425,6 +435,7 @@ const pingStateClass = computed(() => {
   white-space: nowrap;
   flex-shrink: 0;
 }
+.row-btn-label { display: none; }
 .row-btn:hover { background: #f5f5f5; border-color: #bfbfbf; color: #595959; }
 
 .row-btn-connect {
@@ -445,4 +456,111 @@ const pingStateClass = computed(() => {
   color: #ff4d4f;
 }
 .row-btn-danger:hover { background: #fff1f0; }
+
+@media (max-width: 700px) {
+  .server-row {
+    display: grid;
+    grid-template-columns: 20px 12px minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 6px 8px;
+    min-width: 0;
+    width: 100%;
+    padding: 12px;
+    user-select: auto;
+  }
+
+  .server-row > *:not(.row-check):not(.dot) {
+    border-left: 0;
+    padding: 0;
+  }
+
+  .row-check {
+    grid-column: 1;
+    grid-row: 1;
+    width: 18px;
+    height: 18px;
+    flex: none;
+    margin: 0;
+  }
+
+  .dot {
+    grid-column: 2;
+    grid-row: 1;
+    margin: 0;
+  }
+
+  .row-name {
+    grid-column: 3;
+    grid-row: 1;
+    width: auto;
+    min-width: 0;
+    font-size: 14px;
+    font-weight: 600;
+  }
+
+  .row-lat {
+    grid-column: 4;
+    grid-row: 1;
+    width: auto;
+    min-width: 48px;
+    justify-content: flex-end;
+    font-size: 12px;
+  }
+
+  .row-addr {
+    grid-column: 3 / 5;
+    grid-row: 2;
+    width: auto;
+    min-width: 0;
+    font-size: 12px;
+  }
+
+  .row-geo {
+    grid-column: 3 / 5;
+    grid-row: 3;
+    width: auto;
+    min-width: 0;
+    color: #8c8c8c;
+    font-size: 11px;
+  }
+
+  .row-type,
+  .row-iptype,
+  .row-ipscore {
+    grid-row: 4;
+    width: auto;
+    min-width: 0;
+    justify-content: center;
+    padding: 4px 7px !important;
+    border-radius: 5px;
+    background: #fafafa;
+  }
+
+  .row-type { grid-column: 1 / 3; }
+  .row-iptype { grid-column: 3; }
+  .row-ipscore { grid-column: 4; }
+
+  .row-ops {
+    grid-column: 1 / -1;
+    grid-row: 5;
+    display: grid !important;
+    grid-template-columns: repeat(auto-fit, minmax(68px, 1fr));
+    gap: 7px;
+    width: auto;
+    padding-top: 4px !important;
+  }
+
+  .row-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    min-height: 34px;
+    padding: 6px 8px;
+    font-size: 12px;
+    background: #fff;
+  }
+
+  .row-btn-label { display: inline; }
+}
 </style>

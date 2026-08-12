@@ -38,6 +38,7 @@ export const api = {
   getServers: (view = 'list') => http.get('/servers', { params: { view } }),
   queryServers: (refs) => http.post('/servers/query', { refs }),
   searchServers: (q, limit = 100, signal) => http.get('/servers/search', { params: { q, limit }, signal }),
+  getServerBySource: (prefix) => http.get('/servers/by-source', { params: { prefix } }),
   import: (data) => http.post('/import', data),
   importServers: (links, groupId) => http.post('/servers', { links, groupId }),
   deleteServers: (indexes) => http.delete('/servers', { data: { indexes } }),
@@ -56,7 +57,10 @@ export const api = {
   refreshSubscription: (index) => http.post(`/subscriptions/${index}/update`),
 
   // 分组
-  getGroups: () => http.get('/groups'),
+  getGroups: (view = 'summary') => http.get('/groups', { params: { view } }),
+  // ref 可传分组 ID 或列表下标，ID 不受分组增删导致的下标漂移影响
+  getGroupServers: (ref, page, pageSize, params = {}) =>
+    http.get(`/groups/${encodeURIComponent(ref)}/servers`, { params: { page, pageSize, ...params } }),
   createGroup: (name) => http.post('/groups', { name }),
   updateGroup: (index, name) => http.put(`/groups/${index}`, { name }),
   deleteGroup: (index) => http.delete(`/groups/${index}`),

@@ -708,14 +708,15 @@ const inboundModalTitle = computed(() => {
 })
 
 onMounted(async () => {
-  await Promise.all([
-    loadRules(),
-    loadInbounds(),
-    checkDataFiles(),
-    store.fetchOutbounds(),
-    api.getRuleSetInfos().then(r => { ruleSetInfos.value = r.data.infos || [] }).catch(() => {}),
-    loadBuiltinSettings(),
-  ])
+  const requests = [loadInbounds(), store.fetchOutbounds(), loadBuiltinSettings()]
+  if (props.mode !== 'inbounds') {
+    requests.push(
+      loadRules(),
+      checkDataFiles(),
+      api.getRuleSetInfos().then(r => { ruleSetInfos.value = r.data.infos || [] }).catch(() => {}),
+    )
+  }
+  await Promise.all(requests)
 })
 
 async function loadBuiltinSettings() {
@@ -1072,7 +1073,8 @@ async function saveInbound() {
   await api.setCustomInbounds(inbounds.value)
   showInboundModal.value = false
   await loadInbounds()
-  await Promise.all([store.fetchServers(), store.fetchOutbounds(), store.fetchCustomInbounds()])
+  store.invalidateNodeDetails()
+  await Promise.all([store.fetchOutbounds(), store.fetchCustomInbounds()])
 }
 
 async function deleteInbound(i) {
@@ -1081,7 +1083,8 @@ async function deleteInbound(i) {
   if (idx >= 0) inbounds.value.splice(idx, 1)
   await api.setCustomInbounds(inbounds.value)
   await loadInbounds()
-  await Promise.all([store.fetchServers(), store.fetchOutbounds(), store.fetchCustomInbounds()])
+  store.invalidateNodeDetails()
+  await Promise.all([store.fetchOutbounds(), store.fetchCustomInbounds()])
 }
 
 async function deleteBuiltinProxy(i) {
@@ -1090,7 +1093,8 @@ async function deleteBuiltinProxy(i) {
   if (idx >= 0) inbounds.value.splice(idx, 1)
   await api.setCustomInbounds(inbounds.value)
   await loadInbounds()
-  await Promise.all([store.fetchServers(), store.fetchOutbounds(), store.fetchCustomInbounds()])
+  store.invalidateNodeDetails()
+  await Promise.all([store.fetchOutbounds(), store.fetchCustomInbounds()])
 }
 
 function builtinStatusText(id) {
@@ -1115,7 +1119,8 @@ async function restartBuiltinProxy(ib) {
   try {
     await api.restartBuiltinProxy(ib.id)
     await loadInbounds()
-    await Promise.all([store.fetchServers(), store.fetchOutbounds(), store.fetchCustomInbounds()])
+    store.invalidateNodeDetails()
+    await Promise.all([store.fetchOutbounds(), store.fetchCustomInbounds()])
   } catch (e) {
     alert('重启失败: ' + (e?.response?.data?.error || e.message))
   } finally {
@@ -1133,11 +1138,10 @@ async function createRuleOutboundForProxy(ib) {
   if (!ib?.id) return
   try {
     await loadInbounds()
-    const { data } = await api.getServers('catalog')
-    const servers = data.servers || []
     const sourcePrefix = `inbound:${ib.id}`
-    const index = servers.findIndex(s => s.source === sourcePrefix || String(s.source || '').startsWith(sourcePrefix + ':'))
-    if (index < 0) {
+    const lookup = await api.getServerBySource(sourcePrefix).catch(() => null)
+    const ref = lookup?.data?.result?.ref
+    if (!ref) {
       alert('未找到该代理节点，请先保存并确认状态为运行正常')
       return
     }
@@ -1148,7 +1152,7 @@ async function createRuleOutboundForProxy(ib) {
     }
     await api.connectOutbound(outboundName, {
       targetType: 'node',
-      nodeRef: { type: 'server', index, sub: 0 },
+      nodeRef: ref,
     })
     await Promise.all([store.fetchOutbounds(), store.fetchStatus()])
     alert(`已创建/更新出站「${outboundName}」，分流规则中可选择该出站`)

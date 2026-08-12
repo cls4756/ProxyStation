@@ -121,7 +121,30 @@ func TestQueryServersReturnsOnlyRequestedRefs(t *testing.T) {
 	}
 }
 
-func TestBootstrapIncludesInitialDataAndReferencedNodes(t *testing.T) {
+func TestGetServerBySourceReturnsSingleMatch(t *testing.T) {
+	setupListQueryTestDB(t)
+	if err := configure.AppendServers([]*configure.ServerRaw{
+		{Name: "normal", Source: "manual"},
+		{Name: "proxy", Source: "inbound:abc:cfdo:8080"},
+	}); err != nil {
+		t.Fatalf("append servers: %v", err)
+	}
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest(http.MethodGet, "/api/servers/by-source?prefix=inbound%3Aabc", nil)
+	getServerBySource(context)
+	var payload struct {
+		Result serverQueryResult `json:"result"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if recorder.Code != http.StatusOK || payload.Result.Ref.Index != 1 || payload.Result.Server.Name != "proxy" {
+		t.Fatalf("unexpected source lookup: %s", recorder.Body.String())
+	}
+}
+
+func TestBootstrapOnlyReturnsRuntimeStatus(t *testing.T) {
 	setupListQueryTestDB(t)
 	if err := configure.AppendServers([]*configure.ServerRaw{
 		{Link: "socks://secret", Name: "bootstrap-node", Host: "1.1.1.1", Port: 1080, Type: "socks"},
@@ -157,23 +180,132 @@ func TestBootstrapIncludesInitialDataAndReferencedNodes(t *testing.T) {
 	if bytes.Contains(recorder.Body.Bytes(), []byte("socks://secret")) || bytes.Contains(recorder.Body.Bytes(), []byte("vmess://secret")) {
 		t.Fatalf("bootstrap leaked raw links: %s", recorder.Body.String())
 	}
-	var payload struct {
-		Subscriptions []subscriptionListItem `json:"subscriptions"`
-		Groups        []configure.Group      `json:"groups"`
-		Outbounds     []configure.Outbound   `json:"outbounds"`
-		Nodes         []serverQueryResult    `json:"nodes"`
-	}
+	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("decode bootstrap: %v", err)
 	}
-	if len(payload.Subscriptions) != 1 || payload.Subscriptions[0].ServerCount != 1 {
-		t.Fatalf("unexpected subscriptions: %+v", payload.Subscriptions)
+	if len(payload) != 1 || payload["running"] == nil {
+		t.Fatalf("bootstrap should only contain running status: %s", recorder.Body.String())
 	}
-	if len(payload.Groups) != 1 || len(payload.Outbounds) != 1 {
-		t.Fatalf("unexpected bootstrap lists: groups=%d outbounds=%d", len(payload.Groups), len(payload.Outbounds))
+}
+
+func TestGroupSummaryAndPagedServers(t *testing.T) {
+	setupListQueryTestDB(t)
+	if err := configure.AppendServers([]*configure.ServerRaw{
+		{Name: "a", Host: "1.1.1.1", Port: 1, Type: "socks"},
+		{Name: "b", Host: "2.2.2.2", Port: 2, Type: "socks"},
+		{Name: "c", Host: "3.3.3.3", Port: 3, Type: "socks"},
+	}); err != nil {
+		t.Fatalf("append servers: %v", err)
 	}
-	if len(payload.Nodes) != 1 || payload.Nodes[0].Server.Name != "bootstrap-node" {
-		t.Fatalf("unexpected referenced nodes: %+v", payload.Nodes)
+	if err := configure.AppendGroup(&configure.Group{
+		ID: "group", Name: "group", Servers: []configure.ServerRef{
+			{Type: "server", Index: 0}, {Type: "server", Index: 1}, {Type: "server", Index: 2},
+		},
+	}); err != nil {
+		t.Fatalf("append group: %v", err)
+	}
+
+	summaryRecorder := httptest.NewRecorder()
+	summaryContext, _ := gin.CreateTestContext(summaryRecorder)
+	summaryContext.Request = httptest.NewRequest(http.MethodGet, "/api/groups?view=summary", nil)
+	getGroups(summaryContext)
+	var summary struct {
+		Groups []struct {
+			ServerCount int               `json:"serverCount"`
+			Servers     []json.RawMessage `json:"servers"`
+		} `json:"groups"`
+	}
+	if err := json.Unmarshal(summaryRecorder.Body.Bytes(), &summary); err != nil {
+		t.Fatalf("decode group summary: %v", err)
+	}
+	if len(summary.Groups) != 1 || summary.Groups[0].ServerCount != 3 || summary.Groups[0].Servers != nil {
+		t.Fatalf("unexpected group summary: %s", summaryRecorder.Body.String())
+	}
+
+	pageRecorder := httptest.NewRecorder()
+	pageContext, _ := gin.CreateTestContext(pageRecorder)
+	pageContext.Params = gin.Params{{Key: "index", Value: "0"}}
+	pageContext.Request = httptest.NewRequest(http.MethodGet, "/api/groups/0/servers?page=2&pageSize=2", nil)
+	getGroupServers(pageContext)
+	var page struct {
+		Refs        []configure.ServerRef `json:"refs"`
+		Results     []serverQueryResult   `json:"results"`
+		ServerCount int                   `json:"serverCount"`
+		Offset      int                   `json:"offset"`
+	}
+	if err := json.Unmarshal(pageRecorder.Body.Bytes(), &page); err != nil {
+		t.Fatalf("decode group page: %v", err)
+	}
+	if page.ServerCount != 3 || page.Offset != 2 || len(page.Refs) != 1 || len(page.Results) != 1 || page.Results[0].Server.Name != "c" {
+		t.Fatalf("unexpected group page: %s", pageRecorder.Body.String())
+	}
+}
+
+func TestGroupServersByIDSupportsFilterAndCatalogView(t *testing.T) {
+	setupListQueryTestDB(t)
+	if err := configure.AppendServers([]*configure.ServerRaw{
+		{Name: "hk-01", Host: "1.1.1.1", Port: 1, Type: "socks", Latency: 33},
+		{Name: "jp-01", Host: "2.2.2.2", Port: 2, Type: "vmess", Latency: 44},
+		{Name: "hk-02", Host: "3.3.3.3", Port: 3, Type: "socks", Latency: 55},
+	}); err != nil {
+		t.Fatalf("append servers: %v", err)
+	}
+	// 第一个分组只用来把目标分组挤到下标 1，验证按 ID 定位不受下标影响
+	if err := configure.AppendGroup(&configure.Group{ID: "other", Name: "other"}); err != nil {
+		t.Fatalf("append other group: %v", err)
+	}
+	if err := configure.AppendGroup(&configure.Group{
+		ID: "target", Name: "target", Servers: []configure.ServerRef{
+			{Type: "server", Index: 0}, {Type: "server", Index: 1}, {Type: "server", Index: 2},
+		},
+	}); err != nil {
+		t.Fatalf("append target group: %v", err)
+	}
+
+	filterRecorder := httptest.NewRecorder()
+	filterContext, _ := gin.CreateTestContext(filterRecorder)
+	filterContext.Params = gin.Params{{Key: "index", Value: "target"}}
+	filterContext.Request = httptest.NewRequest(http.MethodGet, "/api/groups/target/servers?page=1&pageSize=100&q=hk", nil)
+	getGroupServers(filterContext)
+	var filtered struct {
+		Refs        []configure.ServerRef `json:"refs"`
+		Results     []serverQueryResult   `json:"results"`
+		ServerCount int                   `json:"serverCount"`
+	}
+	if err := json.Unmarshal(filterRecorder.Body.Bytes(), &filtered); err != nil {
+		t.Fatalf("decode filtered group page: %v", err)
+	}
+	if filtered.ServerCount != 2 || len(filtered.Results) != 2 || len(filtered.Refs) != 2 {
+		t.Fatalf("filter should only keep matching nodes: %s", filterRecorder.Body.String())
+	}
+	if filtered.Results[0].Server.Name != "hk-01" || filtered.Results[1].Server.Name != "hk-02" ||
+		filtered.Refs[1].Index != 2 {
+		t.Fatalf("unexpected filtered payload: %s", filterRecorder.Body.String())
+	}
+
+	catalogRecorder := httptest.NewRecorder()
+	catalogContext, _ := gin.CreateTestContext(catalogRecorder)
+	catalogContext.Params = gin.Params{{Key: "index", Value: "target"}}
+	catalogContext.Request = httptest.NewRequest(http.MethodGet, "/api/groups/target/servers?view=catalog&page=1&pageSize=100", nil)
+	getGroupServers(catalogContext)
+	var catalog struct {
+		Refs        []configure.ServerRef `json:"refs"`
+		Results     []serverCatalogResult `json:"results"`
+		ServerCount int                   `json:"serverCount"`
+	}
+	if err := json.Unmarshal(catalogRecorder.Body.Bytes(), &catalog); err != nil {
+		t.Fatalf("decode catalog group page: %v", err)
+	}
+	if catalog.ServerCount != 3 || len(catalog.Results) != 3 || catalog.Refs != nil {
+		t.Fatalf("unexpected catalog payload: %s", catalogRecorder.Body.String())
+	}
+	if catalog.Results[0].Server.Name != "hk-01" || catalog.Results[0].Server.Port != 1 {
+		t.Fatalf("catalog should keep selection fields: %s", catalogRecorder.Body.String())
+	}
+	if bytes.Contains(catalogRecorder.Body.Bytes(), []byte(`"latency"`)) ||
+		bytes.Contains(catalogRecorder.Body.Bytes(), []byte(`"lastProbeTime"`)) {
+		t.Fatalf("catalog view should drop probe fields: %s", catalogRecorder.Body.String())
 	}
 }
 

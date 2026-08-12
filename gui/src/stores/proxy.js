@@ -11,6 +11,7 @@ export const useProxyStore = defineStore('proxy', () => {
   const customInbounds = ref([])
   const subscriptionLoads = new Map()
   const nodeLoads = new Map()
+  const groupLoads = new Map()
   let subscriptionsLoaded = false
   let subscriptionSummaryLoad = null
   let subscriptionsGeneration = 0
@@ -66,6 +67,22 @@ export const useProxyStore = defineStore('proxy', () => {
   function invalidateSubscriptions() {
     subscriptionsLoaded = false
     subscriptionsGeneration += 1
+  }
+
+  function invalidateNodeDetails() {
+    servers.value = []
+    subscriptions.value = subscriptions.value.map(sub => ({
+      ...sub,
+      servers: undefined,
+      serversLoaded: false,
+      loadedPages: {},
+    }))
+    groups.value = groups.value.map(group => ({
+      ...group,
+      servers: undefined,
+      serversLoaded: false,
+      loadedPages: {},
+    }))
   }
 
   async function fetchSubscriptionServers(index, force = false, page = 1, pageSize = 100) {
@@ -165,8 +182,45 @@ export const useProxyStore = defineStore('proxy', () => {
   }
 
   async function fetchGroups() {
-    const { data } = await api.getGroups()
-    groups.value = data.groups || []
+    const { data } = await api.getGroups('summary')
+    groups.value = (data.groups || []).map(group => ({ ...group, serversLoaded: false }))
+  }
+
+  async function fetchGroupServers(index, force = false, page = 1, pageSize = 100) {
+    const group = groups.value[index]
+    if (!group) return []
+    const pageKey = `${page}:${pageSize}`
+    if (!force && group.loadedPages?.[pageKey] && Array.isArray(group.servers)) {
+      return group.servers.slice((page - 1) * pageSize, page * pageSize)
+    }
+    const loadKey = `${group.id}:${pageKey}`
+    if (groupLoads.has(loadKey)) return groupLoads.get(loadKey)
+    const request = api.getGroupServers(group.id, page, pageSize).then(({ data }) => {
+      const currentIndex = groups.value.findIndex(item => item.id === group.id)
+      if (currentIndex < 0) return []
+      const current = groups.value[currentIndex]
+      const total = Number(data.serverCount || 0)
+      const offset = Number(data.offset || 0)
+      const refs = Array.isArray(current.servers) && current.servers.length === total
+        ? [...current.servers]
+        : new Array(total)
+      for (let i = 0; i < (data.refs || []).length; i += 1) {
+        refs[offset + i] = data.refs[i]
+      }
+      const next = [...groups.value]
+      next[currentIndex] = {
+        ...current,
+        servers: refs,
+        serversLoaded: true,
+        loadedPages: { ...(current.loadedPages || {}), [pageKey]: true },
+        serverCount: total,
+      }
+      groups.value = next
+      patchNodes(data.results || [])
+      return data.results || []
+    }).finally(() => groupLoads.delete(loadKey))
+    groupLoads.set(loadKey, request)
+    return request
   }
 
   async function fetchOutbounds() {
@@ -179,7 +233,12 @@ export const useProxyStore = defineStore('proxy', () => {
     const index = groups.value.findIndex(item => item.id === group.id)
     if (index < 0) return
     const next = [...groups.value]
-    next[index] = group
+    next[index] = {
+      ...group,
+      serverCount: Array.isArray(group.servers) ? group.servers.length : Number(group.serverCount || 0),
+      serversLoaded: Array.isArray(group.servers),
+      loadedPages: Array.isArray(group.servers) ? {} : (group.loadedPages || {}),
+    }
     groups.value = next
   }
 
@@ -188,27 +247,15 @@ export const useProxyStore = defineStore('proxy', () => {
     customInbounds.value = data.inbounds || []
   }
 
-  function applyBootstrap(data = {}) {
-    running.value = !!data.running
-    servers.value = []
-    const incoming = data.subscriptions || []
-    subscriptions.value = incoming.map(sub => ({ ...sub, serversLoaded: false }))
-    subscriptionsLoaded = true
-    subscriptionSummaryLoad = null
-    groups.value = data.groups || []
-    outbounds.value = data.outbounds || []
-    customInbounds.value = data.customInbounds || []
-    patchNodes(data.nodes || [])
-  }
-
-  async function fetchAll() {
-    await Promise.all([
+  async function fetchAll({ includeSubscriptions = true, includeCustomInbounds = true } = {}) {
+    const requests = [
       fetchStatus(),
-      fetchSubscriptions(false),
       fetchGroups(),
       fetchOutbounds(),
-      fetchCustomInbounds(),
-    ])
+    ]
+    if (includeSubscriptions) requests.push(fetchSubscriptions(false))
+    if (includeCustomInbounds) requests.push(fetchCustomInbounds())
+    await Promise.all(requests)
     const refs = []
     for (const outbound of outbounds.value) {
       const target = outbound?.target
@@ -245,15 +292,16 @@ export const useProxyStore = defineStore('proxy', () => {
     fetchServers,
     fetchSubscriptions,
     invalidateSubscriptions,
+    invalidateNodeDetails,
     fetchSubscriptionServers,
     fetchNodes,
     patchNode,
     patchNodes,
     fetchGroups,
+    fetchGroupServers,
     patchGroup,
     fetchOutbounds,
     fetchCustomInbounds,
-    applyBootstrap,
     fetchAll, 
     toggleProxy 
   }

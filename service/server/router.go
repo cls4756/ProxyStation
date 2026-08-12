@@ -34,6 +34,7 @@ func NewRouter(guiDir string) *gin.Engine {
 		api.GET("/servers", getServers)
 		api.POST("/servers/query", queryServers)
 		api.GET("/servers/search", searchServers)
+		api.GET("/servers/by-source", getServerBySource)
 		api.POST("/servers", importServers)
 		api.DELETE("/servers", deleteServers)
 		api.PUT("/servers/:index", editServer)
@@ -58,6 +59,7 @@ func NewRouter(guiDir string) *gin.Engine {
 
 		// 分组管理
 		api.GET("/groups", getGroups)
+		api.GET("/groups/:index/servers", getGroupServers)
 		api.POST("/groups", createGroup)
 		api.PUT("/groups/:index", updateGroup)
 		api.DELETE("/groups/:index", deleteGroup)

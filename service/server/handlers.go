@@ -628,6 +628,23 @@ type serverQueryResult struct {
 	Server serverListItem    `json:"server"`
 }
 
+type serverCatalogResult struct {
+	Ref    configure.NodeRef `json:"ref"`
+	Server serverCatalogItem `json:"server"`
+}
+
+// serverCatalogResults 只保留选择节点所需的字段，避免下拉列表拉取延迟、IP 画像等无用数据
+func serverCatalogResults(results []serverQueryResult) []serverCatalogResult {
+	items := make([]serverCatalogResult, len(results))
+	for i, item := range results {
+		items[i] = serverCatalogResult{Ref: item.Ref, Server: serverCatalogItem{
+			Identity: item.Server.Identity, Name: item.Server.Name, Host: item.Server.Host,
+			Port: item.Server.Port, Type: item.Server.Type, Source: item.Server.Source,
+		}}
+	}
+	return items
+}
+
 func queryServerRefs(refs []configure.NodeRef) []serverQueryResult {
 	results := make([]serverQueryResult, 0, len(refs))
 	var manualServers []configure.ServerRaw
@@ -716,10 +733,33 @@ func searchServers(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"results": results, "total": len(results)})
 }
 
+func getServerBySource(c *gin.Context) {
+	prefix := strings.TrimSpace(c.Query("prefix"))
+	if prefix == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "prefix is required"})
+		return
+	}
+	for index, server := range configure.GetServers() {
+		if server.Source == prefix || strings.HasPrefix(server.Source, prefix+":") {
+			c.JSON(http.StatusOK, gin.H{"result": serverQueryResult{
+				Ref: configure.NodeRef{Type: "server", Index: index}, Server: newServerListItem(server),
+			}})
+			return
+		}
+	}
+	c.JSON(http.StatusNotFound, gin.H{"error": "server not found"})
+}
+
 func matchServer(s configure.ServerRaw, q string) bool {
 	return strings.Contains(strings.ToLower(s.Name), q) ||
 		strings.Contains(strings.ToLower(s.Host), q) ||
 		strings.Contains(strings.ToLower(s.Type), q)
+}
+
+func matchServerItem(item serverListItem, q string) bool {
+	return strings.Contains(strings.ToLower(item.Name), q) ||
+		strings.Contains(strings.ToLower(item.Host), q) ||
+		strings.Contains(strings.ToLower(item.Type), q)
 }
 
 func importServers(c *gin.Context) {
@@ -1790,9 +1830,108 @@ func fetchSubscription(index int, sub *configure.SubscriptionRaw) {
 
 // ---- Groups ----
 
+type groupListItem struct {
+	ID          string    `json:"id"`
+	Name        string    `json:"name"`
+	FromSub     bool      `json:"fromSub"`
+	SubID       string    `json:"subId,omitempty"`
+	ServerCount int       `json:"serverCount"`
+	CreatedAt   time.Time `json:"createdAt"`
+}
+
 func getGroups(c *gin.Context) {
 	groups := configure.GetGroups()
+	if c.Query("view") != "list" {
+		items := make([]groupListItem, len(groups))
+		for i, group := range groups {
+			items[i] = groupListItem{
+				ID: group.ID, Name: group.Name, FromSub: group.FromSub, SubID: group.SubID,
+				ServerCount: len(group.Servers), CreatedAt: group.CreatedAt,
+			}
+		}
+		c.JSON(http.StatusOK, gin.H{"groups": items})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"groups": groups})
+}
+
+// resolveGroupParam 允许用分组 ID 或列表下标定位分组，ID 不受分组增删导致的下标漂移影响
+func resolveGroupParam(param string) *configure.Group {
+	if index, err := strconv.Atoi(param); err == nil {
+		return configure.GetGroup(index)
+	}
+	_, group := configure.GetGroupByID(param)
+	return group
+}
+
+func pageBounds(total, page, pageSize int) (int, int) {
+	if page < 1 || pageSize < 1 {
+		return 0, total
+	}
+	if pageSize > 500 {
+		pageSize = 500
+	}
+	start := (page - 1) * pageSize
+	if start > total {
+		start = total
+	}
+	end := start + pageSize
+	if end > total {
+		end = total
+	}
+	return start, end
+}
+
+func groupNodeRefs(refs []configure.ServerRef) []configure.NodeRef {
+	nodeRefs := make([]configure.NodeRef, len(refs))
+	for i, ref := range refs {
+		nodeRefs[i] = configure.NodeRef{Type: ref.Type, Index: ref.Index, Sub: ref.Sub}
+	}
+	return nodeRefs
+}
+
+func getGroupServers(c *gin.Context) {
+	group := resolveGroupParam(c.Param("index"))
+	if group == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "group not found"})
+		return
+	}
+	page, _ := strconv.Atoi(c.Query("page"))
+	pageSize, _ := strconv.Atoi(c.Query("pageSize"))
+
+	// 按名称过滤必须先展开全部引用；无过滤时只展开当前页，避免整组查询
+	if query := strings.ToLower(strings.TrimSpace(c.Query("q"))); query != "" {
+		matched := make([]serverQueryResult, 0, len(group.Servers))
+		for _, item := range queryServerRefs(groupNodeRefs(group.Servers)) {
+			if matchServerItem(item.Server, query) {
+				matched = append(matched, item)
+			}
+		}
+		start, end := pageBounds(len(matched), page, pageSize)
+		paged := matched[start:end]
+		refs := make([]configure.ServerRef, len(paged))
+		for i, item := range paged {
+			refs[i] = configure.ServerRef{Type: item.Ref.Type, Index: item.Ref.Index, Sub: item.Ref.Sub}
+		}
+		writeGroupServers(c, refs, paged, len(matched), start)
+		return
+	}
+
+	start, end := pageBounds(len(group.Servers), page, pageSize)
+	refs := group.Servers[start:end]
+	writeGroupServers(c, refs, queryServerRefs(groupNodeRefs(refs)), len(group.Servers), start)
+}
+
+func writeGroupServers(c *gin.Context, refs []configure.ServerRef, results []serverQueryResult, total, offset int) {
+	if c.Query("view") == "catalog" {
+		c.JSON(http.StatusOK, gin.H{
+			"results": serverCatalogResults(results), "serverCount": total, "offset": offset,
+		})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"refs": refs, "results": results, "serverCount": total, "offset": offset,
+	})
 }
 
 func createGroup(c *gin.Context) {
@@ -2736,67 +2875,7 @@ func getBootstrap(c *gin.Context) {
 	if running != configure.GetRunning() {
 		_ = configure.SetRunning(running)
 	}
-
-	summaries := configure.GetSubscriptionSummaries()
-	subscriptions := make([]subscriptionListItem, len(summaries))
-	for i, sub := range summaries {
-		subscriptions[i] = subscriptionListItem{
-			ID: sub.ID, Name: sub.Name, URL: sub.URL, Format: sub.Format,
-			UpdatedAt: sub.UpdatedAt, GroupID: sub.GroupID, ProxyOutbound: sub.ProxyOutbound,
-			ServerCount: sub.ServerCount,
-		}
-	}
-
-	outbounds := listOutbounds()
-	refs := make([]configure.NodeRef, 0, len(outbounds)*2)
-	seenRefs := make(map[string]struct{}, len(outbounds)*2)
-	appendRef := func(ref *configure.NodeRef) {
-		if ref == nil {
-			return
-		}
-		key := fmt.Sprintf("%s:%d:%d", ref.Type, ref.Index, ref.Sub)
-		if _, exists := seenRefs[key]; exists {
-			return
-		}
-		seenRefs[key] = struct{}{}
-		refs = append(refs, *ref)
-	}
-	for _, outbound := range outbounds {
-		appendRef(outbound.Target.NodeRef)
-		appendRef(outbound.Target.ActiveNodeRef)
-	}
-
-	kernels := engine.KernelStatus()
-	kernelMeta := gin.H{}
-	for _, name := range []string{"singbox", "xray", "v2ray"} {
-		kernelMeta[name] = engine.KernelMeta{
-			Path:         kernels[name],
-			LocalVersion: engine.GetKernelVersion(name),
-			HasUpdate:    false,
-		}
-	}
-	kernels["geoip"] = engine.DataFileStatus("geoip")
-	kernels["geosite"] = engine.DataFileStatus("geosite")
-	for name, path := range engine.RuleSetStatus() {
-		kernels["ruleset:"+name] = path
-	}
-
-	logMutex.RLock()
-	logs := append([]string(nil), logBuffer...)
-	logMutex.RUnlock()
-
-	c.JSON(http.StatusOK, gin.H{
-		"running":        running,
-		"kernel":         string(engine.Manager.CurrentKernel()),
-		"subscriptions":  subscriptions,
-		"groups":         configure.GetGroups(),
-		"outbounds":      outbounds,
-		"customInbounds": configure.GetCustomInbounds(),
-		"nodes":          queryServerRefs(refs),
-		"kernels":        kernels,
-		"kernelMeta":     kernelMeta,
-		"logs":           logs,
-	})
+	c.JSON(http.StatusOK, gin.H{"running": running})
 }
 
 func getStatus(c *gin.Context) {
@@ -2982,16 +3061,24 @@ func getLogs(c *gin.Context) {
 	defer logMutex.RUnlock()
 	filter := c.Query("inbound")
 	includeSystem := c.Query("system") == "1" || c.Query("system") == "true"
-	if filter == "" && includeSystem {
-		c.JSON(http.StatusOK, gin.H{"logs": logBuffer})
-		return
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
+	if limit < 1 || limit > 500 {
+		limit = 50
 	}
 	inboundID, inboundTag := resolveInboundFilter(filter)
-	logs := make([]string, 0, len(logBuffer))
-	for _, message := range logBuffer {
+	capacity := limit
+	if capacity > len(logBuffer) {
+		capacity = len(logBuffer)
+	}
+	logs := make([]string, 0, capacity)
+	for i := len(logBuffer) - 1; i >= 0 && len(logs) < limit; i-- {
+		message := logBuffer[i]
 		if shouldIncludeLog(message, inboundID, inboundTag, includeSystem) {
 			logs = append(logs, message)
 		}
+	}
+	for left, right := 0, len(logs)-1; left < right; left, right = left+1, right-1 {
+		logs[left], logs[right] = logs[right], logs[left]
 	}
 	c.JSON(http.StatusOK, gin.H{"logs": logs})
 }

@@ -27,7 +27,7 @@
               @click="activeTab = 'group-' + gi"
             >
               {{ group.name }}
-              <span class="tab-badge">{{ group.servers?.length || 0 }}</span>
+              <span class="tab-badge">{{ groupServerCount(group) }}</span>
             </span>
             <span
               v-for="(sub, si) in store.subscriptions" :key="'sub-' + sub.id"
@@ -208,7 +208,7 @@
           <div class="info-bar">
             <div class="info-bar-left">
               <span class="group-name-display">{{ group.name }}</span>
-              <span class="info-count">{{ group.servers?.length || 0 }} 个节点</span>
+              <span class="info-count">{{ groupServerCount(group) }} 个节点</span>
             </div>
             <div class="info-bar-right">
               <input
@@ -240,8 +240,11 @@
               <button v-if="group.name !== 'SERVER'" class="action-btn action-btn-danger" @click="deleteGroup(gi)">删除分组</button>
             </div>
           </div>
-          <div v-if="!getSortedGroupEntries(group).length" class="empty-hint">
+          <div v-if="groupServerCount(group) === 0" class="empty-hint">
             <p class="empty-sub">分组为空，点击「添加节点」</p>
+          </div>
+          <div v-else-if="!getSortedGroupEntries(group).length" class="empty-hint">
+            <p class="empty-sub">正在加载分组节点…</p>
           </div>
           <div class="table-scroll" v-if="getSortedGroupEntries(group).length">
             <ServerListHead
@@ -421,7 +424,7 @@
             <select class="input" v-model="bulkCopyGroupId">
               <option value="">-- 请选择 --</option>
               <option v-for="g in manualGroups" :key="g.id" :value="g.id">
-                {{ g.name }}（{{ g.servers?.length || 0 }} 个节点）
+                {{ g.name }}（{{ groupServerCount(g) }} 个节点）
               </option>
             </select>
           </div>
@@ -446,7 +449,7 @@
             <select class="input" v-model="bulkMoveGroupId">
               <option value="">-- 请选择 --</option>
               <option v-for="g in manualGroups" :key="g.id" :value="g.id">
-                {{ g.name }}（{{ g.servers?.length || 0 }} 个节点）
+                {{ g.name }}（{{ groupServerCount(g) }} 个节点）
               </option>
             </select>
           </div>
@@ -793,9 +796,8 @@ async function refreshPanel() {
       await store.fetchSubscriptionServers(si, true, nodePage.value, NODE_PAGE_SIZE)
     } else if (activeTab.value.startsWith('group-')) {
       const gi = parseInt(activeTab.value.replace('group-', ''))
-      await store.fetchNodes(getGroupPageRefs(manualGroups.value[gi]))
-    } else {
-      await Promise.all([store.fetchServers(), store.fetchSubscriptions(false)])
+      const group = manualGroups.value[gi]
+      if (group) await store.fetchGroupServers(realGroupIndex(group), true, nodePage.value, NODE_PAGE_SIZE)
     }
   } catch (e) {
     showNotice('刷新失败：' + (e?.response?.data?.error || e?.message || '未知错误'), true)
@@ -872,7 +874,7 @@ function scrollActiveTabIntoView() {
   target?.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'nearest' })
 }
 
-onMounted(() => {
+onMounted(async () => {
   updateTabScrollState()
   if (typeof ResizeObserver !== 'undefined' && tabsWrapEl.value) {
     tabsResizeObserver = new ResizeObserver(updateTabScrollState)
@@ -884,6 +886,7 @@ onMounted(() => {
   window.addEventListener('blur', endDragSelect)
   // 评分任务跑在后端，刷新页面后要接回进度显示
   resumeIPScoreIfRunning()
+  await store.fetchSubscriptions(false)
   ensureActiveTabNodes()
 })
 
@@ -1078,9 +1081,24 @@ async function ensureActiveTabNodes() {
   }
   if (activeTab.value.startsWith('group-')) {
     const gi = parseInt(activeTab.value.replace('group-', ''))
-    await store.fetchNodes(getGroupPageRefs(manualGroups.value[gi]))
+    const group = manualGroups.value[gi]
+    if (group) await store.fetchGroupServers(realGroupIndex(group), false, nodePage.value, NODE_PAGE_SIZE)
   }
 }
+
+watch(
+  () => [
+    store.groups.map(group => `${group.id}:${group.serverCount || 0}`).join('|'),
+    store.subscriptions.map(sub => `${sub.id}:${sub.serverCount || 0}`).join('|'),
+  ],
+  async () => {
+    if (activeTab.value.startsWith('group-')) {
+      const gi = parseInt(activeTab.value.replace('group-', ''))
+      if (!manualGroups.value[gi] && manualGroups.value.length) activeTab.value = 'group-0'
+    }
+    await ensureActiveTabNodes()
+  },
+)
 
 const manualGroups = computed(() => {
   const groups = store.groups.filter(group => !group.fromSub)
@@ -1094,6 +1112,10 @@ const manualGroups = computed(() => {
   return serverGroup ? [serverGroup, ...otherGroups] : otherGroups
 })
 
+function groupServerCount(group) {
+  return Number(group?.serverCount ?? group?.servers?.length ?? 0)
+}
+
 const currentNodeTotal = computed(() => {
   if (activeTab.value.startsWith('sub-')) {
     const si = parseInt(activeTab.value.replace('sub-', ''))
@@ -1101,7 +1123,7 @@ const currentNodeTotal = computed(() => {
   }
   if (activeTab.value.startsWith('group-')) {
     const gi = parseInt(activeTab.value.replace('group-', ''))
-    return manualGroups.value[gi]?.servers?.length || 0
+    return groupServerCount(manualGroups.value[gi])
   }
   return 0
 })
@@ -1391,7 +1413,7 @@ function getSubServerEntries(sub, si) {
 
 function getGroupPageRefs(group) {
   const start = (nodePage.value - 1) * NODE_PAGE_SIZE
-  return (group?.servers || []).slice(start, start + NODE_PAGE_SIZE)
+  return (group?.servers || []).slice(start, start + NODE_PAGE_SIZE).filter(Boolean)
 }
 
 function getSubscriptionRefs(si) {
@@ -1616,8 +1638,9 @@ async function abortIPScore() {
 
 async function removeManualServer(ref) {
   await api.deleteServers([ref.index])
-  // 删除服务器后需要刷新服务器和分组数据
-  await Promise.all([store.fetchServers(), store.fetchGroups()])
+  store.invalidateNodeDetails()
+  await store.fetchGroups()
+  await ensureActiveTabNodes()
 }
 
 async function removeFromGroup(groupIndex, ref) {
@@ -1629,6 +1652,7 @@ async function removeFromGroup(groupIndex, ref) {
 async function refreshSub(si) {
   await api.refreshSubscription(si)
   store.invalidateSubscriptions()
+  store.invalidateNodeDetails()
   await store.fetchSubscriptions(false, true)
   await ensureActiveTabNodes()
 }
@@ -1650,6 +1674,7 @@ async function saveEditSub() {
   await api.updateSubscription(editSubIdx.value, editSubForm.value)
   editSubIdx.value = -1
   store.invalidateSubscriptions()
+  store.invalidateNodeDetails()
   await store.fetchSubscriptions(false, true)
 }
 
@@ -1657,6 +1682,7 @@ async function deleteSub(si) {
   await api.deleteSubscription(si)
   activeTab.value = 'group-0'
   store.invalidateSubscriptions()
+  store.invalidateNodeDetails()
   // 删除订阅需要刷新订阅和分组数据
   await Promise.all([store.fetchSubscriptions(false, true), store.fetchGroups()])
 }
@@ -1665,8 +1691,8 @@ async function deleteGroup(gi) {
   const group = manualGroups.value[gi]
   await api.deleteGroup(realGroupIndex(group))
   activeTab.value = 'group-0'
-  // 删除分组需要刷新分组和服务器数据
-  await Promise.all([store.fetchGroups(), store.fetchServers()])
+  store.invalidateNodeDetails()
+  await store.fetchGroups()
 }
 
 async function createGroup() {
@@ -2099,5 +2125,151 @@ async function confirmSingleMove() {
   color: #8c8c8c;
   margin-top: 4px;
   line-height: 1.5;
+}
+
+@media (max-width: 700px) {
+  .home { height: auto; min-height: 100%; }
+
+  .tab-bar {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    padding: 0 10px 10px;
+    min-height: 0;
+  }
+
+  .tabs-viewport { min-height: 44px; }
+  .tab { height: 44px; padding: 0 14px; }
+  .tab-scroll-btn { width: 28px; }
+
+  .tab-actions {
+    grid-column: 1 / -1;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+    width: 100%;
+    padding: 8px 0 0;
+  }
+
+  .tab-actions .action-btn { justify-content: center; min-height: 36px; }
+
+  .content-area {
+    overflow: visible;
+    padding: 10px;
+  }
+
+  .panel-fill { min-height: 420px; }
+  .panel { border-radius: 7px; }
+
+  .info-bar {
+    align-items: stretch;
+    flex-direction: column;
+    padding: 12px;
+    gap: 10px;
+  }
+
+  .info-bar-left {
+    align-items: flex-start;
+    flex-wrap: wrap;
+    gap: 5px 8px;
+  }
+
+  .info-url {
+    flex-basis: 100%;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    line-height: 1.5;
+  }
+
+  .info-bar-right {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+    width: 100%;
+  }
+
+  .info-bar-right .search-input {
+    grid-column: 1 / -1;
+    width: 100%;
+    height: 36px;
+    border-radius: 6px;
+    background: #fff;
+  }
+
+  .search-input:focus { width: 100%; }
+
+  .info-bar-right .action-btn {
+    justify-content: center;
+    min-height: 36px;
+    padding: 7px 8px;
+  }
+
+  .info-bar-right .ping-progress {
+    grid-column: 1 / -1;
+    max-width: none;
+    text-align: center;
+  }
+
+  .table-scroll {
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+
+  .table-scroll > :first-child { display: none; }
+
+  .bulk-bar {
+    align-items: stretch;
+    flex-wrap: wrap;
+    gap: 7px;
+    padding: 10px;
+  }
+
+  .bulk-count {
+    flex-basis: 100%;
+    margin-right: 0;
+  }
+
+  .bulk-bar .action-btn {
+    flex: 1 1 calc(50% - 7px);
+    justify-content: center;
+    min-height: 36px;
+  }
+
+  .bulk-bar .ping-progress {
+    flex-basis: 100%;
+    max-width: none;
+    text-align: center;
+  }
+
+  .notice-bar { padding: 9px 12px; }
+
+  .node-pagination {
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 10px;
+  }
+
+  .node-pagination span {
+    order: -1;
+    flex-basis: 100%;
+    text-align: center;
+  }
+
+  .node-pagination .action-btn {
+    flex: 1;
+    justify-content: center;
+    min-height: 36px;
+  }
+
+  .empty-hint { padding: 36px 16px; }
+
+  .sel-row {
+    align-items: flex-start;
+    flex-wrap: wrap;
+    padding: 10px 14px;
+  }
+
+  .sel-name { min-width: 0; }
+  .sel-addr { flex-basis: 100%; padding-left: 0; overflow-wrap: anywhere; }
 }
 </style>

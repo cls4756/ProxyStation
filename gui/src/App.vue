@@ -159,40 +159,57 @@
               </div>
               <template v-if="outboundForm.targetType === 'node'">
                 <div class="form-group">
-                  <label class="form-label">选择节点</label>
+                  <label class="form-label">搜索节点</label>
+                  <div style="display:flex; gap:8px; margin-bottom:8px">
+                    <input class="input" v-model="outboundNodeSearch" placeholder="输入名称、地址或协议" @keyup.enter="searchOutboundNodes" />
+                    <button class="btn btn-light" :disabled="outboundNodesLoading" @click="searchOutboundNodes">
+                      {{ outboundNodesLoading ? '搜索中…' : '搜索' }}
+                    </button>
+                  </div>
                   <select class="input" v-model="outboundForm.nodeKey">
                     <option value="">-- 请选择 --</option>
-                    <optgroup label="手动节点">
-                      <option v-for="(s, i) in editServers" :key="`s-${s._index ?? i}`" :value="`server:${s._index ?? i}:0`">
-                        [{{ s.type }}] {{ s.name || '未命名' }} — {{ s.host }}:{{ s.port }}
-                      </option>
-                    </optgroup>
-                    <optgroup v-for="(sub, si) in editSubscriptions" :key="sub.id" :label="sub.name">
-                      <option v-for="(s, i) in sub.servers" :key="`ss-${si}-${i}`" :value="`sub_server:${i}:${si}`">
-                        [{{ s.type }}] {{ s.name || '未命名' }} — {{ s.host }}:{{ s.port }}
-                      </option>
-                    </optgroup>
+                    <option v-for="item in outboundNodeOptions" :key="nodeKeyForRef(item.ref)" :value="nodeKeyForRef(item.ref)">
+                      {{ editNodeLabel(item) }}
+                    </option>
                   </select>
+                  <div class="form-tip">只搜索并加载匹配节点，不再打开弹窗时加载全部节点和订阅内容。</div>
                 </div>
               </template>
               <template v-if="outboundForm.targetType === 'group'">
                 <div class="form-group">
                   <label class="form-label">选择分组</label>
                   <select class="input" v-model="outboundForm.groupId">
-                    <option value="">-- 请选择 --</option>
+                    <option value="">{{ outboundGroupsLoading ? '正在加载分组…' : '-- 请选择 --' }}</option>
                     <option v-for="g in editGroups" :key="g.id" :value="g.id">
-                      {{ g.name }}（{{ g.servers?.length || 0 }} 个节点）
+                      {{ g.name }}（{{ g.serverCount || 0 }} 个节点）
                     </option>
                   </select>
                 </div>
                 <div class="form-group" v-if="outboundForm.groupId">
                   <label class="form-label">分组节点</label>
+                  <input
+                    class="input"
+                    style="margin-bottom:8px"
+                    v-model="outboundGroupNodeSearch"
+                    placeholder="过滤节点：名称、地址或协议"
+                  />
                   <select class="input" v-model="outboundForm.activeNodeKey">
                     <option value="">自动选择（按策略）</option>
-                    <option v-for="ref in groupNodeOptions" :key="nodeKeyForRef(ref)" :value="nodeKeyForRef(ref)">
-                      {{ editNodeLabel(ref) }}
+                    <option v-for="item in outboundGroupNodeOptions" :key="nodeKeyForRef(item.ref)" :value="nodeKeyForRef(item.ref)">
+                      {{ editNodeLabel(item) }}
                     </option>
                   </select>
+                  <button
+                    v-if="outboundGroupNodeOptions.length < outboundGroupNodeTotal"
+                    class="btn btn-light btn-sm"
+                    style="margin-top:8px"
+                    :disabled="outboundGroupNodesLoading"
+                    @click="loadMoreOutboundGroupNodes"
+                  >
+                    {{ outboundGroupNodesLoading ? '加载中…' : `加载更多（${outboundGroupNodeOptions.length}/${outboundGroupNodeTotal}）` }}
+                  </button>
+                  <div v-else-if="outboundGroupNodesLoading" class="form-tip">正在加载分组节点…</div>
+                  <div v-else-if="outboundGroupNodeSearch.trim() && !outboundGroupNodeTotal" class="form-tip">该分组下没有匹配的节点。</div>
                   <div class="form-tip">自动策略下作为初始/当前节点；手动指定策略下固定使用该节点。</div>
                 </div>
                 <div class="form-group">
@@ -422,11 +439,20 @@ const renameOutboundName = ref('')
 const renameOutboundError = ref('')
 const renamingOutboundBusy = ref(false)
 const outboundForm = ref({ targetType: 'node', nodeKey: '', groupId: '', activeNodeKey: '', mode: 'leastping', probeInterval: '30s', probeMode: 'real', switchThresholdMs: 100, switchCooldownSec: 600 })
-const kernels = ref({})
 // 出站弹窗里实时获取的数据（独立于 store 缓存）
 const editGroups = ref([])
-const editServers = ref([])
-const editSubscriptions = ref([])
+const outboundGroupsLoading = ref(false)
+const outboundNodeSearch = ref('')
+const outboundNodeOptions = ref([])
+const outboundNodesLoading = ref(false)
+const outboundGroupNodeOptions = ref([])
+const outboundGroupNodeTotal = ref(0)
+const outboundGroupNodePage = ref(0)
+const outboundGroupNodesLoading = ref(false)
+const outboundGroupNodeSearch = ref('')
+let outboundGroupLoadVersion = 0
+let outboundGroupSearchTimer = null
+const OUTBOUND_GROUP_PAGE_SIZE = 200
 const accountSaving = ref(false)
 const accountMsg = ref(null)
 const passwordSaving = ref(false)
@@ -591,7 +617,8 @@ watch(showLogs, (newVal) => {
 function onImportDone() {
   showImport.value = false
   store.invalidateSubscriptions()
-  Promise.all([store.fetchServers(), store.fetchSubscriptions(false, true), store.fetchGroups()])
+  store.invalidateNodeDetails()
+  Promise.all([store.fetchSubscriptions(false, true), store.fetchGroups()])
 }
 
 function resetAccountMessages() {
@@ -679,11 +706,13 @@ async function initAuthenticatedApp() {
   }
   appInitializing.value = true
   appInitError.value = ''
-  const request = api.getBootstrap()
-    .then(({ data }) => {
-      store.applyBootstrap(data)
-      kernels.value = data.kernels || {}
-      setLogs(data.logs || [])
+  const isNodePage = router.currentRoute.value.path === '/'
+  const request = Promise.all([
+    store.fetchAll({ includeSubscriptions: isNodePage, includeCustomInbounds: showLogs.value }),
+    api.getLogs({ limit: 50, system: '1' }),
+  ])
+    .then(([, logsResponse]) => {
+      setLogs(logsResponse.data.logs || [])
       startLogsStream()
     })
     .catch((error) => {
@@ -770,33 +799,79 @@ async function defaultGroupSettings() {
   }
 }
 
-const groupNodeOptions = computed(() => {
-  const group = editGroups.value.find(item => item.id === outboundForm.value.groupId)
-  return group?.servers || []
-})
-
 function nodeKeyForRef(ref) {
   return `${ref.type}:${ref.index}:${ref.sub || 0}`
 }
 
-function editNodeLabel(ref) {
-  if (ref.type === 'server') {
-    const server = editServers.value.find(item => item._index === ref.index) || editServers.value[ref.index]
-    return `[${server?.type || '?'}] ${server?.name || '未命名'} — ${server?.host || '?'}:${server?.port || 0}`
+function editNodeLabel(item) {
+  const server = item?.server
+  return `[${server?.type || '?'}] ${server?.name || '未命名'} — ${server?.host || '?'}:${server?.port || 0}`
+}
+
+function mergeNodeOptions(current, incoming) {
+  const merged = new Map(current.map(item => [nodeKeyForRef(item.ref), item]))
+  for (const item of incoming || []) merged.set(nodeKeyForRef(item.ref), item)
+  return [...merged.values()]
+}
+
+async function loadConfiguredOutboundNode(refObj) {
+  if (!refObj) return
+  const { data } = await api.queryServers([refObj])
+  outboundNodeOptions.value = mergeNodeOptions(outboundNodeOptions.value, data.results || [])
+}
+
+async function searchOutboundNodes() {
+  const query = outboundNodeSearch.value.trim()
+  if (!query || outboundNodesLoading.value) return
+  outboundNodesLoading.value = true
+  try {
+    const { data } = await api.searchServers(query, 100)
+    outboundNodeOptions.value = mergeNodeOptions(
+      outboundForm.value.nodeKey ? outboundNodeOptions.value.filter(item => nodeKeyForRef(item.ref) === outboundForm.value.nodeKey) : [],
+      data.results || [],
+    )
+  } finally {
+    outboundNodesLoading.value = false
   }
-  if (ref.type === 'sub_server') {
-    const sub = editSubscriptions.value[ref.sub || 0]
-    const server = sub?.servers?.[ref.index]
-    return `[${server?.type || '?'}] ${server?.name || '未命名'} — ${server?.host || '?'}:${server?.port || 0}`
+}
+
+async function loadOutboundGroupNodes(groupId, page = 1, append = false) {
+  if (!groupId) return
+  const query = outboundGroupNodeSearch.value.trim()
+  const loadVersion = ++outboundGroupLoadVersion
+  outboundGroupNodesLoading.value = true
+  try {
+    const params = { view: 'catalog' }
+    if (query) params.q = query
+    const { data } = await api.getGroupServers(groupId, page, OUTBOUND_GROUP_PAGE_SIZE, params)
+    if (loadVersion !== outboundGroupLoadVersion || outboundForm.value.groupId !== groupId) return
+    outboundGroupNodeOptions.value = append
+      ? mergeNodeOptions(outboundGroupNodeOptions.value, data.results || [])
+      : (data.results || [])
+    outboundGroupNodeTotal.value = Number(data.serverCount || 0)
+    outboundGroupNodePage.value = page
+    if (outboundForm.value.activeNodeKey && !outboundGroupNodeOptions.value.some(item => nodeKeyForRef(item.ref) === outboundForm.value.activeNodeKey)) {
+      const [type, index, sub] = outboundForm.value.activeNodeKey.split(':')
+      const selected = await api.queryServers([{ type, index: Number(index), sub: Number(sub) }])
+      if (loadVersion === outboundGroupLoadVersion) {
+        outboundGroupNodeOptions.value = mergeNodeOptions(outboundGroupNodeOptions.value, selected.data.results || [])
+      }
+    }
+  } finally {
+    if (loadVersion === outboundGroupLoadVersion) outboundGroupNodesLoading.value = false
   }
-  return '未知节点'
+}
+
+function loadMoreOutboundGroupNodes() {
+  if (!outboundForm.value.groupId || outboundGroupNodesLoading.value) return
+  loadOutboundGroupNodes(outboundForm.value.groupId, outboundGroupNodePage.value + 1, true)
 }
 
 async function openOutboundEdit(o) {
   // 先设置表单，弹窗立即打开
   editingOutbound.value = o
   const t = o.target || {}
-  const defaults = await defaultGroupSettings()
+  const defaults = { probeInterval: '300s', switchThresholdMs: 100, switchCooldownSec: 600 }
   outboundForm.value = {
     targetType: t.targetType || 'node',
     nodeKey: t.nodeRef ? `${t.nodeRef.type}:${t.nodeRef.index}:${t.nodeRef.sub || 0}` : '',
@@ -809,24 +884,49 @@ async function openOutboundEdit(o) {
     switchThresholdMs: typeof o.switchThresholdMs === 'number' ? o.switchThresholdMs : defaults.switchThresholdMs,
     switchCooldownSec: typeof o.switchCooldownSec === 'number' ? o.switchCooldownSec : defaults.switchCooldownSec,
   }
-  // 实时从后端获取最新数据，直接写入弹窗专用变量
-  const [gRes, sRes, subRes, ibRes] = await Promise.all([
-    api.getGroups(),
-    api.getServers('catalog'),
-    api.getSubscriptions('catalog'),
-    api.getCustomInbounds(),
-  ])
-  editGroups.value = gRes.data.groups || []
-  const inbounds = ibRes.data.inbounds || []
-  const inboundIDSet = new Set(inbounds.map(ib => ib.id))
-  editServers.value = (sRes.data.servers || []).map((server, index) => ({ ...server, _index: index })).filter(s => {
-    if (typeof s.source !== 'string' || !s.source.startsWith('inbound:')) return true
-    const rest = s.source.slice('inbound:'.length)
-    const id = rest.split(':')[0]
-    return inboundIDSet.has(id)
+  editGroups.value = []
+  outboundGroupsLoading.value = true
+  outboundNodeSearch.value = ''
+  outboundNodeOptions.value = []
+  outboundGroupNodeOptions.value = []
+  outboundGroupNodeTotal.value = 0
+  outboundGroupNodePage.value = 0
+  outboundGroupNodeSearch.value = ''
+  const groupsRequest = api.getGroups('summary').then(({ data }) => {
+    if (editingOutbound.value?.name !== o.name) return
+    editGroups.value = data.groups || []
+    outboundGroupsLoading.value = false
+  }).catch(() => {
+    if (editingOutbound.value?.name === o.name) outboundGroupsLoading.value = false
   })
-  editSubscriptions.value = subRes.data.subscriptions || []
+  const defaultsRequest = defaultGroupSettings().then(settingDefaults => {
+    if (editingOutbound.value?.name !== o.name) return
+    if (!o.probeInterval) outboundForm.value.probeInterval = settingDefaults.probeInterval
+    if (typeof o.switchThresholdMs !== 'number') outboundForm.value.switchThresholdMs = settingDefaults.switchThresholdMs
+    if (typeof o.switchCooldownSec !== 'number') outboundForm.value.switchCooldownSec = settingDefaults.switchCooldownSec
+  })
+  const selectedNodeRequest = t.nodeRef ? loadConfiguredOutboundNode(t.nodeRef) : Promise.resolve()
+  const groupNodesRequest = t.groupId ? loadOutboundGroupNodes(t.groupId) : Promise.resolve()
+  await Promise.all([groupsRequest, defaultsRequest, selectedNodeRequest, groupNodesRequest])
 }
+
+watch(() => outboundForm.value.groupId, (groupId, previousGroupId) => {
+  if (!editingOutbound.value || outboundForm.value.targetType !== 'group' || !groupId) return
+  if (previousGroupId && previousGroupId !== groupId) {
+    outboundForm.value.activeNodeKey = ''
+    outboundGroupNodeSearch.value = ''
+  }
+  loadOutboundGroupNodes(groupId)
+})
+
+watch(outboundGroupNodeSearch, () => {
+  if (!editingOutbound.value || outboundForm.value.targetType !== 'group' || !outboundForm.value.groupId) return
+  clearTimeout(outboundGroupSearchTimer)
+  outboundGroupSearchTimer = setTimeout(() => {
+    if (!editingOutbound.value) return
+    loadOutboundGroupNodes(outboundForm.value.groupId)
+  }, 300)
+})
 
 async function createOutbound() {
   if (creatingOutbound.value) return
@@ -874,11 +974,10 @@ async function submitOutboundRename() {
   try {
     await api.renameOutbound(oldName, newName)
     if (currentOutbound.value === oldName) currentOutbound.value = newName
+    store.invalidateNodeDetails()
     closeOutboundRename()
     await Promise.all([
       store.fetchOutbounds(),
-      store.fetchServers(),
-      store.fetchSubscriptions(false, true),
       store.fetchStatus(),
     ])
   } catch (e) {
@@ -934,6 +1033,7 @@ async function loadLogs() {
     const params = {}
     if (logsInboundFilter.value) params.inbound = logsInboundFilter.value
     if (logsIncludeSystem.value) params.system = '1'
+    params.limit = 50
     const res = await api.getLogs(params)
     setLogs(res.data.logs || [])
   } catch (e) {
@@ -971,8 +1071,8 @@ function startLogsStream() {
         const entry = JSON.parse(e.data)
         if (logsStreaming.value) {
           logs.value.push(entry)
-          if (logs.value.length > 500) {
-            logs.value = logs.value.slice(-500)
+          if (logs.value.length > 50) {
+            logs.value = logs.value.slice(-50)
           }
           scrollLogsToBottom()
         }
