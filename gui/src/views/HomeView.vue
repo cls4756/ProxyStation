@@ -64,10 +64,16 @@
       </div>
 
       <!-- 多选工具栏（有选中时显示） -->
-      <div class="bulk-bar" v-if="selectedRefs.length || showSelectAll">
+      <div class="bulk-bar" v-if="hasSelection">
         <span class="bulk-count">已选 {{ selectedRefs.length }} 个节点</span>
         <button class="action-btn" @click="selectAll" v-if="!allSelected">☑ 全选</button>
-        <button class="action-btn" @click="selectedRefs = []" v-if="allSelected">☐ 取消全选</button>
+        <button class="action-btn" @click="clearSelection" v-if="allSelected">☐ 取消全选</button>
+        <button v-if="singleSelectedRef" class="action-btn action-btn-primary" @click="connectNode(singleSelectedRef)">
+          🔗 连接 / 切换
+        </button>
+        <button v-if="singleSelectedRef?.type === 'server' && singleSelectedServer" class="action-btn" @click="openNodeMenu('edit', singleSelectedRef, singleSelectedServer)">
+          ✏ 编辑
+        </button>
         <button class="action-btn" @click="pingSelected('fast')" :disabled="pinging">⚡ 批量快速</button>
         <button class="action-btn" @click="pingSelected('real')" :disabled="pinging">🧪 批量真连</button>
         <button v-if="pinging" class="action-btn action-btn-danger" @click="abortPing">⏹ 中止检测</button>
@@ -83,7 +89,7 @@
         <button class="action-btn" @click="showBulkCopyModal = true">📋 复制到分组</button>
         <button v-if="canBulkRemove" class="action-btn" @click="showBulkMoveModal = true">✂ 移动到分组</button>
         <button v-if="canBulkRemove" class="action-btn action-btn-danger" @click="removeSelected">✕ 批量删除</button>
-        <button class="action-btn" @click="selectedRefs = []">取消选择</button>
+        <button class="action-btn" @click="clearSelection">取消选择</button>
       </div>
 
       <!-- 搜索结果面板 -->
@@ -131,7 +137,7 @@
               <span class="info-url" :title="sub.url">{{ sub.url }}</span>
               <span v-if="sub.updatedAt" class="info-time">{{ formatTime(sub.updatedAt) }}</span>
             </div>
-            <div class="info-bar-right">
+            <div class="info-bar-right" v-if="!hasSelection">
               <input
                 class="search-input"
                 v-model="searchQuery"
@@ -210,7 +216,7 @@
               <span class="group-name-display">{{ group.name }}</span>
               <span class="info-count">{{ groupServerCount(group) }} 个节点</span>
             </div>
-            <div class="info-bar-right">
+            <div class="info-bar-right" v-if="!hasSelection">
               <input
                 class="search-input"
                 v-model="searchQuery"
@@ -823,6 +829,16 @@ const nodeMenuServer = ref(null)
 
 // 多选状态
 const selectedRefs = ref([])
+const hasSelection = computed(() => selectedRefs.value.length > 0)
+const singleSelectedRef = computed(() => selectedRefs.value.length === 1 ? selectedRefs.value[0] : null)
+const singleSelectedServer = computed(() => {
+  const refObj = singleSelectedRef.value
+  if (!refObj) return null
+  const searchItem = searchResults.value.find(item => refKey(item.ref) === refKey(refObj))
+  if (searchItem?.server) return searchItem.server
+  if (refObj.type === 'server') return store.servers[refObj.index] || null
+  return store.subscriptions[refObj.sub || 0]?.servers?.[refObj.index] || null
+})
 const selectedKeys = computed(() => new Set(selectedRefs.value.map(refKey)))
 const selectionAnchorKey = ref('')
 const dragSelecting = ref(false)
@@ -1058,6 +1074,13 @@ function selectAll() {
   const currentTabServers = getCurrentTabServers()
   selectedRefs.value = [...currentTabServers]
   showSelectAll.value = true
+}
+
+function clearSelection() {
+  selectedRefs.value = []
+  showSelectAll.value = false
+  selectionAnchorKey.value = ''
+  endDragSelect()
 }
 
 // 切换 tab 时清空选择
@@ -1469,22 +1492,45 @@ function formatTime(t) {
 async function connectNode(ref) {
   const outbound = store.outbounds.find(o => o.name === currentOutbound.value)
   const t = outbound?.target
+  const normalizedRef = { type: ref.type, index: ref.index, sub: ref.sub || 0 }
 
-  // 当前是分组模式，点击节点会切换为手动模式，给出提示
+  if (t?.targetType === 'group' && currentNodeGroupId(normalizedRef) === t.groupId) {
+    await api.setOutboundActiveNode(currentOutbound.value, normalizedRef)
+    await Promise.all([store.fetchOutbounds(), store.fetchStatus()])
+    return
+  }
+
+  // 当前节点不属于已绑定分组时，保持原来的行为：切换为单节点模式。
   if (t?.targetType === 'group') {
     const groupName = store.groups.find(g => g.id === t.groupId)?.name || t.groupId
-    if (!confirm(`当前出站已绑定分组「${groupName}」（自动选优）。\n点击确认将切换为手动指定此节点。`)) {
-      return
-    }
+    if (!confirm(`当前出站已绑定分组「${groupName}」（自动选优）。\n所选节点不在该分组内，点击确认将切换为手动指定此节点。`)) return
   }
 
   const active = t?.nodeRef
-  if (active?.type === ref.type && active?.index === ref.index && active?.sub === (ref.sub || 0)) {
+  if (active?.type === normalizedRef.type && active?.index === normalizedRef.index && (active?.sub || 0) === normalizedRef.sub) {
     await api.disconnectOutbound(currentOutbound.value)
   } else {
-    await api.connectOutbound(currentOutbound.value, { targetType: 'node', nodeRef: { type: ref.type, index: ref.index, sub: ref.sub || 0 } })
+    await api.connectOutbound(currentOutbound.value, { targetType: 'node', nodeRef: normalizedRef })
   }
   await Promise.all([store.fetchOutbounds(), store.fetchStatus()])
+}
+
+function currentNodeGroupId(ref) {
+  if (isSearching.value) return ''
+  if (activeTab.value.startsWith('group-')) {
+    const groupIndex = parseInt(activeTab.value.replace('group-', ''))
+    const group = manualGroups.value[groupIndex]
+    const belongsToGroup = (group?.servers || []).some(item =>
+      item?.type === ref.type && item?.index === ref.index && (item?.sub || 0) === ref.sub
+    )
+    return belongsToGroup ? group.id : ''
+  }
+  if (activeTab.value.startsWith('sub-')) {
+    const subscriptionIndex = parseInt(activeTab.value.replace('sub-', ''))
+    if (ref.type !== 'sub_server' || ref.sub !== subscriptionIndex) return ''
+    return store.subscriptions[subscriptionIndex]?.groupId || ''
+  }
+  return ''
 }
 
 async function pingSingleNode(ref) {
@@ -2218,27 +2264,39 @@ async function confirmSingleMove() {
   .table-scroll > :first-child { display: none; }
 
   .bulk-bar {
-    align-items: stretch;
-    flex-wrap: wrap;
-    gap: 7px;
-    padding: 10px;
+    align-items: center;
+    flex-wrap: nowrap;
+    gap: 6px;
+    padding: 6px 8px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: none;
+    overscroll-behavior-x: contain;
+    -webkit-overflow-scrolling: touch;
   }
 
+  .bulk-bar::-webkit-scrollbar { display: none; }
+
   .bulk-count {
-    flex-basis: 100%;
+    flex: 0 0 auto;
     margin-right: 0;
+    padding: 0 4px;
+    white-space: nowrap;
   }
 
   .bulk-bar .action-btn {
-    flex: 1 1 calc(50% - 7px);
+    flex: 0 0 auto;
     justify-content: center;
-    min-height: 36px;
+    min-height: 30px;
+    padding: 4px 8px;
+    font-size: 11px;
+    white-space: nowrap;
   }
 
   .bulk-bar .ping-progress {
-    flex-basis: 100%;
-    max-width: none;
-    text-align: center;
+    flex: 0 0 auto;
+    max-width: 160px;
+    white-space: nowrap;
   }
 
   .notice-bar { padding: 9px 12px; }

@@ -75,6 +75,7 @@ func NewRouter(guiDir string) *gin.Engine {
 		api.PUT("/outbounds/:name/rename", renameOutbound)
 		api.DELETE("/outbounds/:name", deleteOutbound)
 		api.POST("/outbounds/:name/connect", connectOutbound)
+		api.PUT("/outbounds/:name/active-node", setOutboundActiveNode)
 		api.POST("/outbounds/:name/disconnect", disconnectOutbound)
 		api.GET("/cfgoodnet/ca/download", downloadCfGoodNetCA)
 		api.POST("/cfgoodnet/ca/import", importCfGoodNetCAToSystem)

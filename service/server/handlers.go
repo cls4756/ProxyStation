@@ -2371,6 +2371,45 @@ func connectOutbound(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
+func setOutboundActiveNode(c *gin.Context) {
+	name := c.Param("name")
+	var req struct {
+		Ref configure.NodeRef `json:"ref"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	o := configure.GetOutbound(name)
+	if o == nil || o.Target.TargetType != "group" || strings.TrimSpace(o.Target.GroupID) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "出站未绑定分组"})
+		return
+	}
+	_, group := configure.GetGroupByID(o.Target.GroupID)
+	if group == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "出站绑定的分组不存在"})
+		return
+	}
+	if !groupContainsNodeRef(group.Servers, req.Ref) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "指定节点不属于出站绑定分组"})
+		return
+	}
+	current := o.Target.ActiveNodeRef
+	if current != nil && current.Type == req.Ref.Type && current.Index == req.Ref.Index && current.Sub == req.Ref.Sub {
+		c.JSON(http.StatusOK, gin.H{"ok": true, "outbound": o})
+		return
+	}
+	if err := configure.SetOutboundActiveNode(name, &req.Ref); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	observatory.MarkManualSwitch(name)
+	if engine.Manager.IsRunning() {
+		_ = engine.Manager.Restart()
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "outbound": configure.GetOutbound(name)})
+}
+
 func disconnectOutbound(c *gin.Context) {
 	name := c.Param("name")
 	o := configure.GetOutbound(name)

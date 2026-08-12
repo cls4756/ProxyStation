@@ -43,7 +43,7 @@
       <!-- 连接按钮 -->
       <button
         :class="['row-btn', 'row-btn-connect', connected ? 'row-btn-connected' : '']"
-        :title="connected ? '断开连接' : '连接此节点'"
+        :title="connectionButtonTitle"
         @click="$emit('connect', refObj)"
       >
         {{ connected ? '已连接' : '连接' }}
@@ -126,6 +126,12 @@ const connected = computed(() => {
       (t.activeNodeRef.sub || 0) === (props.refObj.sub || 0)
   }
   return false
+})
+
+const connectionButtonTitle = computed(() => {
+  if (!connected.value) return '连接此节点'
+  const outbound = props.outbounds.find(o => o.name === props.currentOutbound)
+  return outbound?.target?.targetType === 'group' ? '当前分组节点' : '断开连接'
 })
 
 function latText(lat) {
@@ -541,26 +547,7 @@ const pingStateClass = computed(() => {
   .row-ipscore { grid-column: 4; }
 
   .row-ops {
-    grid-column: 1 / -1;
-    grid-row: 5;
-    display: grid !important;
-    grid-template-columns: repeat(auto-fit, minmax(68px, 1fr));
-    gap: 7px;
-    width: auto;
-    padding-top: 4px !important;
+    display: none !important;
   }
-
-  .row-btn {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    gap: 4px;
-    min-height: 34px;
-    padding: 6px 8px;
-    font-size: 12px;
-    background: #fff;
-  }
-
-  .row-btn-label { display: inline; }
 }
 </style>

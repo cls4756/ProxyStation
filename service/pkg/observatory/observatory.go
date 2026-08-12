@@ -126,6 +126,12 @@ func OnOutboundUpdated(name string) {
 	}
 }
 
+// MarkManualSwitch records a user-selected active node so automatic switching
+// respects the outbound cooldown instead of immediately overriding the choice.
+func MarkManualSwitch(name string) {
+	markSwitched(name)
+}
+
 // OnGroupUpdated runs an immediate probe after a group membership/source update.
 // If the group is bound to an outbound, reuse that outbound's switch logic;
 // otherwise just refresh node latency values for display.

@@ -242,6 +242,92 @@ func TestGroupSummaryAndPagedServers(t *testing.T) {
 	}
 }
 
+func TestSetOutboundActiveNodePreservesGroupBinding(t *testing.T) {
+	setupListQueryTestDB(t)
+	if err := configure.AppendServers([]*configure.ServerRaw{
+		{Name: "a"}, {Name: "b"}, {Name: "outside"},
+	}); err != nil {
+		t.Fatalf("append servers: %v", err)
+	}
+	if err := configure.AppendGroup(&configure.Group{
+		ID: "group", Name: "group", Servers: []configure.ServerRef{
+			{Type: "server", Index: 0}, {Type: "server", Index: 1},
+		},
+	}); err != nil {
+		t.Fatalf("append group: %v", err)
+	}
+	threshold, cooldown := 120, 900
+	if err := configure.SetOutbound("proxy", &configure.Outbound{
+		Name: "proxy",
+		Target: configure.OutboundTarget{
+			TargetType: "group", GroupID: "group", Mode: configure.ModeStable,
+			ActiveNodeRef: &configure.NodeRef{Type: "server", Index: 0},
+		},
+		ProbeInterval: "5m", ProbeMode: "real",
+		SwitchThresholdMs: &threshold, SwitchCooldownSec: &cooldown,
+	}); err != nil {
+		t.Fatalf("set outbound: %v", err)
+	}
+
+	body := bytes.NewBufferString(`{"ref":{"type":"server","index":1,"sub":0}}`)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Params = gin.Params{{Key: "name", Value: "proxy"}}
+	context.Request = httptest.NewRequest(http.MethodPut, "/api/outbounds/proxy/active-node", body)
+	context.Request.Header.Set("Content-Type", "application/json")
+	setOutboundActiveNode(context)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("unexpected status %d: %s", recorder.Code, recorder.Body.String())
+	}
+	outbound := configure.GetOutbound("proxy")
+	if outbound == nil || outbound.Target.TargetType != "group" || outbound.Target.GroupID != "group" || outbound.Target.Mode != configure.ModeStable {
+		t.Fatalf("group binding changed: %+v", outbound)
+	}
+	if outbound.Target.ActiveNodeRef == nil || outbound.Target.ActiveNodeRef.Index != 1 {
+		t.Fatalf("active node not updated: %+v", outbound.Target.ActiveNodeRef)
+	}
+	if outbound.ProbeInterval != "5m" || outbound.ProbeMode != "real" || outbound.SwitchThresholdMs == nil || *outbound.SwitchThresholdMs != threshold || outbound.SwitchCooldownSec == nil || *outbound.SwitchCooldownSec != cooldown {
+		t.Fatalf("outbound settings changed: %+v", outbound)
+	}
+}
+
+func TestSetOutboundActiveNodeRejectsNodeOutsideGroup(t *testing.T) {
+	setupListQueryTestDB(t)
+	if err := configure.AppendServers([]*configure.ServerRaw{{Name: "inside"}, {Name: "outside"}}); err != nil {
+		t.Fatalf("append servers: %v", err)
+	}
+	if err := configure.AppendGroup(&configure.Group{
+		ID: "group", Servers: []configure.ServerRef{{Type: "server", Index: 0}},
+	}); err != nil {
+		t.Fatalf("append group: %v", err)
+	}
+	if err := configure.SetOutbound("proxy", &configure.Outbound{
+		Name: "proxy", Target: configure.OutboundTarget{
+			TargetType: "group", GroupID: "group", Mode: configure.ModeLeastPing,
+			ActiveNodeRef: &configure.NodeRef{Type: "server", Index: 0},
+		},
+	}); err != nil {
+		t.Fatalf("set outbound: %v", err)
+	}
+
+	body := bytes.NewBufferString(`{"ref":{"type":"server","index":1,"sub":0}}`)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Params = gin.Params{{Key: "name", Value: "proxy"}}
+	context.Request = httptest.NewRequest(http.MethodPut, "/api/outbounds/proxy/active-node", body)
+	context.Request.Header.Set("Content-Type", "application/json")
+	setOutboundActiveNode(context)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status %d: %s", recorder.Code, recorder.Body.String())
+	}
+	outbound := configure.GetOutbound("proxy")
+	if outbound.Target.ActiveNodeRef == nil || outbound.Target.ActiveNodeRef.Index != 0 {
+		t.Fatalf("active node changed after rejected request: %+v", outbound.Target.ActiveNodeRef)
+	}
+}
+
 func TestGroupServersByIDSupportsFilterAndCatalogView(t *testing.T) {
 	setupListQueryTestDB(t)
 	if err := configure.AppendServers([]*configure.ServerRaw{

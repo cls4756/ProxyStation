@@ -86,6 +86,7 @@ export const api = {
   deleteOutbound: (name) => http.delete(`/outbounds/${name}`),
   // target 之外的 extra 承载出站顶层字段（probeInterval / probeMode），后端按需读取
   connectOutbound: (name, target, extra = {}) => http.post(`/outbounds/${name}/connect`, { ...target, ...extra }),
+  setOutboundActiveNode: (name, ref) => http.put(`/outbounds/${name}/active-node`, { ref }),
   disconnectOutbound: (name) => http.post(`/outbounds/${name}/disconnect`),
   downloadCfGoodNetCA: () => window.open('/api/cfgoodnet/ca/download', '_blank'),
   importCfGoodNetCA: () => http.post('/cfgoodnet/ca/import'),
