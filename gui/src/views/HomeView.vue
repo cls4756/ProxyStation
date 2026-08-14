@@ -207,10 +207,18 @@
               @copy-to-group="ref => openSingleCopy(ref)"
             />
           </div>
-          <div class="node-pagination" v-if="currentNodeTotal > NODE_PAGE_SIZE">
+          <div class="node-pagination" v-if="currentNodeTotal > 0">
             <button class="action-btn" :disabled="nodePage <= 1" @click="changeNodePage(nodePage - 1)">‹ 上一页</button>
             <span>第 {{ nodePage }} / {{ nodeTotalPages }} 页，共 {{ currentNodeTotal }} 个</span>
             <button class="action-btn" :disabled="nodePage >= nodeTotalPages" @click="changeNodePage(nodePage + 1)">下一页 ›</button>
+            <label class="node-page-size">
+              每页
+              <select v-model.number="nodePageSize" @change="changeNodePageSize">
+                <option v-for="option in NODE_PAGE_SIZE_OPTIONS" :key="option.value" :value="option.value">
+                  {{ option.label }}
+                </option>
+              </select>
+            </label>
           </div>
         </div>
       </template>
@@ -288,10 +296,18 @@
               @move-to-group="ref => openSingleMove(ref)"
             />
           </div>
-          <div class="node-pagination" v-if="currentNodeTotal > NODE_PAGE_SIZE">
+          <div class="node-pagination" v-if="currentNodeTotal > 0">
             <button class="action-btn" :disabled="nodePage <= 1" @click="changeNodePage(nodePage - 1)">‹ 上一页</button>
             <span>第 {{ nodePage }} / {{ nodeTotalPages }} 页，共 {{ currentNodeTotal }} 个</span>
             <button class="action-btn" :disabled="nodePage >= nodeTotalPages" @click="changeNodePage(nodePage + 1)">下一页 ›</button>
+            <label class="node-page-size">
+              每页
+              <select v-model.number="nodePageSize" @change="changeNodePageSize">
+                <option v-for="option in NODE_PAGE_SIZE_OPTIONS" :key="option.value" :value="option.value">
+                  {{ option.label }}
+                </option>
+              </select>
+            </label>
           </div>
         </div>
       </template>
@@ -552,7 +568,13 @@ const isSearching = ref(false)
 const pingProgress = ref({ total: 0, done: 0, current: '' })
 const pingStates = ref({})
 const FAST_PING_CONCURRENCY = 6
-const NODE_PAGE_SIZE = 100
+const NODE_PAGE_SIZE_OPTIONS = [
+  { value: 100, label: '100 条' },
+  { value: 500, label: '500 条' },
+  { value: 1000, label: '1000 条' },
+  { value: 0, label: '全部' },
+]
+const nodePageSize = ref(100)
 const nodePage = ref(1)
 
 // ---- 列宽 ----
@@ -806,11 +828,11 @@ async function refreshPanel() {
     // 根据当前 tab 只刷新表格数据
     if (activeTab.value.startsWith('sub-')) {
       const si = parseInt(activeTab.value.replace('sub-', ''))
-      await store.fetchSubscriptionServers(si, true, nodePage.value, NODE_PAGE_SIZE)
+      await store.fetchSubscriptionServers(si, true, nodePage.value, nodePageSize.value)
     } else if (activeTab.value.startsWith('group-')) {
       const gi = parseInt(activeTab.value.replace('group-', ''))
       const group = manualGroups.value[gi]
-      if (group) await store.fetchGroupServers(realGroupIndex(group), true, nodePage.value, NODE_PAGE_SIZE)
+      if (group) await store.fetchGroupServers(realGroupIndex(group), true, nodePage.value, nodePageSize.value)
     }
   } catch (e) {
     showNotice('刷新失败：' + (e?.response?.data?.error || e?.message || '未知错误'), true)
@@ -1060,8 +1082,10 @@ function getCurrentTabServers() {
   if (activeTab.value.startsWith('sub-')) {
     const si = parseInt(activeTab.value.replace('sub-', ''))
     const sub = store.subscriptions[si]
-    const start = (nodePage.value - 1) * NODE_PAGE_SIZE
-    const end = Math.min(start + NODE_PAGE_SIZE, Number(sub?.serverCount || 0))
+    const start = nodePageSize.value > 0 ? (nodePage.value - 1) * nodePageSize.value : 0
+    const end = nodePageSize.value > 0
+      ? Math.min(start + nodePageSize.value, Number(sub?.serverCount || 0))
+      : Number(sub?.serverCount || 0)
     return Array.from({ length: Math.max(0, end - start) }, (_, offset) => ({
       type: 'sub_server', index: start + offset, sub: si,
     }))
@@ -1121,13 +1145,13 @@ watch(activeTab, async () => {
 async function ensureActiveTabNodes() {
   if (activeTab.value.startsWith('sub-')) {
     const si = parseInt(activeTab.value.replace('sub-', ''))
-    await store.fetchSubscriptionServers(si, false, nodePage.value, NODE_PAGE_SIZE)
+    await store.fetchSubscriptionServers(si, false, nodePage.value, nodePageSize.value)
     return
   }
   if (activeTab.value.startsWith('group-')) {
     const gi = parseInt(activeTab.value.replace('group-', ''))
     const group = manualGroups.value[gi]
-    if (group) await store.fetchGroupServers(realGroupIndex(group), false, nodePage.value, NODE_PAGE_SIZE)
+    if (group) await store.fetchGroupServers(realGroupIndex(group), false, nodePage.value, nodePageSize.value)
   }
 }
 
@@ -1173,7 +1197,10 @@ const currentNodeTotal = computed(() => {
   return 0
 })
 
-const nodeTotalPages = computed(() => Math.max(1, Math.ceil(currentNodeTotal.value / NODE_PAGE_SIZE)))
+const nodeTotalPages = computed(() => {
+  if (nodePageSize.value <= 0) return 1
+  return Math.max(1, Math.ceil(currentNodeTotal.value / nodePageSize.value))
+})
 
 watch(currentNodeTotal, () => {
   if (nodePage.value > nodeTotalPages.value) {
@@ -1184,6 +1211,13 @@ watch(currentNodeTotal, () => {
 
 async function changeNodePage(page) {
   nodePage.value = Math.min(Math.max(1, page), nodeTotalPages.value)
+  clearSortOrder()
+  selectedRefs.value = []
+  await ensureActiveTabNodes()
+}
+
+async function changeNodePageSize() {
+  nodePage.value = 1
   clearSortOrder()
   selectedRefs.value = []
   await ensureActiveTabNodes()
@@ -1446,8 +1480,10 @@ function getSortedGroupEntries(group) {
 }
 
 function getSubServerEntries(sub, si) {
-  const start = (nodePage.value - 1) * NODE_PAGE_SIZE
-  const end = Math.min(start + NODE_PAGE_SIZE, Number(sub?.serverCount || 0))
+  const start = nodePageSize.value > 0 ? (nodePage.value - 1) * nodePageSize.value : 0
+  const end = nodePageSize.value > 0
+    ? Math.min(start + nodePageSize.value, Number(sub?.serverCount || 0))
+    : Number(sub?.serverCount || 0)
   const entries = []
   for (let index = start; index < end; index += 1) {
     const server = sub?.servers?.[index]
@@ -1457,8 +1493,9 @@ function getSubServerEntries(sub, si) {
 }
 
 function getGroupPageRefs(group) {
-  const start = (nodePage.value - 1) * NODE_PAGE_SIZE
-  return (group?.servers || []).slice(start, start + NODE_PAGE_SIZE).filter(Boolean)
+  if (nodePageSize.value <= 0) return (group?.servers || []).filter(Boolean)
+  const start = (nodePage.value - 1) * nodePageSize.value
+  return (group?.servers || []).slice(start, start + nodePageSize.value).filter(Boolean)
 }
 
 function getSubscriptionRefs(si) {
@@ -2162,6 +2199,8 @@ async function confirmSingleMove() {
 .info-time { font-size: 11px; color: #bfbfbf; white-space: nowrap; }
 .info-count { font-size: 12px; color: #8c8c8c; }
 .node-pagination { display:flex; align-items:center; justify-content:center; gap:12px; padding:10px 12px; color:#666; font-size:12px; border-top:1px solid #eee; }
+.node-page-size { display:flex; align-items:center; gap:6px; white-space:nowrap; }
+.node-page-size select { height:28px; padding:0 24px 0 8px; border:1px solid #d9d9d9; border-radius:5px; background:#fff; color:#555; font-size:12px; }
 .group-name-display { font-size: 14px; font-weight: 600; color: #262626; }
 
 /* 空状态 */

@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -88,6 +89,64 @@ func TestSubscriptionServersSupportsPagination(t *testing.T) {
 	}
 	if payload.ServerCount != 3 || payload.Offset != 2 || len(payload.Servers) != 1 || payload.Servers[0].Name != "c" {
 		t.Fatalf("unexpected paged response: %s", recorder.Body.String())
+	}
+}
+
+func TestSubscriptionServersSupportsThousandAndAllPageSizes(t *testing.T) {
+	setupListQueryTestDB(t)
+	servers := make([]configure.ServerRaw, 1001)
+	for i := range servers {
+		servers[i].Name = fmt.Sprintf("node-%d", i)
+	}
+	if err := configure.AppendSubscriptions([]*configure.SubscriptionRaw{{ID: "sub", Servers: servers}}); err != nil {
+		t.Fatalf("append subscription: %v", err)
+	}
+
+	for _, testCase := range []struct {
+		name     string
+		query    string
+		expected int
+	}{
+		{name: "thousand", query: "?page=1&pageSize=1000", expected: 1000},
+		{name: "all", query: "?page=1&pageSize=0", expected: 1001},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			context, _ := gin.CreateTestContext(recorder)
+			context.Params = gin.Params{{Key: "index", Value: "0"}}
+			context.Request = httptest.NewRequest(http.MethodGet, "/api/subscriptions/0/servers"+testCase.query, nil)
+			getSubscriptionServers(context)
+
+			var payload struct {
+				Servers []serverListItem `json:"servers"`
+			}
+			if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if len(payload.Servers) != testCase.expected {
+				t.Fatalf("expected %d servers, got %d", testCase.expected, len(payload.Servers))
+			}
+		})
+	}
+}
+
+func TestPageBoundsSupportsThousandAndAllPageSizes(t *testing.T) {
+	for _, testCase := range []struct {
+		name          string
+		pageSize      int
+		expectedStart int
+		expectedEnd   int
+	}{
+		{name: "thousand", pageSize: 1000, expectedStart: 0, expectedEnd: 1000},
+		{name: "maximum", pageSize: 2000, expectedStart: 0, expectedEnd: 1000},
+		{name: "all", pageSize: 0, expectedStart: 0, expectedEnd: 1001},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			start, end := pageBounds(1001, 1, testCase.pageSize)
+			if start != testCase.expectedStart || end != testCase.expectedEnd {
+				t.Fatalf("expected bounds %d:%d, got %d:%d", testCase.expectedStart, testCase.expectedEnd, start, end)
+			}
+		})
 	}
 }
 

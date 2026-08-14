@@ -90,6 +90,7 @@ export const useProxyStore = defineStore('proxy', () => {
     if (!sub) return []
     const pageKey = `${page}:${pageSize}`
     if (!force && sub.loadedPages?.[pageKey] && Array.isArray(sub.servers)) {
+      if (pageSize <= 0) return sub.servers.filter(Boolean)
       return sub.servers.slice((page - 1) * pageSize, page * pageSize)
     }
     const loadKey = `${index}:${pageKey}`
@@ -191,6 +192,7 @@ export const useProxyStore = defineStore('proxy', () => {
     if (!group) return []
     const pageKey = `${page}:${pageSize}`
     if (!force && group.loadedPages?.[pageKey] && Array.isArray(group.servers)) {
+      if (pageSize <= 0) return group.servers.filter(Boolean)
       return group.servers.slice((page - 1) * pageSize, page * pageSize)
     }
     const loadKey = `${group.id}:${pageKey}`

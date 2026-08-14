@@ -1569,8 +1569,8 @@ func getSubscriptionServers(c *gin.Context) {
 	pageSize, _ := strconv.Atoi(c.Query("pageSize"))
 	start, end := 0, len(sub.Servers)
 	if page > 0 && pageSize > 0 {
-		if pageSize > 500 {
-			pageSize = 500
+		if pageSize > 1000 {
+			pageSize = 1000
 		}
 		start = (page - 1) * pageSize
 		if start > len(sub.Servers) {
@@ -1868,8 +1868,8 @@ func pageBounds(total, page, pageSize int) (int, int) {
 	if page < 1 || pageSize < 1 {
 		return 0, total
 	}
-	if pageSize > 500 {
-		pageSize = 500
+	if pageSize > 1000 {
+		pageSize = 1000
 	}
 	start := (page - 1) * pageSize
 	if start > total {
