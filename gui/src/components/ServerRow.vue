@@ -16,6 +16,9 @@
     <!-- 节点名 -->
     <div class="row-name" @click="onNameClick">
       <span :title="server.name || '未命名'">{{ server.name || '未命名' }}</span>
+      <span v-if="groupNames.length" class="row-groups" :title="`所在分组：${groupNames.join('、')}`">
+        分组：{{ groupNames.join('、') }}
+      </span>
     </div>
 
     <!-- 地址 -->
@@ -35,8 +38,11 @@
     <!-- IP 评分 -->
     <span :class="['row-ipscore', ipScoreClass]" :title="ipScoreTitle">{{ ipScoreText }}</span>
 
-    <!-- 探测状态/延迟 -->
-    <span :class="['row-lat', pingStateClass, latClass(server.latency)]">{{ pingStateText }}</span>
+    <!-- 快速 TCP 检测延时 -->
+    <span :class="['row-fast-lat', probeClass('fast')]" :title="probeTitle('fast')">{{ probeText('fast') }}</span>
+
+    <!-- 真连接检测延时 -->
+    <span :class="['row-real-lat', probeClass('real')]" :title="probeTitle('real')">{{ probeText('real') }}</span>
 
     <!-- 操作按钮 -->
     <div class="row-ops">
@@ -90,6 +96,7 @@ const props = defineProps({
   pingState: { type: Object, default: null },
   ipTypeState: { type: Object, default: null },
   ipScoreRunning: { type: Boolean, default: false },
+  groupNames: { type: Array, default: () => [] },
 })
 const emit = defineEmits([
   'connect',
@@ -134,27 +141,53 @@ const connectionButtonTitle = computed(() => {
   return outbound?.target?.targetType === 'group' ? '当前分组节点' : '断开连接'
 })
 
-function latText(lat) {
-  if (!lat || lat < 0) return '-'
-  return lat + 'ms'
+function probeValues(mode) {
+  if (mode === 'fast') {
+    return { latency: Number(props.server.fastLatency), probeTime: Number(props.server.lastFastProbeTime) }
+  }
+  return { latency: Number(props.server.latency), probeTime: Number(props.server.lastProbeTime) }
 }
-function latClass(lat) {
-  if (!lat || lat < 0) return 'lat-none'
-  if (lat < 200) return 'lat-good'
-  if (lat < 500) return 'lat-ok'
+
+function currentProbeState(mode) {
+  return props.pingState?.mode === mode ? props.pingState : null
+}
+
+function probeText(mode) {
+  const state = currentProbeState(mode)
+  if (state?.status === 'pending') return '等待中'
+  if (state?.status === 'running') return '测速中'
+  if (state?.status === 'done') return Number(state.latency) > 0 ? `${state.latency}ms` : '-1'
+  const { latency, probeTime } = probeValues(mode)
+  if (!Number.isFinite(probeTime) || probeTime <= 0) return '-'
+  return Number.isFinite(latency) && latency > 0 ? `${latency}ms` : '-1'
+}
+
+function probeClass(mode) {
+  const state = currentProbeState(mode)
+  if (state?.status === 'pending') return 'lat-pending'
+  if (state?.status === 'running') return 'lat-running'
+  const { latency, probeTime } = state?.status === 'done'
+    ? { latency: Number(state.latency), probeTime: 1 }
+    : probeValues(mode)
+  if (!Number.isFinite(probeTime) || probeTime <= 0) return 'lat-none'
+  if (!Number.isFinite(latency) || latency <= 0) return 'lat-fail'
+  if (latency < 200) return 'lat-good'
+  if (latency < 500) return 'lat-ok'
   return 'lat-bad'
 }
 
-const pingStateText = computed(() => {
-  if (!props.pingState) return latText(props.server.latency)
-  if (props.pingState.status === 'pending') return '等待中'
-  if (props.pingState.status === 'running') return '测速中'
-  if (typeof props.pingState.latency === 'number') {
-    if (props.pingState.latency < 0) return '-1'
-    return `${props.pingState.latency}ms`
-  }
-  return latText(props.server.latency)
-})
+function probeTitle(mode) {
+  const label = mode === 'fast' ? '快速检测' : '真连接检测'
+  const state = currentProbeState(mode)
+  if (state?.status === 'pending') return `${label}等待中`
+  if (state?.status === 'running') return `${label}进行中`
+  const { latency, probeTime } = state?.status === 'done'
+    ? { latency: Number(state.latency), probeTime: Math.floor(Date.now() / 1000) }
+    : probeValues(mode)
+  if (!Number.isFinite(probeTime) || probeTime <= 0) return `尚未进行${label}`
+  const result = Number.isFinite(latency) && latency > 0 ? `${latency}ms` : '不通'
+  return `${label}：${result} · ${new Date(probeTime * 1000).toLocaleString()}`
+}
 
 const IP_TYPE_LABELS = {
   idc: '机房',
@@ -242,13 +275,6 @@ const ipGeoTitle = computed(() => {
   return code ? `${ipGeoText.value} (${code})` : ipGeoText.value
 })
 
-const pingStateClass = computed(() => {
-  if (!props.pingState) return ''
-  if (props.pingState.status === 'pending') return 'lat-pending'
-  if (props.pingState.status === 'running') return 'lat-running'
-  if (typeof props.pingState.latency === 'number' && props.pingState.latency < 0) return 'lat-fail'
-  return ''
-})
 </script>
 
 <style scoped>
@@ -277,7 +303,7 @@ const pingStateClass = computed(() => {
 }
 
 /* 文字单元格允许划词，方便右键复制节点名/地址 */
-.row-name, .row-addr, .row-geo, .row-type, .row-iptype, .row-ipscore, .row-lat {
+.row-name, .row-addr, .row-geo, .row-type, .row-iptype, .row-ipscore, .row-fast-lat, .row-real-lat {
   user-select: text;
   -webkit-user-select: text;
 }
@@ -310,6 +336,9 @@ const pingStateClass = computed(() => {
   text-overflow: ellipsis;
   cursor: pointer;
   border-left: none !important;
+  flex-direction: column;
+  align-items: flex-start !important;
+  justify-content: center;
 }
 .row-name > span {
   overflow: hidden;
@@ -336,6 +365,13 @@ const pingStateClass = computed(() => {
   flex: 0 0 var(--col-type);
   width: var(--col-type);
   overflow: hidden;
+}
+.row-groups {
+  max-width: 100%;
+  margin-top: 2px;
+  color: #8c8c8c;
+  font-size: 10px;
+  font-weight: 400;
 }
 .row-geo {
   flex: 0 0 var(--col-geo);
@@ -368,15 +404,17 @@ const pingStateClass = computed(() => {
 .tag-socks5, .tag-socks, .tag-socks4 { background: #faf0ff; color: #6b46c1; }
 .tag-http, .tag-https, .tag-naive { background: #f7fafc; color: #4a5568; }
 
-.row-lat {
-  flex: 0 0 var(--col-latency);
-  width: var(--col-latency);
+.row-fast-lat,
+.row-real-lat {
   font-size: 12px;
   font-weight: 600;
   text-align: right;
+  justify-content: flex-end;
   white-space: nowrap;
   overflow: hidden;
 }
+.row-fast-lat { flex: 0 0 var(--col-fastLatency); width: var(--col-fastLatency); }
+.row-real-lat { flex: 0 0 var(--col-latency); width: var(--col-latency); }
 .row-iptype {
   flex: 0 0 var(--col-iptype);
   width: var(--col-iptype);
@@ -504,17 +542,22 @@ const pingStateClass = computed(() => {
     font-weight: 600;
   }
 
-  .row-lat {
+  .row-fast-lat,
+  .row-real-lat {
     grid-column: 4;
-    grid-row: 1;
     width: auto;
     min-width: 48px;
     justify-content: flex-end;
     font-size: 12px;
   }
 
+  .row-fast-lat { grid-row: 1; }
+  .row-real-lat { grid-row: 2; }
+  .row-fast-lat::before { content: '快 '; color: #8c8c8c; font-weight: 400; }
+  .row-real-lat::before { content: '真 '; color: #8c8c8c; font-weight: 400; }
+
   .row-addr {
-    grid-column: 3 / 5;
+    grid-column: 3;
     grid-row: 2;
     width: auto;
     min-width: 0;

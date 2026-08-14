@@ -532,28 +532,30 @@ func urlDomain(u string) string {
 // ---- Servers ----
 
 type serverListItem struct {
-	Identity         string `json:"identity"`
-	Name             string `json:"name"`
-	Host             string `json:"host"`
-	Port             int    `json:"port"`
-	Type             string `json:"type"`
-	Latency          int    `json:"latency"`
-	LastProbeTime    int64  `json:"lastProbeTime"`
-	Source           string `json:"source"`
-	FrontProxy       string `json:"frontProxy,omitempty"`
-	IPType           string `json:"ipType,omitempty"`
-	IPTypeAddr       string `json:"ipTypeAddr,omitempty"`
-	IPTypeISP        string `json:"ipTypeIsp,omitempty"`
-	IPTypeCheckedAt  int64  `json:"ipTypeCheckedAt,omitempty"`
-	IPScore          *int   `json:"ipScore,omitempty"`
-	IPScoreGrade     string `json:"ipScoreGrade,omitempty"`
-	IPScoreRisk      string `json:"ipScoreRisk,omitempty"`
-	IPScoreProvider  string `json:"ipScoreProvider,omitempty"`
-	IPScoreAt        int64  `json:"ipScoreAt,omitempty"`
-	IPGeoCountry     string `json:"ipGeoCountry,omitempty"`
-	IPGeoCountryCode string `json:"ipGeoCountryCode,omitempty"`
-	IPGeoRegion      string `json:"ipGeoRegion,omitempty"`
-	IPGeoCity        string `json:"ipGeoCity,omitempty"`
+	Identity          string `json:"identity"`
+	Name              string `json:"name"`
+	Host              string `json:"host"`
+	Port              int    `json:"port"`
+	Type              string `json:"type"`
+	Latency           int    `json:"latency"`
+	LastProbeTime     int64  `json:"lastProbeTime"`
+	FastLatency       int    `json:"fastLatency"`
+	LastFastProbeTime int64  `json:"lastFastProbeTime"`
+	Source            string `json:"source"`
+	FrontProxy        string `json:"frontProxy,omitempty"`
+	IPType            string `json:"ipType,omitempty"`
+	IPTypeAddr        string `json:"ipTypeAddr,omitempty"`
+	IPTypeISP         string `json:"ipTypeIsp,omitempty"`
+	IPTypeCheckedAt   int64  `json:"ipTypeCheckedAt,omitempty"`
+	IPScore           *int   `json:"ipScore,omitempty"`
+	IPScoreGrade      string `json:"ipScoreGrade,omitempty"`
+	IPScoreRisk       string `json:"ipScoreRisk,omitempty"`
+	IPScoreProvider   string `json:"ipScoreProvider,omitempty"`
+	IPScoreAt         int64  `json:"ipScoreAt,omitempty"`
+	IPGeoCountry      string `json:"ipGeoCountry,omitempty"`
+	IPGeoCountryCode  string `json:"ipGeoCountryCode,omitempty"`
+	IPGeoRegion       string `json:"ipGeoRegion,omitempty"`
+	IPGeoCity         string `json:"ipGeoCity,omitempty"`
 }
 
 type serverCatalogItem struct {
@@ -580,6 +582,7 @@ func newServerListItem(server configure.ServerRaw) serverListItem {
 	return serverListItem{
 		Identity: identity, Name: server.Name, Host: server.Host, Port: server.Port,
 		Type: server.Type, Latency: server.Latency, LastProbeTime: server.LastProbeTime,
+		FastLatency: server.FastLatency, LastFastProbeTime: server.LastFastProbeTime,
 		Source: server.Source, FrontProxy: server.FrontProxy, IPType: server.IPType,
 		IPTypeAddr: server.IPTypeAddr, IPTypeISP: server.IPTypeISP,
 		IPTypeCheckedAt: server.IPTypeCheckedAt, IPScore: server.IPScore,
@@ -699,8 +702,9 @@ func searchServers(c *gin.Context) {
 		return
 	}
 	type result struct {
-		Server serverListItem    `json:"server"`
-		Ref    configure.NodeRef `json:"ref"`
+		Server     serverListItem    `json:"server"`
+		Ref        configure.NodeRef `json:"ref"`
+		GroupNames []string          `json:"groupNames"`
 	}
 	var results []result
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "100"))
@@ -727,6 +731,17 @@ func searchServers(c *gin.Context) {
 				if len(results) >= limit {
 					break
 				}
+			}
+		}
+	}
+	resultIndexes := make(map[configure.ServerRef]int, len(results))
+	for i, item := range results {
+		resultIndexes[configure.ServerRef{Type: item.Ref.Type, Index: item.Ref.Index, Sub: item.Ref.Sub}] = i
+	}
+	for _, group := range configure.GetGroups() {
+		for _, ref := range group.Servers {
+			if index, ok := resultIndexes[ref]; ok {
+				results[index].GroupNames = append(results[index].GroupNames, group.Name)
 			}
 		}
 	}
@@ -2768,21 +2783,6 @@ func builtinSocksProxyURL() (*url.URL, error) {
 			url.QueryEscape(acc.Username), url.QueryEscape(acc.Password), setting.Socks5Port))
 	}
 	return url.Parse(fmt.Sprintf("socks5://127.0.0.1:%d", setting.Socks5Port))
-}
-
-// saveLatency 将测速结果写回存储
-func saveLatency(ref configure.NodeRef, latency int) {
-	now := time.Now().Unix()
-	apply := func(server *configure.ServerRaw) {
-		server.Latency = latency
-		server.LastProbeTime = now
-	}
-	switch ref.Type {
-	case "server":
-		_ = configure.UpdateServer(ref.Index, apply)
-	case "sub_server":
-		_ = configure.UpdateSubscriptionServer(ref.Sub, ref.Index, apply)
-	}
 }
 
 // ---- Setting ----

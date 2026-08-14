@@ -152,7 +152,7 @@ func GetLenSubscriptionServers(index int) int {
 	return len(sub.Servers)
 }
 
-// PreserveServerProbeResults copies latency metadata from old subscription nodes
+// PreserveServerProbeResults copies fast/real probe metadata from old subscription nodes
 // to newly parsed nodes when they represent the same server.
 func PreserveServerProbeResults(oldServers, newServers []ServerRaw) {
 	preserveServerResults(oldServers, newServers, true)
@@ -182,6 +182,8 @@ func preserveServerResults(oldServers, newServers []ServerRaw, preserveFrontProx
 			if old, ok := byKey[key]; ok {
 				newServers[i].Latency = old.Latency
 				newServers[i].LastProbeTime = old.LastProbeTime
+				newServers[i].FastLatency = old.FastLatency
+				newServers[i].LastFastProbeTime = old.LastFastProbeTime
 				if preserveFrontProxy {
 					// 订阅刷新会整体覆盖节点，用户手动设的前置代理需要跟着保留
 					newServers[i].FrontProxy = old.FrontProxy

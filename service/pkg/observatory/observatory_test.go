@@ -21,6 +21,59 @@ func nodeRef(index int) configure.NodeRef {
 	return configure.NodeRef{Type: "server", Index: index}
 }
 
+func TestSaveLatencyKeepsFastAndRealResultsSeparate(t *testing.T) {
+	setupTestDB(t)
+	if err := configure.SetServers([]configure.ServerRaw{{
+		Name: "node", Latency: 120, LastProbeTime: 10, FastLatency: 30, LastFastProbeTime: 20,
+	}}); err != nil {
+		t.Fatalf("SetServers: %v", err)
+	}
+
+	saveLatency(nodeRef(0), "fast", 45)
+	server := configure.GetServer(0)
+	if server == nil || server.FastLatency != 45 || server.LastFastProbeTime <= 20 {
+		t.Fatalf("快速检测结果未保存：%+v", server)
+	}
+	if server.Latency != 120 || server.LastProbeTime != 10 {
+		t.Fatalf("快速检测不应覆盖真连结果：%+v", server)
+	}
+
+	fastProbeTime := server.LastFastProbeTime
+	saveLatency(nodeRef(0), "real", -1)
+	server = configure.GetServer(0)
+	if server == nil || server.Latency != -1 || server.LastProbeTime <= 10 {
+		t.Fatalf("真连接结果未保存：%+v", server)
+	}
+	if server.FastLatency != 45 || server.LastFastProbeTime != fastProbeTime {
+		t.Fatalf("真连接检测不应覆盖快速结果：%+v", server)
+	}
+	if got := readLatency(nodeRef(0), "fast"); got != 45 {
+		t.Fatalf("快速模式读取错误：%d", got)
+	}
+	if got := readLatency(nodeRef(0), "real"); got != -1 {
+		t.Fatalf("真连接模式读取错误：%d", got)
+	}
+}
+
+func TestSaveLatencySeparatesSubscriptionProbeModes(t *testing.T) {
+	setupTestDB(t)
+	if err := configure.AppendSubscriptions([]*configure.SubscriptionRaw{{
+		ID: "sub", Servers: []configure.ServerRaw{{Name: "node", Latency: 90, LastProbeTime: 10}},
+	}}); err != nil {
+		t.Fatalf("AppendSubscriptions: %v", err)
+	}
+
+	ref := configure.NodeRef{Type: "sub_server", Sub: 0, Index: 0}
+	saveLatency(ref, "fast", 25)
+	sub := configure.GetSubscription(0)
+	if sub == nil || sub.Servers[0].FastLatency != 25 || sub.Servers[0].LastFastProbeTime == 0 {
+		t.Fatalf("订阅节点快速结果未保存：%+v", sub)
+	}
+	if sub.Servers[0].Latency != 90 || sub.Servers[0].LastProbeTime != 10 {
+		t.Fatalf("订阅节点快速检测覆盖了真连结果：%+v", sub.Servers[0])
+	}
+}
+
 // 稳定优先的唯一卖点：当前节点还连得上就不动，哪怕它比最优节点慢一个数量级。
 // 这条语义必须在阈值判断之前���效，否则和最低延迟策略没有区别。
 func TestShouldSwitchStableKeepsCurrentWhenAlive(t *testing.T) {

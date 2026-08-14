@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/ProxyStation/proxystation/db"
@@ -154,7 +155,7 @@ func TestQueryServersReturnsOnlyRequestedRefs(t *testing.T) {
 	setupListQueryTestDB(t)
 	if err := configure.AppendServers([]*configure.ServerRaw{
 		{Name: "a", Host: "1.1.1.1", Port: 1, Type: "socks"},
-		{Name: "b", Host: "2.2.2.2", Port: 2, Type: "socks"},
+		{Name: "b", Host: "2.2.2.2", Port: 2, Type: "socks", Latency: 44, LastProbeTime: 45, FastLatency: 22, LastFastProbeTime: 23},
 	}); err != nil {
 		t.Fatalf("append servers: %v", err)
 	}
@@ -175,8 +176,41 @@ func TestQueryServersReturnsOnlyRequestedRefs(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("decode query response: %v", err)
 	}
-	if len(payload.Results) != 1 || payload.Results[0].Ref.Index != 1 || payload.Results[0].Server.Name != "b" {
+	if len(payload.Results) != 1 || payload.Results[0].Ref.Index != 1 || payload.Results[0].Server.Name != "b" ||
+		payload.Results[0].Server.Latency != 44 || payload.Results[0].Server.LastProbeTime != 45 ||
+		payload.Results[0].Server.FastLatency != 22 || payload.Results[0].Server.LastFastProbeTime != 23 {
 		t.Fatalf("unexpected query response: %s", recorder.Body.String())
+	}
+}
+
+func TestSearchServersReturnsGroupNames(t *testing.T) {
+	setupListQueryTestDB(t)
+	if err := configure.AppendServers([]*configure.ServerRaw{{Name: "target-node"}}); err != nil {
+		t.Fatalf("append server: %v", err)
+	}
+	ref := configure.ServerRef{Type: "server", Index: 0}
+	if err := configure.AppendGroup(&configure.Group{ID: "one", Name: "分组一", Servers: []configure.ServerRef{ref}}); err != nil {
+		t.Fatalf("append first group: %v", err)
+	}
+	if err := configure.AppendGroup(&configure.Group{ID: "two", Name: "分组二", Servers: []configure.ServerRef{ref}}); err != nil {
+		t.Fatalf("append second group: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest(http.MethodGet, "/api/servers/search?q=target", nil)
+	searchServers(context)
+
+	var payload struct {
+		Results []struct {
+			GroupNames []string `json:"groupNames"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(payload.Results) != 1 || !reflect.DeepEqual(payload.Results[0].GroupNames, []string{"分组一", "分组二"}) {
+		t.Fatalf("unexpected search groups: %s", recorder.Body.String())
 	}
 }
 
@@ -449,7 +483,9 @@ func TestGroupServersByIDSupportsFilterAndCatalogView(t *testing.T) {
 		t.Fatalf("catalog should keep selection fields: %s", catalogRecorder.Body.String())
 	}
 	if bytes.Contains(catalogRecorder.Body.Bytes(), []byte(`"latency"`)) ||
-		bytes.Contains(catalogRecorder.Body.Bytes(), []byte(`"lastProbeTime"`)) {
+		bytes.Contains(catalogRecorder.Body.Bytes(), []byte(`"lastProbeTime"`)) ||
+		bytes.Contains(catalogRecorder.Body.Bytes(), []byte(`"fastLatency"`)) ||
+		bytes.Contains(catalogRecorder.Body.Bytes(), []byte(`"lastFastProbeTime"`)) {
 		t.Fatalf("catalog view should drop probe fields: %s", catalogRecorder.Body.String())
 	}
 }
@@ -527,9 +563,9 @@ func TestBatchCopyServersToGroupClonesInOneBatchAndSkipsDuplicates(t *testing.T)
 	setupListQueryTestDB(t)
 	score := 82
 	if err := configure.AppendServers([]*configure.ServerRaw{
-		{Name: "a", Host: "1.1.1.1", Port: 1, Type: "socks", Source: "manual", Latency: 20, LastProbeTime: 101, IPType: "idc", IPGeoCountry: "美国", IPGeoRegion: "加州", IPScore: &score},
+		{Name: "a", Host: "1.1.1.1", Port: 1, Type: "socks", Source: "manual", Latency: 20, LastProbeTime: 101, FastLatency: 10, LastFastProbeTime: 201, IPType: "idc", IPGeoCountry: "美国", IPGeoRegion: "加州", IPScore: &score},
 		{Name: "duplicate", Host: "1.1.1.1", Port: 1, Type: "socks", Source: "manual", Latency: 30, IPType: "idc"},
-		{Name: "b", Host: "2.2.2.2", Port: 2, Type: "socks", Source: "manual", Latency: 40, LastProbeTime: 102, IPType: "residential", IPGeoCountry: "日本", IPScore: &score},
+		{Name: "b", Host: "2.2.2.2", Port: 2, Type: "socks", Source: "manual", Latency: 40, LastProbeTime: 102, FastLatency: 30, LastFastProbeTime: 202, IPType: "residential", IPGeoCountry: "日本", IPScore: &score},
 	}); err != nil {
 		t.Fatalf("append servers: %v", err)
 	}
@@ -561,7 +597,9 @@ func TestBatchCopyServersToGroupClonesInOneBatchAndSkipsDuplicates(t *testing.T)
 		}
 	}
 	if servers[group.Servers[0].Index].Latency != 20 || servers[group.Servers[0].Index].LastProbeTime != 101 ||
-		servers[group.Servers[1].Index].Latency != 40 || servers[group.Servers[1].Index].LastProbeTime != 102 {
+		servers[group.Servers[0].Index].FastLatency != 10 || servers[group.Servers[0].Index].LastFastProbeTime != 201 ||
+		servers[group.Servers[1].Index].Latency != 40 || servers[group.Servers[1].Index].LastProbeTime != 102 ||
+		servers[group.Servers[1].Index].FastLatency != 30 || servers[group.Servers[1].Index].LastFastProbeTime != 202 {
 		t.Fatalf("clone should preserve probe results: %+v, %+v", servers[group.Servers[0].Index], servers[group.Servers[1].Index])
 	}
 }

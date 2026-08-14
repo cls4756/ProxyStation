@@ -1,4 +1,4 @@
-// observatory 负责对绑定了 Group 的出站进行定期真连接测速，并按阈值自动切换到更优节点
+// observatory 负责按出站配置对绑定 Group 的节点定期测速，并按同一测速口径自动切换。
 package observatory
 
 import (
@@ -220,9 +220,10 @@ func selectBestNodeFromExisting(outboundName string, o *configure.Outbound) {
 
 	var available []probeResult
 
+	probeMode := normalizeProbeMode(o.ProbeMode)
 	for _, ref := range group.Servers {
 		nodeRef := configure.NodeRef{Type: ref.Type, Index: ref.Index, Sub: ref.Sub}
-		latency := readLatency(nodeRef)
+		latency := readLatency(nodeRef, probeMode)
 		if latency > 0 {
 			available = append(available, probeResult{ref: nodeRef, latency: latency})
 		}
@@ -281,6 +282,7 @@ func probeNodesWithProgress(refs []configure.NodeRef, mode string, onStart Probe
 	if len(refs) == 0 {
 		return results
 	}
+	mode = normalizeProbeMode(mode)
 	workers := resolveProbeConcurrencyForMode(mode)
 	if workers > len(refs) {
 		workers = len(refs)
@@ -301,7 +303,7 @@ func probeNodesWithProgress(refs []configure.NodeRef, mode string, onStart Probe
 				}
 				latency := probeNodeByMode(refs[i], mode)
 				results[i] = probeResult{ref: refs[i], latency: latency}
-				saveLatency(refs[i], latency)
+				saveLatency(refs[i], mode, latency)
 				if onDone != nil {
 					onDone(i, refs[i], latency)
 				}
@@ -415,7 +417,7 @@ func ApplyGroupProbeResults(groupID string, mode string) []GroupSwitchOutcome {
 			continue
 		}
 
-		ok, reason := applyOutboundSwitch(name, o, group)
+		ok, reason := applyOutboundSwitch(name, o, group, mode)
 		if ok {
 			switched = append(switched, name)
 		}
@@ -435,11 +437,11 @@ func ApplyGroupProbeResults(groupID string, mode string) []GroupSwitchOutcome {
 
 // applyOutboundSwitch 复用周期测速的切换判定，但延迟取自存储里刚写回的测速结果，
 // 因此不会重新发起探测。
-func applyOutboundSwitch(name string, o *configure.Outbound, group *configure.Group) (bool, string) {
+func applyOutboundSwitch(name string, o *configure.Outbound, group *configure.Group, probeMode string) (bool, string) {
 	available := make([]probeResult, 0, len(group.Servers))
 	for _, ref := range group.Servers {
 		nodeRef := configure.NodeRef{Type: ref.Type, Index: ref.Index, Sub: ref.Sub}
-		if latency := readLatency(nodeRef); latency > 0 {
+		if latency := readLatency(nodeRef, probeMode); latency > 0 {
 			available = append(available, probeResult{ref: nodeRef, latency: latency})
 		}
 	}
@@ -811,18 +813,25 @@ func nodeRefEqual(a, b *configure.NodeRef) bool {
 	return a.Type == b.Type && a.Index == b.Index && a.Sub == b.Sub
 }
 
-func readLatency(ref configure.NodeRef) int {
+func readLatency(ref configure.NodeRef, mode string) int {
+	mode = normalizeProbeMode(mode)
 	switch ref.Type {
 	case "server":
 		s := configure.GetServer(ref.Index)
 		if s == nil {
 			return -1
 		}
+		if mode == "fast" {
+			return s.FastLatency
+		}
 		return s.Latency
 	case "sub_server":
 		sub := configure.GetSubscription(ref.Sub)
 		if sub == nil || ref.Index >= len(sub.Servers) {
 			return -1
+		}
+		if mode == "fast" {
+			return sub.Servers[ref.Index].FastLatency
 		}
 		return sub.Servers[ref.Index].Latency
 	default:
@@ -1016,10 +1025,16 @@ func probeViaCoreSocks(host string, socksPort int, timeout time.Duration) int {
 	return ms
 }
 
-// saveLatency 将测速结果写回存储
-func saveLatency(ref configure.NodeRef, latency int) {
+// saveLatency 按测速方式分别写回快速检测与真连接结果。
+func saveLatency(ref configure.NodeRef, mode string, latency int) {
+	mode = normalizeProbeMode(mode)
 	now := time.Now().Unix()
 	apply := func(server *configure.ServerRaw) {
+		if mode == "fast" {
+			server.FastLatency = latency
+			server.LastFastProbeTime = now
+			return
+		}
 		server.Latency = latency
 		server.LastProbeTime = now
 	}

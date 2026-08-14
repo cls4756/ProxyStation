@@ -81,17 +81,26 @@
         <button v-if="singleSelectedRef?.type === 'server' && singleSelectedServer" class="action-btn" @click="openNodeMenu('edit', singleSelectedRef, singleSelectedServer)">
           ✏ 编辑
         </button>
-        <button class="action-btn" @click="pingSelected('fast')" :disabled="pinging">⚡ 批量快速</button>
-        <button class="action-btn" @click="pingSelected('real')" :disabled="pinging">🧪 批量真连</button>
-        <button v-if="pinging" class="action-btn action-btn-danger" @click="abortPing">⏹ 中止检测</button>
-        <span v-if="pinging && pingProgress.total > 0" class="ping-progress">{{ pingProgress.done }}/{{ pingProgress.total }}</span>
+        <button
+          :class="['action-btn', { 'action-btn-danger': pinging && activePingMode === 'fast' }]"
+          :disabled="pinging && activePingMode !== 'fast'"
+          @click="pinging && activePingMode === 'fast' ? abortPing() : pingSelected('fast')"
+        >{{ pinging && activePingMode === 'fast' ? '⏹ 中止检测' : '⚡ 批量快速' }}</button>
+        <button
+          :class="['action-btn', { 'action-btn-danger': pinging && activePingMode === 'real' }]"
+          :disabled="pinging && activePingMode !== 'real'"
+          @click="pinging && activePingMode === 'real' ? abortPing() : pingSelected('real')"
+        >{{ pinging && activePingMode === 'real' ? '⏹ 中止检测' : '🧪 批量真连' }}</button>
         <button class="action-btn" @click="detectIPTypeForRefs(selectedRefs)" :disabled="detectingIPType">
           🌐 {{ detectingIPType ? '检测中…' : '检测 IP 类型' }}
         </button>
-        <button class="action-btn" @click="scoreIPForRefs(selectedRefs)" :disabled="ipScoreTask.running" title="查询 IP 纯净度评分（后台串行执行）">
-          🧮 {{ ipScoreTask.running ? `评分中 ${ipScoreTask.done}/${ipScoreTask.total}` : '查 IP 评分' }}
+        <button
+          :class="['action-btn', { 'action-btn-danger': ipScoreTask.running }]"
+          @click="ipScoreTask.running ? abortIPScore() : scoreIPForRefs(selectedRefs)"
+          title="查询 IP 纯净度评分（后台串行执行）"
+        >
+          {{ ipScoreTask.running ? '⏹ 中止评分' : '🧮 查 IP 评分' }}
         </button>
-        <button v-if="ipScoreTask.running" class="action-btn action-btn-danger" @click="abortIPScore">⏹ 中止评分</button>
         <button class="action-btn" @click="shareSelected">🔗 批量分享</button>
         <button class="action-btn" @click="showBulkCopyModal = true">📋 复制到分组</button>
         <button v-if="canBulkRemove" class="action-btn" @click="showBulkMoveModal = true">✂ 移动到分组</button>
@@ -122,6 +131,7 @@
           <ServerRow
             v-for="(r, i) in sortedSearchResults" :key="refKey(r.ref) + ':' + i"
             :server="r.server" :ref-obj="r.ref" :outbounds="store.outbounds" :removable="false"
+            :group-names="r.groupNames || []"
             :current-outbound="currentOutbound"
             :ping-state="pingStates[refKey(r.ref)] || null"
             :ip-type-state="ipTypeStates[refKey(r.ref)] || null"
@@ -132,6 +142,8 @@
             @select-start="startDragSelect"
             @select-enter="continueDragSelect"
             @share="(ref, sv) => openNodeMenu('share', ref, sv)"
+            @edit="(ref, sv) => openNodeMenu('edit', ref, sv)"
+            @copy-to-group="openSingleCopy"
           />
         </div>
       </div>
@@ -154,21 +166,26 @@
               <button class="action-btn" @click="refreshPanel" :disabled="refreshing" title="重新加载节点数据">
                 ↻ {{ refreshing ? '刷新中…' : '刷新' }}
               </button>
-              <button class="action-btn" @click="pingCurrentTab('fast')" :disabled="pinging">
-                ⚡ {{ pinging ? '探测中…' : '快速检测' }}
-              </button>
-              <button class="action-btn" @click="pingCurrentTab('real')" :disabled="pinging">
-                🧪 {{ pinging ? '探测中…' : '真连接检测' }}
-              </button>
-              <button v-if="pinging" class="action-btn action-btn-danger" @click="abortPing">⏹ 中止检测</button>
-              <span v-if="pinging && pingProgress.total > 0" class="ping-progress">{{ pingProgress.done }}/{{ pingProgress.total }}</span>
+              <button
+                :class="['action-btn', { 'action-btn-danger': pinging && activePingMode === 'fast' }]"
+                :disabled="pinging && activePingMode !== 'fast'"
+                @click="pinging && activePingMode === 'fast' ? abortPing() : pingCurrentTab('fast')"
+              >{{ pinging && activePingMode === 'fast' ? '⏹ 中止检测' : '⚡ 快速检测' }}</button>
+              <button
+                :class="['action-btn', { 'action-btn-danger': pinging && activePingMode === 'real' }]"
+                :disabled="pinging && activePingMode !== 'real'"
+                @click="pinging && activePingMode === 'real' ? abortPing() : pingCurrentTab('real')"
+              >{{ pinging && activePingMode === 'real' ? '⏹ 中止检测' : '🧪 真连接检测' }}</button>
               <button class="action-btn" @click="detectIPTypeForCurrentTab" :disabled="detectingIPType" title="查询节点地址是机房还是家宽">
                 🌐 {{ detectingIPType ? '检测中…' : 'IP 类型' }}
               </button>
-              <button class="action-btn" @click="scoreIPForCurrentTab" :disabled="ipScoreTask.running" title="查询 IP 纯净度评分（后台串行执行，避免触发第三方限流）">
-                🧮 {{ ipScoreTask.running ? `评分中 ${ipScoreTask.done}/${ipScoreTask.total}` : 'IP 评分' }}
+              <button
+                :class="['action-btn', { 'action-btn-danger': ipScoreTask.running }]"
+                @click="ipScoreTask.running ? abortIPScore() : scoreIPForCurrentTab()"
+                title="查询 IP 纯净度评分（后台串行执行，避免触发第三方限流）"
+              >
+                {{ ipScoreTask.running ? '⏹ 中止评分' : '🧮 IP 评分' }}
               </button>
-              <button v-if="ipScoreTask.running" class="action-btn action-btn-danger" @click="abortIPScore">⏹ 中止评分</button>
               <button class="action-btn" @click="refreshSub(si)" title="重新拉取订阅节点">↻ 更新节点</button>
               <button class="action-btn" @click="openEditSub(si)" title="编辑订阅名称和链接">✏ 编辑</button>
               <button class="action-btn action-btn-danger" @click="deleteSub(si)">删除</button>
@@ -241,21 +258,26 @@
               <button class="action-btn" @click="refreshPanel" :disabled="refreshing" title="重新加载节点数据">
                 ↻ {{ refreshing ? '刷新中…' : '刷新' }}
               </button>
-              <button class="action-btn" @click="pingCurrentTab('fast')" :disabled="pinging">
-                ⚡ {{ pinging ? '探测中…' : '快速检测' }}
-              </button>
-              <button class="action-btn" @click="pingCurrentTab('real')" :disabled="pinging">
-                🧪 {{ pinging ? '探测中…' : '真连接检测' }}
-              </button>
-              <button v-if="pinging" class="action-btn action-btn-danger" @click="abortPing">⏹ 中止检测</button>
-              <span v-if="pinging && pingProgress.total > 0" class="ping-progress">{{ pingProgress.done }}/{{ pingProgress.total }}</span>
+              <button
+                :class="['action-btn', { 'action-btn-danger': pinging && activePingMode === 'fast' }]"
+                :disabled="pinging && activePingMode !== 'fast'"
+                @click="pinging && activePingMode === 'fast' ? abortPing() : pingCurrentTab('fast')"
+              >{{ pinging && activePingMode === 'fast' ? '⏹ 中止检测' : '⚡ 快速检测' }}</button>
+              <button
+                :class="['action-btn', { 'action-btn-danger': pinging && activePingMode === 'real' }]"
+                :disabled="pinging && activePingMode !== 'real'"
+                @click="pinging && activePingMode === 'real' ? abortPing() : pingCurrentTab('real')"
+              >{{ pinging && activePingMode === 'real' ? '⏹ 中止检测' : '🧪 真连接检测' }}</button>
               <button class="action-btn" @click="detectIPTypeForCurrentTab" :disabled="detectingIPType" title="查询节点地址是机房还是家宽">
                 🌐 {{ detectingIPType ? '检测中…' : 'IP 类型' }}
               </button>
-              <button class="action-btn" @click="scoreIPForCurrentTab" :disabled="ipScoreTask.running" title="查询 IP 纯净度评分（后台串行执行，避免触发第三方限流）">
-                🧮 {{ ipScoreTask.running ? `评分中 ${ipScoreTask.done}/${ipScoreTask.total}` : 'IP 评分' }}
+              <button
+                :class="['action-btn', { 'action-btn-danger': ipScoreTask.running }]"
+                @click="ipScoreTask.running ? abortIPScore() : scoreIPForCurrentTab()"
+                title="查询 IP 纯净度评分（后台串行执行，避免触发第三方限流）"
+              >
+                {{ ipScoreTask.running ? '⏹ 中止评分' : '🧮 IP 评分' }}
               </button>
-              <button v-if="ipScoreTask.running" class="action-btn action-btn-danger" @click="abortIPScore">⏹ 中止评分</button>
               <button v-if="group.name !== 'SERVER'" class="action-btn" @click="openEditGroup(gi)">✏ 编辑</button>
               <button class="action-btn" @click="openAddToGroup(gi)">＋ 添加节点</button>
               <button v-if="group.name !== 'SERVER'" class="action-btn action-btn-danger" @click="deleteGroup(gi)">删除分组</button>
@@ -567,6 +589,7 @@ const searchResults = ref([])
 const isSearching = ref(false)
 const pingProgress = ref({ total: 0, done: 0, current: '' })
 const pingStates = ref({})
+const activePingMode = ref('')
 const FAST_PING_CONCURRENCY = 6
 const NODE_PAGE_SIZE_OPTIONS = [
   { value: 100, label: '100 条' },
@@ -587,7 +610,8 @@ const COLUMN_DEFS = [
   { key: 'type', label: '协议', min: 50, def: 76, sortable: true },
   { key: 'iptype', label: 'IP 类型', min: 46, def: 62, sortable: true },
   { key: 'ipscore', label: '评分', min: 46, def: 62, sortable: true },
-  { key: 'latency', label: '延迟', min: 46, def: 64, sortable: true },
+  { key: 'fastLatency', label: '快速延时', min: 54, def: 72, sortable: true },
+  { key: 'latency', label: '真连延时', min: 54, def: 76, sortable: true },
   { key: 'ops', label: '操作', min: 120, def: 232, noResizer: true },
 ]
 const COLUMN_WIDTH_STORAGE_KEY = 'ps.serverList.columnWidths'
@@ -678,7 +702,8 @@ function onSortColumn(key) {
 const sortRanks = ref(null)
 
 function sortValueFor(key, server) {
-  if (key === 'latency') return latencyValue(server)
+  if (key === 'fastLatency') return latencyValue(server?.fastLatency, server?.lastFastProbeTime)
+  if (key === 'latency') return latencyValue(server?.latency, server?.lastProbeTime)
   if (key === 'iptype') return ipTypeOrder(server?.ipType)
   // 评分越高越好，取负值让"升序"= 从优到劣，和延迟列的方向观感一致
   if (key === 'ipscore') {
@@ -720,12 +745,12 @@ function ipTypeOrder(type) {
   return v === undefined ? Number.MAX_SAFE_INTEGER : v
 }
 
-function latencyValue(server) {
-  const lat = Number(server?.latency)
-  // -1=未测速, 0=超时，都排在最后
-  if (!Number.isFinite(lat) || lat < 0) return Number.MAX_SAFE_INTEGER
-  if (lat === 0) return Number.MAX_SAFE_INTEGER - 1
-  return lat
+function latencyValue(rawLatency, rawProbeTime) {
+  const latency = Number(rawLatency)
+  const probeTime = Number(rawProbeTime)
+  if (!Number.isFinite(probeTime) || probeTime <= 0) return Number.MAX_SAFE_INTEGER
+  if (!Number.isFinite(latency) || latency <= 0) return Number.MAX_SAFE_INTEGER - 1
+  return latency
 }
 
 // 只在点击表头时，对当前可见行生成一次 ref -> 名次快照。
@@ -1246,7 +1271,7 @@ async function pingRefsWithProgress(refs, mode = 'fast') {
   const queue = refs.map(ref => ({ type: ref.type, index: ref.index, sub: ref.sub || 0 }))
   const stateMap = {}
   for (const ref of queue) {
-    stateMap[refKey(ref)] = { status: 'pending' }
+    stateMap[refKey(ref)] = { status: 'pending', mode }
   }
   pingStates.value = stateMap
 
@@ -1258,11 +1283,15 @@ async function pingRefsWithProgress(refs, mode = 'fast') {
         if (!ref) return
         const key = refKey({ type: ref.type, index: ref.index, sub: ref.sub || 0 })
         if (evt === 'running') {
-          schedulePingFlush(key, { status: 'running' })
+          schedulePingFlush(key, { status: 'running', mode })
         } else if (evt === 'done') {
           const lat = payload.latency
           const latency = typeof lat === 'number' ? lat : -1
-          schedulePingFlush(key, { status: 'done', latency }, ref, { latency })
+          const probeTime = Math.floor(Date.now() / 1000)
+          const patch = mode === 'fast'
+            ? { fastLatency: latency, lastFastProbeTime: probeTime }
+            : { latency, lastProbeTime: probeTime }
+          schedulePingFlush(key, { status: 'done', mode, latency }, ref, patch)
           pingProgress.value.done += 1
         }
       },
@@ -1287,6 +1316,7 @@ function abortPing() {
 
 async function pingSelected(mode = 'fast') {
   if (!selectedRefs.value.length) return
+  activePingMode.value = mode
   pinging.value = true
   try {
     await pingRefsWithProgress(selectedRefs.value, mode)
@@ -1295,6 +1325,7 @@ async function pingSelected(mode = 'fast') {
     pingProgress.value = { total: 0, done: 0, current: '' }
     pingStates.value = {}
     pinging.value = false
+    activePingMode.value = ''
   }
 }
 
@@ -1597,6 +1628,7 @@ async function pingSingleNode(ref) {
 }
 
 async function pingCurrentTab(mode = 'fast') {
+  activePingMode.value = mode
   pinging.value = true
   try {
     let refs = []
@@ -1621,6 +1653,7 @@ async function pingCurrentTab(mode = 'fast') {
     pingProgress.value = { total: 0, done: 0, current: '' }
     pingStates.value = {}
     pinging.value = false
+    activePingMode.value = ''
   }
 }
 
@@ -2036,14 +2069,6 @@ async function confirmSingleMove() {
   flex-shrink: 0;
 }
 .mobile-tab-actions { display: none; }
-.ping-progress {
-  font-size: 12px;
-  color: #1677ff;
-  max-width: 280px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
 
 .search-input {
   height: 28px;
@@ -2369,12 +2394,6 @@ async function confirmSingleMove() {
     white-space: nowrap;
   }
 
-  .info-bar-right .ping-progress {
-    flex: 0 0 auto;
-    max-width: 160px;
-    white-space: nowrap;
-  }
-
   .table-scroll {
     overflow-x: hidden;
     overflow-y: auto;
@@ -2410,12 +2429,6 @@ async function confirmSingleMove() {
     min-height: 30px;
     padding: 4px 8px;
     font-size: 11px;
-    white-space: nowrap;
-  }
-
-  .bulk-bar .ping-progress {
-    flex: 0 0 auto;
-    max-width: 160px;
     white-space: nowrap;
   }
 

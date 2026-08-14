@@ -115,6 +115,11 @@ onBeforeUnmount(stopResize)
   width: var(--col-ipscore);
   justify-content: center;
 }
+.head-col-fastLatency {
+  flex: 0 0 var(--col-fastLatency);
+  width: var(--col-fastLatency);
+  justify-content: flex-end;
+}
 .head-col-latency {
   flex: 0 0 var(--col-latency);
   width: var(--col-latency);

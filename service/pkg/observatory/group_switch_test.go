@@ -13,9 +13,15 @@ func setupGroupSwitchDB(t *testing.T, mode configure.SelectionMode, probeMode st
 	servers := make([]configure.ServerRaw, 0, len(latencies))
 	refs := make([]configure.ServerRef, 0, len(latencies))
 	for i, lat := range latencies {
-		servers = append(servers, configure.ServerRaw{
-			Name: string(rune('a' + i)), Host: "h.example.com", Port: 443, Type: "vmess", Latency: lat,
-		})
+		server := configure.ServerRaw{Name: string(rune('a' + i)), Host: "h.example.com", Port: 443, Type: "vmess"}
+		if normalizeProbeMode(probeMode) == "fast" {
+			server.FastLatency = lat
+			server.LastFastProbeTime = 1
+		} else {
+			server.Latency = lat
+			server.LastProbeTime = 1
+		}
+		servers = append(servers, server)
 		refs = append(refs, configure.ServerRef{Type: "server", Index: i})
 	}
 	if err := configure.SetServers(servers); err != nil {
@@ -64,6 +70,59 @@ func TestApplyGroupProbeResultsSwitchesOnLeastPing(t *testing.T) {
 	}
 	if got := activeIndex(t); got != 1 {
 		t.Errorf("应切到 index=1 的节点，实际 %d", got)
+	}
+}
+
+func TestApplyGroupProbeResultsUsesFastLatency(t *testing.T) {
+	groupID := setupGroupSwitchDB(t, configure.ModeLeastPing, "fast", []int{900, 20})
+	servers := configure.GetServers()
+	servers[0].Latency, servers[1].Latency = 20, 900
+	servers[0].LastProbeTime, servers[1].LastProbeTime = 1, 1
+	if err := configure.SetServers(servers); err != nil {
+		t.Fatalf("SetServers: %v", err)
+	}
+
+	outcomes := ApplyGroupProbeResults(groupID, "fast")
+	if len(outcomes) != 1 || !outcomes[0].Switched {
+		t.Fatalf("快速模式应按 fastLatency 切换，实际 %+v", outcomes)
+	}
+	if got := activeIndex(t); got != 1 {
+		t.Errorf("快速模式应切到 fastLatency 更低的 index=1，实际 %d", got)
+	}
+}
+
+func TestSelectBestNodeFromExistingUsesOutboundProbeMode(t *testing.T) {
+	setupTestDB(t)
+	if err := configure.SetServers([]configure.ServerRaw{
+		{Name: "real-best", Latency: 20, LastProbeTime: 1, FastLatency: 900, LastFastProbeTime: 1},
+		{Name: "fast-best", Latency: 900, LastProbeTime: 1, FastLatency: 20, LastFastProbeTime: 1},
+	}); err != nil {
+		t.Fatalf("SetServers: %v", err)
+	}
+	if err := configure.AppendGroup(&configure.Group{ID: "g1", Name: "G1", Servers: []configure.ServerRef{
+		{Type: "server", Index: 0}, {Type: "server", Index: 1},
+	}}); err != nil {
+		t.Fatalf("AppendGroup: %v", err)
+	}
+	if err := configure.AddOutbound("hk"); err != nil {
+		t.Fatalf("AddOutbound: %v", err)
+	}
+
+	for _, testCase := range []struct {
+		mode          string
+		expectedIndex int
+	}{
+		{mode: "fast", expectedIndex: 1},
+		{mode: "real", expectedIndex: 0},
+	} {
+		o := &configure.Outbound{Name: "hk", ProbeMode: testCase.mode, Target: configure.OutboundTarget{TargetType: "group", GroupID: "g1"}}
+		if err := configure.SetOutbound("hk", o); err != nil {
+			t.Fatalf("SetOutbound: %v", err)
+		}
+		selectBestNodeFromExisting("hk", o)
+		if got := activeIndex(t); got != testCase.expectedIndex {
+			t.Fatalf("mode=%s 应选择 index=%d，实际 %d", testCase.mode, testCase.expectedIndex, got)
+		}
 	}
 }
 

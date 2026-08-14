@@ -63,6 +63,9 @@ func TestSetSubscriptionPreservesResultsWrittenAfterSnapshot(t *testing.T) {
 	stale := GetSubscription(0)
 	if err := UpdateSubscriptionServer(0, 0, func(server *ServerRaw) {
 		server.Latency = -1
+		server.LastProbeTime = 101
+		server.FastLatency = 88
+		server.LastFastProbeTime = 102
 		server.IPType = "idc"
 		server.IPScore = &score
 		server.IPGeoCountry = "日本"
@@ -76,7 +79,10 @@ func TestSetSubscriptionPreservesResultsWrittenAfterSnapshot(t *testing.T) {
 	}
 
 	got := GetSubscription(0)
-	if got.Servers[0].Latency != -1 || got.Servers[0].IPType != "idc" || got.Servers[0].IPScore == nil || *got.Servers[0].IPScore != score || got.Servers[0].IPGeoCountry != "日本" || got.Servers[0].IPGeoCity != "东京" {
+	if got.Servers[0].Latency != -1 || got.Servers[0].LastProbeTime != 101 ||
+		got.Servers[0].FastLatency != 88 || got.Servers[0].LastFastProbeTime != 102 ||
+		got.Servers[0].IPType != "idc" || got.Servers[0].IPScore == nil || *got.Servers[0].IPScore != score ||
+		got.Servers[0].IPGeoCountry != "日本" || got.Servers[0].IPGeoCity != "东京" {
 		t.Fatalf("runtime results were overwritten: %+v", got.Servers[0])
 	}
 }

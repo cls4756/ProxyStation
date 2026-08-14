@@ -17,10 +17,14 @@ type ServerRaw struct {
 	Port int    `json:"port"`
 	// 协议类型: vmess, vless, ss, trojan, hysteria2, tuic ...
 	Type string `json:"type"`
-	// 延迟，单位 ms，-1 表示未测速，0 表示超时
+	// 真连接延迟，单位 ms；是否检测过由 LastProbeTime 判断，非正数表示不通
 	Latency int `json:"latency"`
-	// 上次测速时间（Unix 时间戳）
+	// 上次真连接检测时间（Unix 时间戳）
 	LastProbeTime int64 `json:"lastProbeTime"`
+	// 快速 TCP 检测延迟，单位 ms；是否检测过由 LastFastProbeTime 判断，非正数表示不通
+	FastLatency int `json:"fastLatency"`
+	// 上次快速检测时间（Unix 时间戳）
+	LastFastProbeTime int64 `json:"lastFastProbeTime"`
 	// 来源：manual（手动导入）或订阅ID
 	Source string `json:"source"`
 	// 前置代理出站名（用于链式代理，如 "proxy"），为空表示不使用前置

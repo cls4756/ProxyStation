@@ -328,6 +328,8 @@ func fixSharedNodes() {
 			newServer.Source = "manual"
 			newServer.Latency = -1
 			newServer.LastProbeTime = 0
+			newServer.FastLatency = -1
+			newServer.LastFastProbeTime = 0
 
 			servers := configure.GetServers()
 			newIndex := len(servers)
