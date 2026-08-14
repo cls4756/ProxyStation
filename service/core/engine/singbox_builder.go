@@ -177,6 +177,7 @@ type SingboxRouteRule struct {
 	PortRange     []string `json:"port_range,omitempty"`
 	Network       string   `json:"network,omitempty"`
 	InboundTag    []string `json:"inbound,omitempty"`
+	AuthUser      []string `json:"auth_user,omitempty"`
 	Protocol      string   `json:"protocol,omitempty"`
 	// action 模式（sniff/hijack-dns/route）
 	Action   string `json:"action,omitempty"`
@@ -201,6 +202,7 @@ func BuildSingboxConfig(setting *configure.Setting) (*SingboxConfig, error) {
 		Inbounds: []SingboxInbound{
 			buildSingboxInbound("socks", "socks-in", listenAddr, setting.Socks5Port, setting.Socks5AuthAccounts()),
 			buildSingboxInbound("http", "http-in", listenAddr, setting.HttpPort, setting.HTTPAuthAccounts()),
+			buildSingboxInbound("socks", MainProbeInboundTag, ProbeInboundListen, ProbeInboundSocksPort, nil),
 		},
 		Outbounds: []SingboxOutbound{
 			{Type: "direct", Tag: "direct"},
@@ -251,6 +253,7 @@ func BuildSingboxConfig(setting *configure.Setting) (*SingboxConfig, error) {
 	validOutboundTags := collectValidOutboundTags()
 
 	var firstProxyOutbound string
+	var mainProbeRules []SingboxRouteRule
 	for _, name := range configure.GetOutboundNames() {
 		o := configure.GetOutbound(name)
 		if o == nil {
@@ -276,10 +279,18 @@ func BuildSingboxConfig(setting *configure.Setting) (*SingboxConfig, error) {
 		}
 		cfg.Outbounds = append([]SingboxOutbound{ob}, cfg.Outbounds...)
 		validOutboundTags[name] = true
+		credential := mainProbeCredentialForOutbound(name)
+		cfg.Inbounds[2].Users = append(cfg.Inbounds[2].Users, SingboxInboundUser{
+			Username: credential.Username, Password: credential.Password,
+		})
+		mainProbeRules = append(mainProbeRules, SingboxRouteRule{
+			InboundTag: []string{MainProbeInboundTag}, AuthUser: []string{credential.Username}, Outbound: name,
+		})
 		if firstProxyOutbound == "" {
 			firstProxyOutbound = name
 		}
 	}
+	cfg.Route.Rules = append(mainProbeRules, cfg.Route.Rules...)
 
 	// 更新路由的 Final 出站和 DNS remote 的 Detour：优先使用第一个代理出站，否则使用 direct
 	if firstProxyOutbound != "" {

@@ -3,6 +3,7 @@ package observatory
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -923,7 +924,11 @@ func serverRawByRef(ref configure.NodeRef) *configure.ServerRaw {
 		if sub == nil || ref.Index < 0 || ref.Index >= len(sub.Servers) {
 			return nil
 		}
-		return &sub.Servers[ref.Index]
+		s := sub.Servers[ref.Index]
+		if s.FrontProxy == "" {
+			s.FrontProxy = sub.ProxyOutbound
+		}
+		return &s
 	default:
 		return nil
 	}
@@ -931,30 +936,24 @@ func serverRawByRef(ref configure.NodeRef) *configure.ServerRaw {
 
 func fastReachableRef(ref configure.NodeRef) bool {
 	const fastProbeTimeout = 1200 * time.Millisecond
-	switch ref.Type {
-	case "server":
-		s := configure.GetServer(ref.Index)
-		if s == nil {
-			return false
-		}
-		// 需经前置代理才能连通的节点，直连预检必然失败，交给内核走链路测
-		if s.FrontProxy != "" {
-			return true
-		}
-		return probe.FastReachable(s, fastProbeTimeout)
-	case "sub_server":
-		sub := configure.GetSubscription(ref.Sub)
-		if sub == nil || ref.Index < 0 || ref.Index >= len(sub.Servers) {
-			return false
-		}
-		s := sub.Servers[ref.Index]
-		if s.FrontProxy != "" || sub.ProxyOutbound != "" {
-			return true
-		}
-		return probe.FastReachable(&s, fastProbeTimeout)
-	default:
+	s := serverRawByRef(ref)
+	if s == nil {
 		return false
 	}
+	if s.FrontProxy == "" {
+		return probe.FastReachable(s, fastProbeTimeout)
+	}
+	conn, err := engine.DialTCPViaOutbound(
+		s.FrontProxy,
+		net.JoinHostPort(s.Host, strconv.Itoa(s.Port)),
+		fastProbeTimeout,
+	)
+	if err != nil {
+		// 主内核未运行或内部探测入口不可用时，保留原行为，交给独立探测内核验证完整链路。
+		return errors.Is(err, engine.ErrMainProbeUnavailable)
+	}
+	_ = conn.Close()
+	return true
 }
 
 func restartEngineIfRunning(outboundName string) {

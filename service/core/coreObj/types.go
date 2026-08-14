@@ -162,6 +162,7 @@ type RoutingRule struct {
 	Type        string   `json:"type"`
 	OutboundTag string   `json:"outboundTag,omitempty"`
 	InboundTag  []string `json:"inboundTag,omitempty"`
+	User        []string `json:"user,omitempty"`
 	Domain      []string `json:"domain,omitempty"`
 	IP          []string `json:"ip,omitempty"`
 	Port        string   `json:"port,omitempty"`

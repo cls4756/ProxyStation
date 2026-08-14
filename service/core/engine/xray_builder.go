@@ -38,6 +38,10 @@ func BuildXrayConfig(setting *configure.Setting) (*coreObj.Config, error) {
 				Tag: "http-in", Port: setting.HttpPort, Listen: listenAddr, Protocol: "http",
 				Sniffing: builtinHTTPSniffing,
 			},
+			{
+				Tag: MainProbeInboundTag, Port: ProbeInboundSocksPort, Listen: ProbeInboundListen, Protocol: "socks",
+				Settings: &coreObj.InboundSettings{Auth: "password", UDP: false},
+			},
 		},
 		Outbounds: []coreObj.OutboundObject{
 			{Tag: "direct", Protocol: "freedom"},
@@ -116,6 +120,7 @@ func BuildXrayConfig(setting *configure.Setting) (*coreObj.Config, error) {
 	// 先收集有效出站 tag，再注入路由规则
 	validOutboundTags := collectValidOutboundTags()
 	hasProxyCatchAll := false
+	var mainProbeRules []coreObj.RoutingRule
 	for _, name := range configure.GetOutboundNames() {
 		o := configure.GetOutbound(name)
 		if o == nil {
@@ -156,11 +161,19 @@ func BuildXrayConfig(setting *configure.Setting) (*coreObj.Config, error) {
 		}
 		cfg.Outbounds = append([]coreObj.OutboundObject{ob}, cfg.Outbounds...)
 		validOutboundTags[name] = true
+		credential := mainProbeCredentialForOutbound(name)
+		cfg.Inbounds[2].Settings.Accounts = append(cfg.Inbounds[2].Settings.Accounts, coreObj.InboundAccount{
+			User: credential.Username, Pass: credential.Password,
+		})
+		mainProbeRules = append(mainProbeRules, coreObj.RoutingRule{
+			Type: "field", OutboundTag: name, InboundTag: []string{MainProbeInboundTag}, User: []string{credential.Username},
+		})
 		if name == "proxy" {
 			// catch-all 兜底：必须排在用户规则之后，否则会吃掉全部流量
 			hasProxyCatchAll = true
 		}
 	}
+	cfg.Routing.Rules = append(mainProbeRules, cfg.Routing.Rules...)
 
 	// 注入用户自定义路由规则（跳过引用了不存在出站的规则）
 	for _, r := range configure.GetRoutingRules() {

@@ -74,6 +74,22 @@ func TestSaveLatencySeparatesSubscriptionProbeModes(t *testing.T) {
 	}
 }
 
+func TestServerRawByRefInheritsSubscriptionProxyOutbound(t *testing.T) {
+	setupTestDB(t)
+	if err := configure.AppendSubscriptions([]*configure.SubscriptionRaw{{
+		ID: "sub", ProxyOutbound: "hk", Servers: []configure.ServerRaw{{
+			Name: "node", Host: "node.example.com", Port: 443,
+		}},
+	}}); err != nil {
+		t.Fatalf("AppendSubscriptions: %v", err)
+	}
+
+	server := serverRawByRef(configure.NodeRef{Type: "sub_server", Sub: 0, Index: 0})
+	if server == nil || server.FrontProxy != "hk" {
+		t.Fatalf("订阅节点未继承 ProxyOutbound: %+v", server)
+	}
+}
+
 // 稳定优先的唯一卖点：当前节点还连得上就不动，哪怕它比最优节点慢一个数量级。
 // 这条语义必须在阈值判断之前���效，否则和最低延迟策略没有区别。
 func TestShouldSwitchStableKeepsCurrentWhenAlive(t *testing.T) {
