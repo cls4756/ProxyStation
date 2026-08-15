@@ -64,12 +64,13 @@ var ProtocolKernelMap = map[string]KernelType{
 var Manager = &EngineManager{}
 
 type EngineManager struct {
-	mu      sync.Mutex
-	proc    *os.Process
-	cancel  context.CancelFunc
-	kernel  KernelType
-	dataDir string
-	running bool // 添加运行状态标志
+	mu                  sync.Mutex
+	proc                *os.Process
+	cancel              context.CancelFunc
+	kernel              KernelType
+	dataDir             string
+	running             bool // 添加运行状态标志
+	loadedNodeOutbounds map[string]string
 }
 
 func Init(dataDir string) {
@@ -96,6 +97,7 @@ func (em *EngineManager) Start() error {
 		em.proc = nil
 	}
 	em.cancel = nil
+	em.loadedNodeOutbounds = nil
 
 	// 检查是否有可用的出站配置
 	if !em.hasAnyOutbound() {
@@ -105,6 +107,7 @@ func (em *EngineManager) Start() error {
 	}
 
 	setting := configure.GetSettingNotNil()
+	loadedNodeOutbounds := snapshotLoadedNodeOutbounds()
 	if err := em.ensureCfGoodNetSidecars(); err != nil {
 		em.running = false
 		_ = configure.SetRunning(false)
@@ -277,6 +280,7 @@ func (em *EngineManager) Start() error {
 
 	// 只有在端口就绪后才设置运行状态
 	em.running = true
+	em.loadedNodeOutbounds = loadedNodeOutbounds
 	_ = configure.SetRunning(true)
 
 	// 启动 goroutine 监听进程退出
@@ -292,6 +296,7 @@ func (em *EngineManager) Start() error {
 			em.proc = nil
 			em.cancel = nil
 			em.running = false
+			em.loadedNodeOutbounds = nil
 			_ = configure.SetRunning(false)
 			if LogCallback != nil {
 				LogCallback("⚠️ 进程意外退出")
@@ -319,6 +324,7 @@ func (em *EngineManager) stopLocked() {
 		_ = em.proc.Kill()
 		em.proc = nil
 	}
+	em.loadedNodeOutbounds = nil
 }
 
 func (em *EngineManager) Restart() error {
@@ -357,6 +363,15 @@ func (em *EngineManager) CurrentKernel() KernelType {
 	em.mu.Lock()
 	defer em.mu.Unlock()
 	return em.kernel
+}
+
+func (em *EngineManager) LoadedOutboundForNode(ref configure.NodeRef) string {
+	em.mu.Lock()
+	defer em.mu.Unlock()
+	if !em.running {
+		return ""
+	}
+	return em.loadedNodeOutbounds[nodeRefKey(ref)]
 }
 
 // hasAnyOutbound 检查是否有至少一个出站配置了有效节点
@@ -431,6 +446,29 @@ func resolveActiveNode(o *configure.Outbound) *configure.NodeRef {
 		return &configure.NodeRef{Type: ref.Type, Index: ref.Index, Sub: ref.Sub}
 	}
 	return nil
+}
+
+func nodeRefKey(ref configure.NodeRef) string {
+	return fmt.Sprintf("%s:%d:%d", ref.Type, ref.Sub, ref.Index)
+}
+
+func snapshotLoadedNodeOutbounds() map[string]string {
+	loaded := make(map[string]string)
+	for _, name := range configure.GetOutboundNames() {
+		o := configure.GetOutbound(name)
+		if o == nil {
+			continue
+		}
+		ref := resolveActiveNode(o)
+		if ref == nil || getServerRaw(ref) == nil {
+			continue
+		}
+		key := nodeRefKey(*ref)
+		if _, exists := loaded[key]; !exists {
+			loaded[key] = name
+		}
+	}
+	return loaded
 }
 
 func getServerRaw(ref *configure.NodeRef) *configure.ServerRaw {

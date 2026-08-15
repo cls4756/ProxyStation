@@ -29,28 +29,33 @@ func mainProbeCredentialForOutbound(outboundName string) mainProbeCredential {
 	}
 }
 
-func DialTCPViaOutbound(outboundName, target string, timeout time.Duration) (net.Conn, error) {
+func MainProbeAvailable(timeout time.Duration) bool {
+	if !Manager.IsRunning() {
+		return false
+	}
+	conn, err := net.DialTimeout("tcp", mainProbeAddress(), timeout)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
+func mainProbeAddress() string {
+	return net.JoinHostPort(ProbeInboundListen, strconv.Itoa(ProbeInboundSocksPort))
+}
+
+func mainProbeContextDialer(outboundName string) (xproxy.ContextDialer, error) {
 	if outboundName == "" {
 		return nil, fmt.Errorf("empty outbound name")
 	}
 	if !Manager.IsRunning() {
 		return nil, ErrMainProbeUnavailable
 	}
-	probeAddr := net.JoinHostPort(ProbeInboundListen, strconv.Itoa(ProbeInboundSocksPort))
-	readyTimeout := timeout
-	if readyTimeout > 300*time.Millisecond {
-		readyTimeout = 300 * time.Millisecond
-	}
-	readyConn, err := net.DialTimeout("tcp", probeAddr, readyTimeout)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrMainProbeUnavailable, err)
-	}
-	_ = readyConn.Close()
-
 	credential := mainProbeCredentialForOutbound(outboundName)
-	dialer, err := xproxy.SOCKS5("tcp", probeAddr, &xproxy.Auth{
+	dialer, err := xproxy.SOCKS5("tcp", mainProbeAddress(), &xproxy.Auth{
 		User: credential.Username, Password: credential.Password,
-	}, &net.Dialer{Timeout: timeout})
+	}, &net.Dialer{})
 	if err != nil {
 		return nil, err
 	}
@@ -58,7 +63,30 @@ func DialTCPViaOutbound(outboundName, target string, timeout time.Duration) (net
 	if !ok {
 		return nil, fmt.Errorf("main probe SOCKS dialer does not support context")
 	}
+	return contextDialer, nil
+}
+
+func DialContextViaOutbound(ctx context.Context, outboundName, network, target string) (net.Conn, error) {
+	if !Manager.IsRunning() {
+		return nil, ErrMainProbeUnavailable
+	}
+	readyCtx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer cancel()
+	readyConn, err := (&net.Dialer{}).DialContext(readyCtx, "tcp", mainProbeAddress())
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrMainProbeUnavailable, err)
+	}
+	_ = readyConn.Close()
+
+	dialer, err := mainProbeContextDialer(outboundName)
+	if err != nil {
+		return nil, err
+	}
+	return dialer.DialContext(ctx, network, target)
+}
+
+func DialTCPViaOutbound(outboundName, target string, timeout time.Duration) (net.Conn, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	return contextDialer.DialContext(ctx, "tcp", target)
+	return DialContextViaOutbound(ctx, outboundName, "tcp", target)
 }

@@ -15,7 +15,8 @@ import (
 )
 
 // ProbeInstance 是一个独立的探测内核子进程：只含一个本地 SOCKS 入站、
-// 目标节点出站（含其前置代理链）和最小化路由。测速完成后调用 Close 立即回收。
+// 目标节点出站和最小化路由。主内核可用时前置代理链由主内核复用，否则写入临时配置。
+// 测速完成后调用 Close 立即回收。
 // 它与主内核完全隔离，探测不再需要改写主配置或重启主内核。
 type ProbeInstance struct {
 	SocksPort int
@@ -25,6 +26,10 @@ type ProbeInstance struct {
 	proc      *os.Process
 	cancel    context.CancelFunc
 	closeOnce sync.Once
+}
+
+type probeInstanceOptions struct {
+	mainFrontOutbound string
 }
 
 const probeInstanceStartTimeout = 12 * time.Second
@@ -41,8 +46,17 @@ func probeKernelBin(kernel KernelType) (string, error) {
 }
 
 // StartProbeInstance 为单个节点启动一个独立探测内核并返回其 SOCKS 端口。
+// 节点配置前置代理且主内核探测入口可用时，目标节点经主内核对应出站建链。
 // 调用方必须在测速结束后调用 Close 回收进程与临时文件。
 func StartProbeInstance(s *configure.ServerRaw, socksPort int) (*ProbeInstance, error) {
+	options := probeInstanceOptions{}
+	if s != nil && s.FrontProxy != "" && MainProbeAvailable(300*time.Millisecond) {
+		options.mainFrontOutbound = s.FrontProxy
+	}
+	return startProbeInstance(s, socksPort, options)
+}
+
+func startProbeInstance(s *configure.ServerRaw, socksPort int, options probeInstanceOptions) (*ProbeInstance, error) {
 	if s == nil {
 		return nil, fmt.Errorf("nil server")
 	}
@@ -77,7 +91,7 @@ func StartProbeInstance(s *configure.ServerRaw, socksPort int) (*ProbeInstance, 
 	var args []string
 	switch kernel {
 	case KernelSingbox:
-		cfg, e := buildProbeSingboxConfig(s, socksPort)
+		cfg, e := buildProbeSingboxConfigWithOptions(s, socksPort, options)
 		if e != nil {
 			inst.cleanupFiles()
 			return nil, e
@@ -89,7 +103,7 @@ func StartProbeInstance(s *configure.ServerRaw, socksPort int) (*ProbeInstance, 
 		}
 		args = []string{binPath, "run", "-c", configPath}
 	default: // xray / v2ray
-		cfg, e := buildProbeXrayConfig(s, socksPort)
+		cfg, e := buildProbeXrayConfigWithOptions(s, socksPort, options)
 		if e != nil {
 			inst.cleanupFiles()
 			return nil, e
@@ -206,36 +220,51 @@ type frontHop struct {
 
 // buildProbeSingboxConfig 生成只含目标节点（及其前置链）的最小 sing-box 配置。
 func buildProbeSingboxConfig(s *configure.ServerRaw, socksPort int) (*SingboxConfig, error) {
+	return buildProbeSingboxConfigWithOptions(s, socksPort, probeInstanceOptions{})
+}
+
+func buildProbeSingboxConfigWithOptions(s *configure.ServerRaw, socksPort int, options probeInstanceOptions) (*SingboxConfig, error) {
 	const targetTag = "proxy"
 	out, err := singboxServerToOutbound(s, targetTag)
 	if err != nil {
 		return nil, err
 	}
 	outbounds := []SingboxOutbound{out}
-	// 前置代理链：每一跳作为独立出站，用 detour 由外向内串联。
-	prevTag := targetTag
-	for i, hop := range frontProxyChainRefs(s) {
-		hopTag := fmt.Sprintf("front-%d", i)
-		ho, err := singboxServerToOutbound(hop.server, hopTag)
-		if err != nil {
-			return nil, fmt.Errorf("front proxy %s: %w", hop.tag, err)
-		}
-		outbounds = append(outbounds, ho)
-		// prevTag 的流量先经过 hopTag 出去
-		for j := range outbounds {
-			if outbounds[j].Tag == prevTag {
-				outbounds[j].Detour = hopTag
-				break
+	if options.mainFrontOutbound != "" {
+		const mainFrontTag = "main-front"
+		credential := mainProbeCredentialForOutbound(options.mainFrontOutbound)
+		outbounds[0].Detour = mainFrontTag
+		outbounds = append(outbounds, SingboxOutbound{
+			Type: "socks", Tag: mainFrontTag,
+			Server: ProbeInboundListen, ServerPort: ProbeInboundSocksPort,
+			Username: credential.Username, Password: credential.Password,
+		})
+	} else {
+		// 前置代理链：每一跳作为独立出站，用 detour 由外向内串联。
+		prevTag := targetTag
+		for i, hop := range frontProxyChainRefs(s) {
+			hopTag := fmt.Sprintf("front-%d", i)
+			ho, err := singboxServerToOutbound(hop.server, hopTag)
+			if err != nil {
+				return nil, fmt.Errorf("front proxy %s: %w", hop.tag, err)
 			}
+			outbounds = append(outbounds, ho)
+			// prevTag 的流量先经过 hopTag 出去
+			for j := range outbounds {
+				if outbounds[j].Tag == prevTag {
+					outbounds[j].Detour = hopTag
+					break
+				}
+			}
+			prevTag = hopTag
 		}
-		prevTag = hopTag
 	}
 	outbounds = append(outbounds,
 		SingboxOutbound{Type: "direct", Tag: "direct"},
 	)
 	cfg := &SingboxConfig{
-		Log:      &SingboxLog{Disabled: true},
-		Inbounds: []SingboxInbound{buildSingboxInbound("socks", "probe-in", ProbeInboundListen, socksPort, nil)},
+		Log:       &SingboxLog{Disabled: true},
+		Inbounds:  []SingboxInbound{buildSingboxInbound("socks", "probe-in", ProbeInboundListen, socksPort, nil)},
 		Outbounds: outbounds,
 		Route: &SingboxRoute{
 			Rules: []SingboxRouteRule{{InboundTag: []string{"probe-in"}, Outbound: targetTag}},
@@ -247,28 +276,51 @@ func buildProbeSingboxConfig(s *configure.ServerRaw, socksPort int) (*SingboxCon
 
 // buildProbeXrayConfig 生成只含目标节点（及其前置链）的最小 xray/v2ray 配置。
 func buildProbeXrayConfig(s *configure.ServerRaw, socksPort int) (*coreObj.Config, error) {
+	return buildProbeXrayConfigWithOptions(s, socksPort, probeInstanceOptions{})
+}
+
+func buildProbeXrayConfigWithOptions(s *configure.ServerRaw, socksPort int, options probeInstanceOptions) (*coreObj.Config, error) {
 	const targetTag = "proxy"
 	out, err := xrayServerToOutbound(s, targetTag)
 	if err != nil {
 		return nil, err
 	}
 	outbounds := []coreObj.OutboundObject{out}
-	prevIdx := 0
-	for i, hop := range frontProxyChainRefs(s) {
-		hopTag := fmt.Sprintf("front-%d", i)
-		ho, err := xrayServerToOutbound(hop.server, hopTag)
-		if err != nil {
-			return nil, fmt.Errorf("front proxy %s: %w", hop.tag, err)
+	if options.mainFrontOutbound != "" {
+		const mainFrontTag = "main-front"
+		credential := mainProbeCredentialForOutbound(options.mainFrontOutbound)
+		if outbounds[0].StreamSettings == nil {
+			outbounds[0].StreamSettings = &coreObj.StreamSettings{}
 		}
-		if outbounds[prevIdx].StreamSettings == nil {
-			outbounds[prevIdx].StreamSettings = &coreObj.StreamSettings{}
+		if outbounds[0].StreamSettings.Sockopt == nil {
+			outbounds[0].StreamSettings.Sockopt = &coreObj.Sockopt{}
 		}
-		if outbounds[prevIdx].StreamSettings.Sockopt == nil {
-			outbounds[prevIdx].StreamSettings.Sockopt = &coreObj.Sockopt{}
+		outbounds[0].StreamSettings.Sockopt.DialerProxy = mainFrontTag
+		outbounds = append(outbounds, coreObj.OutboundObject{
+			Tag: mainFrontTag, Protocol: "socks",
+			Settings: coreObj.OutboundSettings{Servers: []coreObj.ServerObject{{
+				Address: ProbeInboundListen, Port: ProbeInboundSocksPort,
+				Users: []coreObj.SocksUser{{User: credential.Username, Pass: credential.Password}},
+			}}},
+		})
+	} else {
+		prevIdx := 0
+		for i, hop := range frontProxyChainRefs(s) {
+			hopTag := fmt.Sprintf("front-%d", i)
+			ho, err := xrayServerToOutbound(hop.server, hopTag)
+			if err != nil {
+				return nil, fmt.Errorf("front proxy %s: %w", hop.tag, err)
+			}
+			if outbounds[prevIdx].StreamSettings == nil {
+				outbounds[prevIdx].StreamSettings = &coreObj.StreamSettings{}
+			}
+			if outbounds[prevIdx].StreamSettings.Sockopt == nil {
+				outbounds[prevIdx].StreamSettings.Sockopt = &coreObj.Sockopt{}
+			}
+			outbounds[prevIdx].StreamSettings.Sockopt.DialerProxy = hopTag
+			outbounds = append(outbounds, ho)
+			prevIdx = len(outbounds) - 1
 		}
-		outbounds[prevIdx].StreamSettings.Sockopt.DialerProxy = hopTag
-		outbounds = append(outbounds, ho)
-		prevIdx = len(outbounds) - 1
 	}
 	outbounds = append(outbounds,
 		coreObj.OutboundObject{Tag: "direct", Protocol: "freedom"},

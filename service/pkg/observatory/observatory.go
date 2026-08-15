@@ -849,6 +849,15 @@ func probeNodeViaCore(ref configure.NodeRef) int {
 	if !fastReachableRef(ref) {
 		return -1
 	}
+	if outboundName := engine.Manager.LoadedOutboundForNode(ref); outboundName != "" {
+		latency, err := probeViaMainOutboundTargets(outboundName)
+		if err == nil && engine.Manager.LoadedOutboundForNode(ref) == outboundName {
+			return latency
+		}
+		if !errors.Is(err, engine.ErrMainProbeUnavailable) {
+			return -1
+		}
+	}
 	s := serverRawByRef(ref)
 	if s == nil {
 		return -1
@@ -863,16 +872,41 @@ func probeNodeViaCore(ref configure.NodeRef) int {
 }
 
 func probeViaCoreTargets(socksPort int) int {
+	dialer, err := xproxy.SOCKS5("tcp", net.JoinHostPort(engine.ProbeInboundListen, strconv.Itoa(socksPort)), nil, xproxy.Direct)
+	if err != nil {
+		return -1
+	}
+	contextDialer, ok := dialer.(xproxy.ContextDialer)
+	if !ok {
+		return -1
+	}
+	latency, _ := probeViaTargets(contextDialer.DialContext)
+	return latency
+}
+
+func probeViaMainOutboundTargets(outboundName string) (int, error) {
+	return probeViaTargets(func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return engine.DialContextViaOutbound(ctx, outboundName, network, addr)
+	})
+}
+
+type probeDialContext func(ctx context.Context, network, addr string) (net.Conn, error)
+
+func probeViaTargets(dialContext probeDialContext) (int, error) {
 	targets := parseProbeTargets(configure.GetSettingNotNil().ProbeTargets)
 	if len(targets) == 0 {
 		targets = []string{"www.gstatic.com", "www.google.com", "www.youtube.com", "cp.cloudflare.com", "example.com"}
 	}
 	for _, host := range targets {
-		if ms := probeViaCoreSocks(host, socksPort, 4500*time.Millisecond); ms > 0 {
-			return ms
+		ms, err := probeHTTPSWithDialContext(host, 4500*time.Millisecond, dialContext)
+		if err == nil && ms > 0 {
+			return ms, nil
+		}
+		if errors.Is(err, engine.ErrMainProbeUnavailable) {
+			return -1, err
 		}
 	}
-	return -1
+	return -1, nil
 }
 
 func probeNodeDirect(ref configure.NodeRef) int {
@@ -994,16 +1028,10 @@ func parseProbeTargets(raw string) []string {
 	return out
 }
 
-func probeViaCoreSocks(host string, socksPort int, timeout time.Duration) int {
+func probeHTTPSWithDialContext(host string, timeout time.Duration, dialContext probeDialContext) (int, error) {
 	start := time.Now()
-	dialSocksProxy, err := xproxy.SOCKS5("tcp", net.JoinHostPort(engine.ProbeInboundListen, strconv.Itoa(socksPort)), nil, xproxy.Direct)
-	if err != nil {
-		return -1
-	}
-	dialContext := func(ctx context.Context, network, addr string) (net.Conn, error) {
-		return dialSocksProxy.Dial(network, addr)
-	}
 	transport := &http.Transport{DialContext: dialContext, TLSHandshakeTimeout: timeout}
+	defer transport.CloseIdleConnections()
 	client := &http.Client{Transport: transport, Timeout: timeout}
 
 	u := "https://" + host + "/generate_204?_=" + strconv.FormatInt(time.Now().UnixNano(), 10)
@@ -1011,17 +1039,17 @@ func probeViaCoreSocks(host string, socksPort int, timeout time.Duration) int {
 	req.Header.Set("User-Agent", "ProxyStation-CoreProbe/1.0")
 	resp, err := client.Do(req)
 	if err != nil {
-		return -1
+		return -1, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 204 && resp.StatusCode != 200 {
-		return -1
+		return -1, fmt.Errorf("unexpected probe status: %d", resp.StatusCode)
 	}
 	ms := int(time.Since(start).Milliseconds())
 	if ms <= 0 {
-		return 1
+		return 1, nil
 	}
-	return ms
+	return ms, nil
 }
 
 // saveLatency 按测速方式分别写回快速检测与真连接结果。
