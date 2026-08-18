@@ -214,6 +214,53 @@ func TestSearchServersReturnsGroupNames(t *testing.T) {
 	}
 }
 
+func TestSearchServersSupportsMultipleFiltersAndIndependentTotal(t *testing.T) {
+	setupListQueryTestDB(t)
+	scoreGood := 85
+	scoreLow := 55
+	if err := configure.AppendServers([]*configure.ServerRaw{
+		{Name: "tokyo-a", Host: "1.1.1.1", Type: "vless", IPType: "residential", Latency: 120, LastProbeTime: 1, IPScore: &scoreGood},
+		{Name: "tokyo-b", Host: "2.2.2.2", Type: "vless", IPType: "residential", Latency: 180, LastProbeTime: 1, IPScore: &scoreGood},
+		{Name: "tokyo-c", Host: "3.3.3.3", Type: "vless", IPType: "idc", Latency: 100, LastProbeTime: 1, IPScore: &scoreGood},
+		{Name: "tokyo-d", Host: "4.4.4.4", Type: "vmess", IPType: "residential", Latency: 100, LastProbeTime: 1, IPScore: &scoreGood},
+		{Name: "tokyo-e", Host: "5.5.5.5", Type: "vless", IPType: "residential", Latency: 100, LastProbeTime: 1, IPScore: &scoreLow},
+		{Name: "tokyo-f", Host: "6.6.6.6", Type: "vless", IPType: "residential"},
+	}); err != nil {
+		t.Fatalf("append servers: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest(http.MethodGet,
+		"/api/servers/search?type=vless&ipType=residential&probe=reachable&maxLatency=200&minScore=70&source=manual&limit=1", nil)
+	searchServers(context)
+
+	var payload struct {
+		Results []struct {
+			Server serverListItem `json:"server"`
+		} `json:"results"`
+		Total int `json:"total"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode search response: %v", err)
+	}
+	if recorder.Code != http.StatusOK || payload.Total != 2 || len(payload.Results) != 1 || payload.Results[0].Server.Name != "tokyo-a" {
+		t.Fatalf("unexpected filtered response: %s", recorder.Body.String())
+	}
+
+	recorder = httptest.NewRecorder()
+	context, _ = gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest(http.MethodGet,
+		"/api/servers/search?type=vless&ipType=residential&probe=reachable&maxLatency=200&minScore=70&source=manual&limit=1&offset=1", nil)
+	searchServers(context)
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode paged search response: %v", err)
+	}
+	if recorder.Code != http.StatusOK || payload.Total != 2 || len(payload.Results) != 1 || payload.Results[0].Server.Name != "tokyo-b" {
+		t.Fatalf("unexpected paged filtered response: %s", recorder.Body.String())
+	}
+}
+
 func TestGetServerBySourceReturnsSingleMatch(t *testing.T) {
 	setupListQueryTestDB(t)
 	if err := configure.AppendServers([]*configure.ServerRaw{

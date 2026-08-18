@@ -694,11 +694,101 @@ func queryServers(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"results": results})
 }
 
+type serverSearchFilters struct {
+	Query      string
+	Type       string
+	Geo        string
+	Source     string
+	IPType     string
+	Probe      string
+	MaxLatency *int
+	MinScore   *int
+}
+
+func optionalIntQuery(c *gin.Context, key string) (*int, error) {
+	raw := strings.TrimSpace(c.Query(key))
+	if raw == "" {
+		return nil, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil {
+		return nil, fmt.Errorf("%s must be an integer", key)
+	}
+	return &value, nil
+}
+
+func serverMatchesFilters(server configure.ServerRaw, filters serverSearchFilters) bool {
+	if filters.Query != "" && !matchServer(server, filters.Query) {
+		return false
+	}
+	if filters.Type != "" && strings.ToLower(strings.TrimSpace(server.Type)) != filters.Type {
+		return false
+	}
+	if filters.Geo != "" {
+		geo := strings.ToLower(strings.Join([]string{
+			server.IPGeoCountry, server.IPGeoCountryCode, server.IPGeoRegion, server.IPGeoCity,
+		}, " "))
+		if !strings.Contains(geo, filters.Geo) {
+			return false
+		}
+	}
+	if filters.IPType == "unchecked" {
+		if strings.TrimSpace(server.IPType) != "" {
+			return false
+		}
+	} else if filters.IPType != "" && strings.ToLower(strings.TrimSpace(server.IPType)) != filters.IPType {
+		return false
+	}
+	switch filters.Probe {
+	case "unchecked":
+		if server.LastProbeTime > 0 {
+			return false
+		}
+	case "reachable":
+		if server.LastProbeTime <= 0 || server.Latency <= 0 {
+			return false
+		}
+	case "failed":
+		if server.LastProbeTime <= 0 || server.Latency > 0 {
+			return false
+		}
+	}
+	if filters.MaxLatency != nil {
+		if server.LastProbeTime <= 0 || server.Latency <= 0 || server.Latency > *filters.MaxLatency {
+			return false
+		}
+	}
+	if filters.MinScore != nil && (server.IPScore == nil || *server.IPScore < *filters.MinScore) {
+		return false
+	}
+	return true
+}
+
 // searchServers 搜索节点（跨手动节点和所有订阅）
 func searchServers(c *gin.Context) {
-	q := strings.ToLower(c.Query("q"))
-	if q == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "q is required"})
+	maxLatency, err := optionalIntQuery(c, "maxLatency")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	minScore, err := optionalIntQuery(c, "minScore")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	filters := serverSearchFilters{
+		Query:      strings.ToLower(strings.TrimSpace(c.Query("q"))),
+		Type:       strings.ToLower(strings.TrimSpace(c.Query("type"))),
+		Geo:        strings.ToLower(strings.TrimSpace(c.Query("geo"))),
+		Source:     strings.ToLower(strings.TrimSpace(c.Query("source"))),
+		IPType:     strings.ToLower(strings.TrimSpace(c.Query("ipType"))),
+		Probe:      strings.ToLower(strings.TrimSpace(c.Query("probe"))),
+		MaxLatency: maxLatency,
+		MinScore:   minScore,
+	}
+	if filters.Query == "" && filters.Type == "" && filters.Geo == "" && filters.Source == "" &&
+		filters.IPType == "" && filters.Probe == "" && filters.MaxLatency == nil && filters.MinScore == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "at least one search filter is required"})
 		return
 	}
 	type result struct {
@@ -707,29 +797,37 @@ func searchServers(c *gin.Context) {
 		GroupNames []string          `json:"groupNames"`
 	}
 	var results []result
+	total := 0
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "100"))
 	if limit < 1 || limit > 500 {
 		limit = 100
 	}
+	offset, _ := strconv.Atoi(c.DefaultQuery("offset", "0"))
+	if offset < 0 {
+		offset = 0
+	}
 	// 搜索手动节点
-	for i, s := range configure.GetServers() {
-		if matchServer(s, q) {
-			results = append(results, result{Server: newServerListItem(s), Ref: configure.NodeRef{Type: "server", Index: i}})
-			if len(results) >= limit {
-				break
+	if filters.Source == "" || filters.Source == "manual" {
+		for i, s := range configure.GetServers() {
+			if !serverMatchesFilters(s, filters) {
+				continue
+			}
+			total++
+			if total > offset && len(results) < limit {
+				results = append(results, result{Server: newServerListItem(s), Ref: configure.NodeRef{Type: "server", Index: i}})
 			}
 		}
 	}
 	// 搜索订阅节点
-	for si, sub := range configure.GetSubscriptions() {
-		if len(results) >= limit {
-			break
-		}
-		for i, s := range sub.Servers {
-			if matchServer(s, q) {
-				results = append(results, result{Server: newServerListItem(s), Ref: configure.NodeRef{Type: "sub_server", Index: i, Sub: si}})
-				if len(results) >= limit {
-					break
+	if filters.Source == "" || filters.Source == "subscription" {
+		for si, sub := range configure.GetSubscriptions() {
+			for i, s := range sub.Servers {
+				if !serverMatchesFilters(s, filters) {
+					continue
+				}
+				total++
+				if total > offset && len(results) < limit {
+					results = append(results, result{Server: newServerListItem(s), Ref: configure.NodeRef{Type: "sub_server", Index: i, Sub: si}})
 				}
 			}
 		}
@@ -745,7 +843,7 @@ func searchServers(c *gin.Context) {
 			}
 		}
 	}
-	c.JSON(http.StatusOK, gin.H{"results": results, "total": len(results)})
+	c.JSON(http.StatusOK, gin.H{"results": results, "total": total})
 }
 
 func getServerBySource(c *gin.Context) {
@@ -2449,8 +2547,9 @@ func disconnectOutbound(c *gin.Context) {
 
 func pingNodes(c *gin.Context) {
 	var req struct {
-		Refs []configure.NodeRef `json:"refs"`
-		Mode string              `json:"mode"` // "fast" | "real"
+		Refs                     []configure.NodeRef `json:"refs"`
+		Mode                     string              `json:"mode"` // "fast" | "real"
+		EnableTransProxyFallback bool                `json:"enableTransProxyFallback"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -2487,7 +2586,9 @@ func pingNodes(c *gin.Context) {
 		}
 	}
 
-	observatory.ProbeNodesWithProgress(req.Refs, mode,
+	observatory.ProbeNodesWithProgressOptions(req.Refs, mode, observatory.ProbeOptions{
+		EnableTransProxyFallback: req.EnableTransProxyFallback && strictProbeMode,
+	},
 		func(i int, ref configure.NodeRef) {
 			if ctx.Err() != nil {
 				return
@@ -2532,6 +2633,7 @@ func pingGroup(c *gin.Context) {
 
 	mode := strings.ToLower(strings.TrimSpace(c.Query("mode")))
 	strictProbeMode := mode == "real"
+	enableTransProxyFallback := strictProbeMode && strings.EqualFold(strings.TrimSpace(c.Query("enableTransProxyFallback")), "true")
 
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
@@ -2562,7 +2664,9 @@ func pingGroup(c *gin.Context) {
 		refs[i] = configure.NodeRef{Type: ref.Type, Index: ref.Index, Sub: ref.Sub}
 	}
 
-	observatory.ProbeNodesWithProgress(refs, mode,
+	observatory.ProbeNodesWithProgressOptions(refs, mode, observatory.ProbeOptions{
+		EnableTransProxyFallback: enableTransProxyFallback,
+	},
 		func(i int, _ configure.NodeRef) {
 			if ctx.Err() != nil {
 				return

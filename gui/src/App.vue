@@ -825,7 +825,7 @@ async function searchOutboundNodes() {
   if (!query || outboundNodesLoading.value) return
   outboundNodesLoading.value = true
   try {
-    const { data } = await api.searchServers(query, 100)
+    const { data } = await api.searchServers({ q: query, limit: 100 })
     outboundNodeOptions.value = mergeNodeOptions(
       outboundForm.value.nodeKey ? outboundNodeOptions.value.filter(item => nodeKeyForRef(item.ref) === outboundForm.value.nodeKey) : [],
       data.results || [],

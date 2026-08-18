@@ -108,46 +108,6 @@
         <button class="action-btn" @click="clearSelection">取消选择</button>
       </div>
 
-      <!-- 搜索结果面板 -->
-      <div v-if="isSearching" class="panel" style="margin-bottom:0">
-        <div class="info-bar">
-          <span style="font-weight:600">搜索结果</span>
-          <span class="info-count">{{ sortedSearchResults.length }} 个节点</span>
-          <button class="action-btn" style="margin-left:auto" @click="searchQuery=''; isSearching=false">✕ 关闭</button>
-        </div>
-        <div v-if="!sortedSearchResults.length" class="empty-hint" style="padding:20px 0">
-          <p class="empty-sub">无匹配节点</p>
-        </div>
-        <div class="table-scroll" v-else>
-          <ServerListHead
-            :columns="listColumns"
-            :sort-key="sortKey"
-            :sort-dir="sortDir"
-            @sort="onSortColumn"
-            @resize="onResizeColumn"
-            @resize-end="onResizeColumnEnd"
-            @reset-width="onResetColumnWidth"
-          />
-          <ServerRow
-            v-for="(r, i) in sortedSearchResults" :key="refKey(r.ref) + ':' + i"
-            :server="r.server" :ref-obj="r.ref" :outbounds="store.outbounds" :removable="false"
-            :group-names="r.groupNames || []"
-            :current-outbound="currentOutbound"
-            :ping-state="pingStates[refKey(r.ref)] || null"
-            :ip-type-state="ipTypeStates[refKey(r.ref)] || null"
-            :ip-score-running="!!ipScoringRefs[refKey(r.ref)]"
-            :selected="isSelected(r.ref)"
-            @connect="connectNode"
-            @select="toggleSelect"
-            @select-start="startDragSelect"
-            @select-enter="continueDragSelect"
-            @share="(ref, sv) => openNodeMenu('share', ref, sv)"
-            @edit="(ref, sv) => openNodeMenu('edit', ref, sv)"
-            @copy-to-group="openSingleCopy"
-          />
-        </div>
-      </div>
-
       <!-- 订阅 tab -->
       <template v-for="(sub, si) in store.subscriptions" :key="'sub-' + sub.id">
         <div v-if="activeTab === 'sub-' + si" class="panel panel-fill">
@@ -155,14 +115,12 @@
             <div class="info-bar-left">
               <span class="info-url" :title="sub.url">{{ sub.url }}</span>
               <span v-if="sub.updatedAt" class="info-time">{{ formatTime(sub.updatedAt) }}</span>
+              <span v-if="isSearching" class="info-count">筛选结果：共 {{ searchTotal }} 个</span>
             </div>
             <div class="info-bar-right" v-if="!hasSelection">
-              <input
-                class="search-input"
-                v-model="searchQuery"
-                placeholder="搜索节点…"
-                @input="onSearch"
-              />
+              <button :class="['action-btn', { 'filter-btn-active': showSearchFilters || isSearching }]" @click="showSearchFilters = !showSearchFilters">
+                {{ showSearchFilters ? '▴ 收起' : '⚙ 搜索 / 筛选' }}<span v-if="searchConditionCount">{{ searchConditionCount }}</span>
+              </button>
               <button class="action-btn" @click="refreshPanel" :disabled="refreshing" title="重新加载节点数据">
                 ↻ {{ refreshing ? '刷新中…' : '刷新' }}
               </button>
@@ -191,13 +149,28 @@
               <button class="action-btn action-btn-danger" @click="deleteSub(si)">删除</button>
             </div>
           </div>
-          <div v-if="!sub.serversLoaded" class="empty-hint">
+          <NodeFilterPanel
+            v-if="showSearchFilters && !hasSelection"
+            :query="searchQuery"
+            :filters="searchFilters"
+            :searching="isSearching"
+            @update:query="searchQuery = $event"
+            @update:filters="searchFilters = $event"
+            @search="submitSearch"
+            @reset="resetSearchFilters"
+            @clear="closeSearch"
+            @close="showSearchFilters = false"
+          />
+          <div v-if="isSearching && !sortedSearchResults.length" class="empty-hint">
+            <p class="empty-sub">无匹配节点</p>
+          </div>
+          <div v-else-if="!isSearching && !sub.serversLoaded" class="empty-hint">
             <p class="empty-sub">正在加载订阅节点…</p>
           </div>
-          <div v-else-if="!sub.servers.length" class="empty-hint">
+          <div v-else-if="!isSearching && !sub.servers.length" class="empty-hint">
             <p class="empty-sub">订阅为空，点击「更新节点」拉取</p>
           </div>
-          <div class="table-scroll" v-if="sub.serversLoaded && getSortedSubEntries(sub, si).length">
+          <div class="table-scroll" v-if="getDisplayedSubEntries(sub, si).length">
             <ServerListHead
               :columns="listColumns"
               :sort-key="sortKey"
@@ -208,9 +181,10 @@
               @reset-width="onResetColumnWidth"
             />
             <ServerRow
-              v-for="(item, i) in getSortedSubEntries(sub, si)" :key="refKey(item.ref) + ':' + i"
+              v-for="(item, i) in getDisplayedSubEntries(sub, si)" :key="refKey(item.ref) + ':' + i"
               :server="item.server" :ref-obj="item.ref"
               :outbounds="store.outbounds" :removable="false"
+              :group-names="item.groupNames || []"
               :current-outbound="currentOutbound"
               :ping-state="pingStates[refKey(item.ref)] || null"
               :ip-type-state="ipTypeStates[refKey(item.ref)] || null"
@@ -246,15 +220,12 @@
           <div class="info-bar">
             <div class="info-bar-left">
               <span class="group-name-display">{{ group.name }}</span>
-              <span class="info-count">{{ groupServerCount(group) }} 个节点</span>
+              <span class="info-count">{{ isSearching ? `筛选结果：共 ${searchTotal} 个` : `${groupServerCount(group)} 个节点` }}</span>
             </div>
             <div class="info-bar-right" v-if="!hasSelection">
-              <input
-                class="search-input"
-                v-model="searchQuery"
-                placeholder="搜索节点…"
-                @input="onSearch"
-              />
+              <button :class="['action-btn', { 'filter-btn-active': showSearchFilters || isSearching }]" @click="showSearchFilters = !showSearchFilters">
+                {{ showSearchFilters ? '▴ 收起' : '⚙ 搜索 / 筛选' }}<span v-if="searchConditionCount">{{ searchConditionCount }}</span>
+              </button>
               <button class="action-btn" @click="refreshPanel" :disabled="refreshing" title="重新加载节点数据">
                 ↻ {{ refreshing ? '刷新中…' : '刷新' }}
               </button>
@@ -283,13 +254,28 @@
               <button v-if="group.name !== 'SERVER'" class="action-btn action-btn-danger" @click="deleteGroup(gi)">删除分组</button>
             </div>
           </div>
-          <div v-if="groupServerCount(group) === 0" class="empty-hint">
+          <NodeFilterPanel
+            v-if="showSearchFilters && !hasSelection"
+            :query="searchQuery"
+            :filters="searchFilters"
+            :searching="isSearching"
+            @update:query="searchQuery = $event"
+            @update:filters="searchFilters = $event"
+            @search="submitSearch"
+            @reset="resetSearchFilters"
+            @clear="closeSearch"
+            @close="showSearchFilters = false"
+          />
+          <div v-if="isSearching && !sortedSearchResults.length" class="empty-hint">
+            <p class="empty-sub">无匹配节点</p>
+          </div>
+          <div v-else-if="!isSearching && groupServerCount(group) === 0" class="empty-hint">
             <p class="empty-sub">分组为空，点击「添加节点」</p>
           </div>
-          <div v-else-if="!getSortedGroupEntries(group).length" class="empty-hint">
+          <div v-else-if="!isSearching && !getSortedGroupEntries(group).length" class="empty-hint">
             <p class="empty-sub">正在加载分组节点…</p>
           </div>
-          <div class="table-scroll" v-if="getSortedGroupEntries(group).length">
+          <div class="table-scroll" v-if="getDisplayedGroupEntries(group).length">
             <ServerListHead
               :columns="listColumns"
               :sort-key="sortKey"
@@ -300,8 +286,9 @@
               @reset-width="onResetColumnWidth"
             />
             <ServerRow
-              v-for="(item, i) in getSortedGroupEntries(group)" :key="refKey(item.ref) + ':' + i"
-              :server="item.server" :ref-obj="item.ref" :outbounds="store.outbounds" :removable="true"
+              v-for="(item, i) in getDisplayedGroupEntries(group)" :key="refKey(item.ref) + ':' + i"
+              :server="item.server" :ref-obj="item.ref" :outbounds="store.outbounds" :removable="!isSearching"
+              :group-names="item.groupNames || []"
               :current-outbound="currentOutbound"
               :ping-state="pingStates[refKey(item.ref)] || null"
               :ip-type-state="ipTypeStates[refKey(item.ref)] || null"
@@ -566,6 +553,7 @@ import { useProxyStore } from '../stores/proxy'
 import { api } from '../api'
 import ServerRow from '../components/ServerRow.vue'
 import ServerListHead from '../components/ServerListHead.vue'
+import NodeFilterPanel from '../components/NodeFilterPanel.vue'
 import NodeMenu from '../components/NodeMenu.vue'
 import axios from 'axios'
 
@@ -585,11 +573,30 @@ const selectedAddIdx = ref(-1)
 const addSearch = ref('')
 const selectableServers = ref([])
 const searchQuery = ref('')
+const appliedSearchQuery = ref('')
 const searchResults = ref([])
+const searchTotal = ref(0)
 const isSearching = ref(false)
+const showSearchFilters = ref(false)
+function emptySearchFilters() {
+  return {
+  type: '',
+  geo: '',
+  source: '',
+  ipType: '',
+  probe: '',
+  maxLatency: '',
+  minScore: '',
+  }
+}
+const searchFilters = ref(emptySearchFilters())
+const appliedSearchFilters = ref(emptySearchFilters())
 const pingProgress = ref({ total: 0, done: 0, current: '' })
 const pingStates = ref({})
 const activePingMode = ref('')
+const transProxyFallbackEnabled = ref(false)
+let previousTransProxyFallbackCommand
+let installedTransProxyFallbackCommand
 const FAST_PING_CONCURRENCY = 6
 const NODE_PAGE_SIZE_OPTIONS = [
   { value: 100, label: '100 条' },
@@ -850,6 +857,10 @@ async function refreshPanel() {
   if (refreshing.value) return
   refreshing.value = true
   try {
+    if (isSearching.value) {
+      await onSearch(false)
+      return
+    }
     // 根据当前 tab 只刷新表格数据
     if (activeTab.value.startsWith('sub-')) {
       const si = parseInt(activeTab.value.replace('sub-', ''))
@@ -960,6 +971,16 @@ function scrollActiveTabIntoView() {
 }
 
 onMounted(async () => {
+  const proxyStation = window.ProxyStation || (window.ProxyStation = {})
+  previousTransProxyFallbackCommand = proxyStation.transProxyFallback
+  installedTransProxyFallbackCommand = (enabled) => {
+    if (typeof enabled === 'boolean') {
+      transProxyFallbackEnabled.value = enabled
+      console.info(`[ProxyStation] 真连接 trans-proxy 回退已${enabled ? '开启' : '关闭'}`)
+    }
+    return transProxyFallbackEnabled.value
+  }
+  proxyStation.transProxyFallback = installedTransProxyFallbackCommand
   updateTabScrollState()
   if (typeof ResizeObserver !== 'undefined' && tabsWrapEl.value) {
     tabsResizeObserver = new ResizeObserver(updateTabScrollState)
@@ -976,6 +997,11 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  const proxyStation = window.ProxyStation
+  if (proxyStation && proxyStation.transProxyFallback === installedTransProxyFallbackCommand) {
+    if (previousTransProxyFallbackCommand) proxyStation.transProxyFallback = previousTransProxyFallbackCommand
+    else delete proxyStation.transProxyFallback
+  }
   tabsResizeObserver?.disconnect()
   window.removeEventListener('resize', updateTabScrollState)
   window.removeEventListener('pointerup', endDragSelect)
@@ -983,7 +1009,6 @@ onBeforeUnmount(() => {
   window.removeEventListener('blur', endDragSelect)
   stopIPScorePoll()
   clearTimeout(addSearchTimer)
-  clearTimeout(searchTimer)
   searchAbortController?.abort()
   addSearchAbortController?.abort()
   cancelPingFlush()
@@ -1104,6 +1129,7 @@ const allSelected = computed(() => {
 })
 
 function getCurrentTabServers() {
+  if (isSearching.value) return sortedSearchResults.value.map(item => item.ref)
   if (activeTab.value.startsWith('sub-')) {
     const si = parseInt(activeTab.value.replace('sub-', ''))
     const sub = store.subscriptions[si]
@@ -1124,6 +1150,7 @@ function getCurrentTabServers() {
 }
 
 function getSortedCurrentTabRefs() {
+  if (isSearching.value) return sortedSearchResults.value.map(e => e.ref)
   if (activeTab.value.startsWith('sub-')) {
     const si = parseInt(activeTab.value.replace('sub-', ''))
     const sub = store.subscriptions[si]
@@ -1168,6 +1195,7 @@ watch(activeTab, async () => {
 })
 
 async function ensureActiveTabNodes() {
+  if (isSearching.value) return
   if (activeTab.value.startsWith('sub-')) {
     const si = parseInt(activeTab.value.replace('sub-', ''))
     await store.fetchSubscriptionServers(si, false, nodePage.value, nodePageSize.value)
@@ -1211,6 +1239,7 @@ function groupServerCount(group) {
 }
 
 const currentNodeTotal = computed(() => {
+  if (isSearching.value) return searchTotal.value
   if (activeTab.value.startsWith('sub-')) {
     const si = parseInt(activeTab.value.replace('sub-', ''))
     return Number(store.subscriptions[si]?.serverCount || 0)
@@ -1230,7 +1259,8 @@ const nodeTotalPages = computed(() => {
 watch(currentNodeTotal, () => {
   if (nodePage.value > nodeTotalPages.value) {
     nodePage.value = nodeTotalPages.value
-    ensureActiveTabNodes()
+    if (isSearching.value) onSearch(false)
+    else ensureActiveTabNodes()
   }
 })
 
@@ -1238,6 +1268,10 @@ async function changeNodePage(page) {
   nodePage.value = Math.min(Math.max(1, page), nodeTotalPages.value)
   clearSortOrder()
   selectedRefs.value = []
+  if (isSearching.value) {
+    await onSearch(false)
+    return
+  }
   await ensureActiveTabNodes()
 }
 
@@ -1245,6 +1279,10 @@ async function changeNodePageSize() {
   nodePage.value = 1
   clearSortOrder()
   selectedRefs.value = []
+  if (isSearching.value) {
+    await onSearch(false)
+    return
+  }
   await ensureActiveTabNodes()
 }
 
@@ -1269,6 +1307,7 @@ async function pingRefsWithProgress(refs, mode = 'fast') {
   pingAbortController.value = new AbortController()
 
   const queue = refs.map(ref => ({ type: ref.type, index: ref.index, sub: ref.sub || 0 }))
+  const enableTransProxyFallback = mode === 'real' && transProxyFallbackEnabled.value
   const stateMap = {}
   for (const ref of queue) {
     stateMap[refKey(ref)] = { status: 'pending', mode }
@@ -1278,6 +1317,7 @@ async function pingRefsWithProgress(refs, mode = 'fast') {
   try {
     await api.pingNodes(queue, mode, {
       signal: pingAbortController.value.signal,
+      enableTransProxyFallback,
       onEvent: (evt, payload) => {
         const ref = payload?.ref
         if (!ref) return
@@ -1385,30 +1425,76 @@ function openNodeMenu(mode, refObj, server) {
   nodeMenuMode.value = mode
 }
 
-let searchTimer = null
 let searchAbortController = null
-async function onSearch() {
-  if (!searchQuery.value.trim()) {
+const activeSearchFilterCount = computed(() => Object.values(searchFilters.value).filter(value => String(value).trim()).length)
+const searchConditionCount = computed(() => activeSearchFilterCount.value + (searchQuery.value.trim() ? 1 : 0))
+
+function searchRequestParams() {
+  const pageSize = nodePageSize.value > 0 ? nodePageSize.value : 500
+  const params = {
+    limit: pageSize,
+    offset: (nodePage.value - 1) * pageSize,
+  }
+  const query = appliedSearchQuery.value.trim()
+  if (query) params.q = query
+  for (const [key, value] of Object.entries(appliedSearchFilters.value)) {
+    const normalized = String(value).trim()
+    if (normalized) params[key] = normalized
+  }
+  return params
+}
+
+function closeSearch() {
+  searchAbortController?.abort()
+  searchQuery.value = ''
+  appliedSearchQuery.value = ''
+  searchFilters.value = emptySearchFilters()
+  appliedSearchFilters.value = emptySearchFilters()
+  showSearchFilters.value = false
+  searchResults.value = []
+  searchTotal.value = 0
+  nodePage.value = 1
+  isSearching.value = false
+  ensureActiveTabNodes()
+}
+
+function resetSearchFilters() {
+  searchFilters.value = emptySearchFilters()
+  searchQuery.value = ''
+}
+
+function submitSearch() {
+  appliedSearchQuery.value = searchQuery.value
+  appliedSearchFilters.value = { ...searchFilters.value }
+  onSearch()
+}
+
+async function onSearch(resetPage = true) {
+  if (resetPage) nodePage.value = 1
+  const hasCriteria = Boolean(appliedSearchQuery.value.trim()) || Object.values(appliedSearchFilters.value).some(value => String(value).trim())
+  if (!hasCriteria) {
     searchAbortController?.abort()
     isSearching.value = false
     searchResults.value = []
+    searchTotal.value = 0
     return
   }
-  clearTimeout(searchTimer)
-  searchTimer = setTimeout(async () => {
-    searchAbortController?.abort()
-    searchAbortController = new AbortController()
-    const query = searchQuery.value.trim()
-    isSearching.value = true
-    try {
-      const { data } = await api.searchServers(query, 100, searchAbortController.signal)
-      if (searchQuery.value.trim() !== query) return
-      searchResults.value = data.results || []
-    } catch (error) {
-      if (error?.code === 'ERR_CANCELED') return
-      searchResults.value = []
-    }
-  }, 300)
+  if (nodePageSize.value <= 0) nodePageSize.value = 500
+  const params = searchRequestParams()
+  searchAbortController?.abort()
+  searchAbortController = new AbortController()
+  const requestKey = JSON.stringify(params)
+  isSearching.value = true
+  try {
+    const { data } = await api.searchServers(params, searchAbortController.signal)
+    if (JSON.stringify(searchRequestParams()) !== requestKey) return
+    searchResults.value = data.results || []
+    searchTotal.value = Number(data.total || 0)
+  } catch (error) {
+    if (error?.code === 'ERR_CANCELED') return
+    searchResults.value = []
+    searchTotal.value = 0
+  }
 }
 
 // tab 数量变化后要重算溢出状态（须在 manualGroups 定义之后注册，watch 的 getter 会立即求值）
@@ -1540,6 +1626,14 @@ function getSortedSubEntries(sub, si) {
 
 const sortedSearchResults = computed(() => applySortOrder(searchResults.value))
 
+function getDisplayedSubEntries(sub, si) {
+  return isSearching.value ? sortedSearchResults.value : getSortedSubEntries(sub, si)
+}
+
+function getDisplayedGroupEntries(group) {
+  return isSearching.value ? sortedSearchResults.value : getSortedGroupEntries(group)
+}
+
 const filteredSelectableServers = computed(() => {
   if (!addSearch.value.trim()) return selectableServers.value
   const q = addSearch.value.toLowerCase()
@@ -1563,7 +1657,7 @@ watch(addSearch, (raw) => {
   addSearchTimer = setTimeout(async () => {
     addSearchAbortController = new AbortController()
     try {
-      const { data } = await api.searchServers(query, 100, addSearchAbortController.signal)
+      const { data } = await api.searchServers({ q: query, limit: 100 }, addSearchAbortController.signal)
       if (addSearch.value.trim() !== query) return
       selectableServers.value = (data.results || []).map(item => ({ ...item.server, _ref: item.ref }))
     } catch (error) {
@@ -2070,23 +2164,10 @@ async function confirmSingleMove() {
 }
 .mobile-tab-actions { display: none; }
 
-.search-input {
-  height: 28px;
-  padding: 0 10px;
-  border: 1px solid #d9d9d9;
-  border-radius: 14px;
-  font-size: 12px;
-  outline: none;
-  width: 140px;
-  transition: all .2s;
-  background: #fafafa;
-  color: #262626;
-}
-.search-input:focus {
+.filter-btn-active {
   border-color: #1677ff;
-  background: #fff;
-  width: 200px;
-  box-shadow: 0 0 0 2px rgba(22,119,255,.1);
+  color: #1677ff;
+  background: #e6f4ff;
 }
 
 /* 操作按钮（比 .btn 更轻量） */
@@ -2374,16 +2455,6 @@ async function confirmSingleMove() {
   }
 
   .info-bar-right::-webkit-scrollbar { display: none; }
-
-  .info-bar-right .search-input {
-    flex: 0 0 150px;
-    width: 150px;
-    height: 30px;
-    border-radius: 6px;
-    background: #fff;
-  }
-
-  .search-input:focus { width: 180px; flex-basis: 180px; }
 
   .info-bar-right .action-btn {
     flex: 0 0 auto;

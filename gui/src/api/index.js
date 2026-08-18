@@ -37,7 +37,7 @@ export const api = {
   // 节点
   getServers: (view = 'list') => http.get('/servers', { params: { view } }),
   queryServers: (refs) => http.post('/servers/query', { refs }),
-  searchServers: (q, limit = 100, signal) => http.get('/servers/search', { params: { q, limit }, signal }),
+  searchServers: (params = {}, signal) => http.get('/servers/search', { params, signal }),
   getServerBySource: (prefix) => http.get('/servers/by-source', { params: { prefix } }),
   import: (data) => http.post('/import', data),
   importServers: (links, groupId) => http.post('/servers', { links, groupId }),
@@ -140,12 +140,12 @@ export const api = {
   // 批量测速：后端为 SSE 流式接口（POST），逐节点推送 running/done 进度。
   // EventSource 只支持 GET，这里用 fetch + ReadableStream 手动解析 SSE。
   // onEvent(event, payload) 会在每个事件到达时回调。
-  pingNodes: async (refs, mode = 'fast', { signal, onEvent } = {}) => {
+  pingNodes: async (refs, mode = 'fast', { signal, onEvent, enableTransProxyFallback = false } = {}) => {
     const resp = await fetch('/api/ping', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'include',
-      body: JSON.stringify({ refs, mode }),
+      body: JSON.stringify({ refs, mode, enableTransProxyFallback }),
       signal,
     })
     if (!resp.ok) {
@@ -177,7 +177,9 @@ export const api = {
       }
     }
   },
-  pingGroup: (index, mode = 'fast') => http.post(`/groups/${index}/ping`, null, { params: { mode } }),
+  pingGroup: (index, mode = 'fast', enableTransProxyFallback = false) => http.post(`/groups/${index}/ping`, null, {
+    params: { mode, enableTransProxyFallback },
+  }),
 
   // 日志
   getLogs: (params = {}) => http.get('/logs', { params }),
