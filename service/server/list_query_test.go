@@ -219,8 +219,8 @@ func TestSearchServersSupportsMultipleFiltersAndIndependentTotal(t *testing.T) {
 	scoreGood := 85
 	scoreLow := 55
 	if err := configure.AppendServers([]*configure.ServerRaw{
-		{Name: "tokyo-a", Host: "1.1.1.1", Type: "vless", IPType: "residential", Latency: 120, LastProbeTime: 1, IPScore: &scoreGood},
-		{Name: "tokyo-b", Host: "2.2.2.2", Type: "vless", IPType: "residential", Latency: 180, LastProbeTime: 1, IPScore: &scoreGood},
+		{Name: "tokyo-a", Host: "1.1.1.1", Type: "vless", IPType: "residential", Latency: 120, LastProbeTime: 1, FastLatency: 80, LastFastProbeTime: 1, IPScore: &scoreGood},
+		{Name: "tokyo-b", Host: "2.2.2.2", Type: "vless", IPType: "residential", Latency: 180, LastProbeTime: 1, FastLatency: 90, LastFastProbeTime: 1, IPScore: &scoreGood},
 		{Name: "tokyo-c", Host: "3.3.3.3", Type: "vless", IPType: "idc", Latency: 100, LastProbeTime: 1, IPScore: &scoreGood},
 		{Name: "tokyo-d", Host: "4.4.4.4", Type: "vmess", IPType: "residential", Latency: 100, LastProbeTime: 1, IPScore: &scoreGood},
 		{Name: "tokyo-e", Host: "5.5.5.5", Type: "vless", IPType: "residential", Latency: 100, LastProbeTime: 1, IPScore: &scoreLow},
@@ -232,7 +232,7 @@ func TestSearchServersSupportsMultipleFiltersAndIndependentTotal(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	context, _ := gin.CreateTestContext(recorder)
 	context.Request = httptest.NewRequest(http.MethodGet,
-		"/api/servers/search?type=vless&ipType=residential&probe=reachable&maxLatency=200&minScore=70&source=manual&limit=1", nil)
+		"/api/servers/search?type=vless&ipType=residential&fastProbe=reachable&probe=reachable&maxLatency=200&minScore=70&source=manual&limit=1", nil)
 	searchServers(context)
 
 	var payload struct {
@@ -251,7 +251,7 @@ func TestSearchServersSupportsMultipleFiltersAndIndependentTotal(t *testing.T) {
 	recorder = httptest.NewRecorder()
 	context, _ = gin.CreateTestContext(recorder)
 	context.Request = httptest.NewRequest(http.MethodGet,
-		"/api/servers/search?type=vless&ipType=residential&probe=reachable&maxLatency=200&minScore=70&source=manual&limit=1&offset=1", nil)
+		"/api/servers/search?type=vless&ipType=residential&fastProbe=reachable&probe=reachable&maxLatency=200&minScore=70&source=manual&limit=1&offset=1", nil)
 	searchServers(context)
 	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("decode paged search response: %v", err)

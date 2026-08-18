@@ -701,6 +701,7 @@ type serverSearchFilters struct {
 	Source     string
 	IPType     string
 	Probe      string
+	FastProbe  string
 	MaxLatency *int
 	MinScore   *int
 }
@@ -753,6 +754,20 @@ func serverMatchesFilters(server configure.ServerRaw, filters serverSearchFilter
 			return false
 		}
 	}
+	switch filters.FastProbe {
+	case "unchecked":
+		if server.LastFastProbeTime > 0 {
+			return false
+		}
+	case "reachable":
+		if server.LastFastProbeTime <= 0 || server.FastLatency <= 0 {
+			return false
+		}
+	case "failed":
+		if server.LastFastProbeTime <= 0 || server.FastLatency > 0 {
+			return false
+		}
+	}
 	if filters.MaxLatency != nil {
 		if server.LastProbeTime <= 0 || server.Latency <= 0 || server.Latency > *filters.MaxLatency {
 			return false
@@ -783,11 +798,12 @@ func searchServers(c *gin.Context) {
 		Source:     strings.ToLower(strings.TrimSpace(c.Query("source"))),
 		IPType:     strings.ToLower(strings.TrimSpace(c.Query("ipType"))),
 		Probe:      strings.ToLower(strings.TrimSpace(c.Query("probe"))),
+		FastProbe:  strings.ToLower(strings.TrimSpace(c.Query("fastProbe"))),
 		MaxLatency: maxLatency,
 		MinScore:   minScore,
 	}
 	if filters.Query == "" && filters.Type == "" && filters.Geo == "" && filters.Source == "" &&
-		filters.IPType == "" && filters.Probe == "" && filters.MaxLatency == nil && filters.MinScore == nil {
+		filters.IPType == "" && filters.Probe == "" && filters.FastProbe == "" && filters.MaxLatency == nil && filters.MinScore == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "at least one search filter is required"})
 		return
 	}

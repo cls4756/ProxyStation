@@ -75,10 +75,10 @@
         <span class="bulk-count">已选 {{ selectedRefs.length }} 个节点</span>
         <button class="action-btn" @click="selectAll" v-if="!allSelected">☑ 全选</button>
         <button class="action-btn" @click="clearSelection" v-if="allSelected">☐ 取消全选</button>
-        <button v-if="singleSelectedRef" class="action-btn action-btn-primary" @click="connectNode(singleSelectedRef)">
+        <button v-if="singleSelectedRef" class="action-btn action-btn-primary mobile-only-action" @click="connectNode(singleSelectedRef)">
           🔗 连接 / 切换
         </button>
-        <button v-if="singleSelectedRef?.type === 'server' && singleSelectedServer" class="action-btn" @click="openNodeMenu('edit', singleSelectedRef, singleSelectedServer)">
+        <button v-if="singleSelectedRef?.type === 'server' && singleSelectedServer" class="action-btn mobile-only-action" @click="openNodeMenu('edit', singleSelectedRef, singleSelectedServer)">
           ✏ 编辑
         </button>
         <button
@@ -584,6 +584,7 @@ function emptySearchFilters() {
   geo: '',
   source: '',
   ipType: '',
+  fastProbe: '',
   probe: '',
   maxLatency: '',
   minScore: '',
@@ -2238,6 +2239,7 @@ async function confirmSingleMove() {
   color: #1677ff;
   margin-right: 4px;
 }
+.mobile-only-action { display: none; }
 .content-area {
   flex: 1;
   overflow: hidden;
@@ -2502,6 +2504,7 @@ async function confirmSingleMove() {
     font-size: 11px;
     white-space: nowrap;
   }
+  .bulk-bar .mobile-only-action { display: inline-flex; }
 
   .notice-bar { padding: 9px 12px; }
 

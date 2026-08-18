@@ -37,6 +37,15 @@
       </select>
     </label>
     <label class="node-filter-field">
+      <span>快速连接状态</span>
+      <select :value="filters.fastProbe" @change="updateField('fastProbe', $event.target.value)">
+        <option value="">全部</option>
+        <option value="reachable">可用</option>
+        <option value="failed">不通</option>
+        <option value="unchecked">未检测</option>
+      </select>
+    </label>
+    <label class="node-filter-field">
       <span>真连状态</span>
       <select :value="filters.probe" @change="updateField('probe', $event.target.value)">
         <option value="">全部</option>
