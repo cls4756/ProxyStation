@@ -83,6 +83,21 @@ func GetServer(index int) *ServerRaw {
 	return s
 }
 
+func GetServersByIndexes(indexes []int) map[int]ServerRaw {
+	result := make(map[int]ServerRaw, len(indexes))
+	rawByIndex, err := db.ListGetMany("touch", "servers", indexes)
+	if err != nil {
+		return result
+	}
+	for index, raw := range rawByIndex {
+		server, err := Bytes2ServerRaw(raw)
+		if err == nil && server != nil {
+			result[index] = *server
+		}
+	}
+	return result
+}
+
 func AppendServers(servers []*ServerRaw) error {
 	return db.ListAppend("touch", "servers", servers)
 }

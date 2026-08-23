@@ -293,6 +293,82 @@ func TestSearchServersSupportsMultipleFiltersAndIndependentTotal(t *testing.T) {
 	}
 }
 
+func TestSearchServersScopesResultsToSelectedGroup(t *testing.T) {
+	setupListQueryTestDB(t)
+	if err := configure.AppendServers([]*configure.ServerRaw{
+		{Name: "group-hk", Type: "vless"},
+		{Name: "group-us", Type: "vless"},
+		{Name: "outside-hk", Type: "vless"},
+	}); err != nil {
+		t.Fatalf("append servers: %v", err)
+	}
+	if err := configure.AppendGroup(&configure.Group{
+		ID: "server", Name: "SERVER", Servers: []configure.ServerRef{
+			{Type: "server", Index: 0},
+			{Type: "server", Index: 1},
+		},
+	}); err != nil {
+		t.Fatalf("append group: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest(http.MethodGet, "/api/servers/search?groupId=server&q=hk", nil)
+	searchServers(context)
+
+	var payload struct {
+		Results []struct {
+			Ref    configure.NodeRef `json:"ref"`
+			Server serverListItem    `json:"server"`
+		} `json:"results"`
+		Total int `json:"total"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode scoped search response: %v", err)
+	}
+	if recorder.Code != http.StatusOK || payload.Total != 1 || len(payload.Results) != 1 ||
+		payload.Results[0].Ref.Index != 0 || payload.Results[0].Server.Name != "group-hk" {
+		t.Fatalf("search should stay inside selected group: %s", recorder.Body.String())
+	}
+}
+
+func TestSearchServersFiltersReachableFastAndFailedRealInsideGroup(t *testing.T) {
+	setupListQueryTestDB(t)
+	if err := configure.AppendServers([]*configure.ServerRaw{
+		{Name: "match", FastLatency: 80, LastFastProbeTime: 10, Latency: -1, LastProbeTime: 11},
+		{Name: "real-ok", FastLatency: 90, LastFastProbeTime: 10, Latency: 120, LastProbeTime: 11},
+		{Name: "outside-match", FastLatency: 70, LastFastProbeTime: 10, Latency: -1, LastProbeTime: 11},
+	}); err != nil {
+		t.Fatalf("append servers: %v", err)
+	}
+	if err := configure.AppendGroup(&configure.Group{
+		ID: "server", Name: "SERVER", Servers: []configure.ServerRef{
+			{Type: "server", Index: 0},
+			{Type: "server", Index: 1},
+		},
+	}); err != nil {
+		t.Fatalf("append group: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest(http.MethodGet,
+		"/api/servers/search?groupId=server&fastProbe=reachable&probe=failed", nil)
+	searchServers(context)
+
+	var payload struct {
+		Results []serverQueryResult `json:"results"`
+		Total   int                 `json:"total"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode probe status search response: %v", err)
+	}
+	if recorder.Code != http.StatusOK || payload.Total != 1 || len(payload.Results) != 1 ||
+		payload.Results[0].Server.Name != "match" {
+		t.Fatalf("unexpected probe status search response: %s", recorder.Body.String())
+	}
+}
+
 func TestGetServerBySourceReturnsSingleMatch(t *testing.T) {
 	setupListQueryTestDB(t)
 	if err := configure.AppendServers([]*configure.ServerRaw{

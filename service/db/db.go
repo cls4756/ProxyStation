@@ -157,6 +157,41 @@ func ListGet(bucket, key string, index int) ([]byte, error) {
 	return all[index], nil
 }
 
+func ListGetMany(bucket, key string, indexes []int) (map[int][]byte, error) {
+	result := make(map[int][]byte, len(indexes))
+	if len(indexes) == 0 {
+		return result, nil
+	}
+	wanted := make(map[int]struct{}, len(indexes))
+	for _, index := range indexes {
+		if index >= 0 {
+			wanted[index] = struct{}{}
+		}
+	}
+	err := database.View(func(tx *bolt.Tx) error {
+		bucketRef := tx.Bucket([]byte(bucket))
+		if bucketRef == nil {
+			return nil
+		}
+		data := bucketRef.Get([]byte(key))
+		if data == nil {
+			return nil
+		}
+		var items []json.RawMessage
+		if err := json.Unmarshal(data, &items); err != nil {
+			return err
+		}
+		for index := range wanted {
+			if index >= len(items) {
+				continue
+			}
+			result[index] = append([]byte(nil), items[index]...)
+		}
+		return nil
+	})
+	return result, err
+}
+
 func ListSet(bucket, key string, index int, value interface{}) error {
 	return database.Update(func(tx *bolt.Tx) error {
 		b, err := tx.CreateBucketIfNotExists([]byte(bucket))

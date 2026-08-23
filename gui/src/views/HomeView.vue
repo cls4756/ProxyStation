@@ -161,7 +161,10 @@
             @clear="closeSearch"
             @close="showSearchFilters = false"
           />
-          <div v-if="isSearching && !sortedSearchResults.length" class="empty-hint">
+          <div v-if="searchLoading" class="empty-hint">
+            <p class="empty-sub">正在筛选节点…</p>
+          </div>
+          <div v-else-if="isSearching && !sortedSearchResults.length" class="empty-hint">
             <p class="empty-sub">无匹配节点</p>
           </div>
           <div v-else-if="!isSearching && !sub.serversLoaded" class="empty-hint">
@@ -267,7 +270,10 @@
             @clear="closeSearch"
             @close="showSearchFilters = false"
           />
-          <div v-if="isSearching && !sortedSearchResults.length" class="empty-hint">
+          <div v-if="searchLoading" class="empty-hint">
+            <p class="empty-sub">正在筛选节点…</p>
+          </div>
+          <div v-else-if="isSearching && !sortedSearchResults.length" class="empty-hint">
             <p class="empty-sub">无匹配节点</p>
           </div>
           <div v-else-if="!isSearching && groupServerCount(group) === 0" class="empty-hint">
@@ -587,6 +593,7 @@ const appliedSearchQuery = ref('')
 const searchResults = ref([])
 const searchTotal = ref(0)
 const isSearching = ref(false)
+const searchLoading = ref(false)
 const showSearchFilters = ref(false)
 function emptySearchFilters() {
   return {
@@ -1212,7 +1219,8 @@ watch(activeTab, async () => {
   showSelectAll.value = false
   selectionAnchorKey.value = ''
   endDragSelect()
-  await ensureActiveTabNodes()
+  if (isSearching.value) await onSearch(false)
+  else await ensureActiveTabNodes()
   await nextTick()
   scrollActiveTabIntoView()
 })
@@ -1476,6 +1484,13 @@ function searchRequestParams() {
     limit: pageSize,
     offset: (nodePage.value - 1) * pageSize,
   }
+  if (activeTab.value.startsWith('group-')) {
+    const groupIndex = parseInt(activeTab.value.replace('group-', ''))
+    const group = manualGroups.value[groupIndex]
+    if (group?.id) params.groupId = group.id
+  } else if (activeTab.value.startsWith('sub-')) {
+    params.subscription = parseInt(activeTab.value.replace('sub-', ''))
+  }
   const query = appliedSearchQuery.value.trim()
   if (query) params.q = query
   for (const [key, value] of Object.entries(appliedSearchFilters.value)) {
@@ -1487,6 +1502,8 @@ function searchRequestParams() {
 
 function closeSearch() {
   searchAbortController?.abort()
+  searchAbortController = null
+  searchLoading.value = false
   searchQuery.value = ''
   appliedSearchQuery.value = ''
   searchFilters.value = emptySearchFilters()
@@ -1515,6 +1532,8 @@ async function onSearch(resetPage = true) {
   const hasCriteria = Boolean(appliedSearchQuery.value.trim()) || Object.values(appliedSearchFilters.value).some(value => String(value).trim())
   if (!hasCriteria) {
     searchAbortController?.abort()
+    searchAbortController = null
+    searchLoading.value = false
     isSearching.value = false
     searchResults.value = []
     searchTotal.value = 0
@@ -1523,11 +1542,13 @@ async function onSearch(resetPage = true) {
   if (nodePageSize.value <= 0) nodePageSize.value = 500
   const params = searchRequestParams()
   searchAbortController?.abort()
-  searchAbortController = new AbortController()
+  const controller = new AbortController()
+  searchAbortController = controller
   const requestKey = JSON.stringify(params)
   isSearching.value = true
+  searchLoading.value = true
   try {
-    const { data } = await api.searchServers(params, searchAbortController.signal)
+    const { data } = await api.searchServers(params, controller.signal)
     if (JSON.stringify(searchRequestParams()) !== requestKey) return
     searchResults.value = data.results || []
     searchTotal.value = Number(data.total || 0)
@@ -1535,6 +1556,11 @@ async function onSearch(resetPage = true) {
     if (error?.code === 'ERR_CANCELED') return
     searchResults.value = []
     searchTotal.value = 0
+  } finally {
+    if (searchAbortController === controller) {
+      searchAbortController = null
+      searchLoading.value = false
+    }
   }
 }
 

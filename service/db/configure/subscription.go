@@ -106,6 +106,21 @@ func GetSubscription(index int) *SubscriptionRaw {
 	return s
 }
 
+func GetSubscriptionsByIndexes(indexes []int) map[int]SubscriptionRaw {
+	result := make(map[int]SubscriptionRaw, len(indexes))
+	rawByIndex, err := db.ListGetMany("touch", "subscriptions", indexes)
+	if err != nil {
+		return result
+	}
+	for index, raw := range rawByIndex {
+		subscription, err := Bytes2SubscriptionRaw(raw)
+		if err == nil && subscription != nil {
+			result[index] = *subscription
+		}
+	}
+	return result
+}
+
 func AppendSubscriptions(subs []*SubscriptionRaw) error {
 	return db.ListAppend("touch", "subscriptions", subs)
 }

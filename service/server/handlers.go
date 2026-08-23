@@ -650,34 +650,41 @@ func serverCatalogResults(results []serverQueryResult) []serverCatalogResult {
 
 func queryServerRefs(refs []configure.NodeRef) []serverQueryResult {
 	results := make([]serverQueryResult, 0, len(refs))
-	var manualServers []configure.ServerRaw
-	manualLoaded := false
-	subscriptions := make(map[int]*configure.SubscriptionRaw)
+	manualIndexes := make([]int, 0)
+	subscriptionIndexes := make([]int, 0)
+	seenSubscriptions := make(map[int]struct{})
 	for _, ref := range refs {
-		var server *configure.ServerRaw
 		switch ref.Type {
 		case "server":
-			if !manualLoaded {
-				manualServers = configure.GetServers()
-				manualLoaded = true
+			manualIndexes = append(manualIndexes, ref.Index)
+		case "sub_server":
+			if _, exists := seenSubscriptions[ref.Sub]; !exists {
+				seenSubscriptions[ref.Sub] = struct{}{}
+				subscriptionIndexes = append(subscriptionIndexes, ref.Sub)
 			}
-			if ref.Index >= 0 && ref.Index < len(manualServers) {
-				server = &manualServers[ref.Index]
+		}
+	}
+	manualServers := configure.GetServersByIndexes(manualIndexes)
+	subscriptions := configure.GetSubscriptionsByIndexes(subscriptionIndexes)
+	for _, ref := range refs {
+		var server configure.ServerRaw
+		found := false
+		switch ref.Type {
+		case "server":
+			if item, ok := manualServers[ref.Index]; ok {
+				server = item
+				found = true
 			}
 		case "sub_server":
-			sub, ok := subscriptions[ref.Sub]
-			if !ok {
-				sub = configure.GetSubscription(ref.Sub)
-				subscriptions[ref.Sub] = sub
-			}
-			if sub != nil && ref.Index >= 0 && ref.Index < len(sub.Servers) {
-				server = &sub.Servers[ref.Index]
+			if sub, ok := subscriptions[ref.Sub]; ok && ref.Index >= 0 && ref.Index < len(sub.Servers) {
+				server = sub.Servers[ref.Index]
+				found = true
 			}
 		}
-		if server == nil {
+		if !found {
 			continue
 		}
-		results = append(results, serverQueryResult{Ref: ref, Server: newServerListItem(*server)})
+		results = append(results, serverQueryResult{Ref: ref, Server: newServerListItem(server)})
 	}
 	return results
 }
@@ -822,28 +829,95 @@ func searchServers(c *gin.Context) {
 	if offset < 0 {
 		offset = 0
 	}
-	// 搜索手动节点
-	if filters.Source == "" || filters.Source == "manual" {
-		for i, s := range configure.GetServers() {
-			if !serverMatchesFilters(s, filters) {
-				continue
-			}
-			total++
-			if total > offset && len(results) < limit {
-				results = append(results, result{Server: newServerListItem(s), Ref: configure.NodeRef{Type: "server", Index: i}})
-			}
+	appendMatch := func(server configure.ServerRaw, ref configure.NodeRef) {
+		if !serverMatchesFilters(server, filters) {
+			return
+		}
+		total++
+		if total > offset && len(results) < limit {
+			results = append(results, result{Server: newServerListItem(server), Ref: ref})
 		}
 	}
-	// 搜索订阅节点
-	if filters.Source == "" || filters.Source == "subscription" {
-		for si, sub := range configure.GetSubscriptions() {
-			for i, s := range sub.Servers {
-				if !serverMatchesFilters(s, filters) {
-					continue
+	sourceAllows := func(refType string) bool {
+		return filters.Source == "" ||
+			(filters.Source == "manual" && refType == "server") ||
+			(filters.Source == "subscription" && refType == "sub_server")
+	}
+
+	groupParam := strings.TrimSpace(c.Query("groupId"))
+	subscriptionParam := strings.TrimSpace(c.Query("subscription"))
+	if groupParam != "" && subscriptionParam != "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "groupId and subscription cannot be combined"})
+		return
+	}
+
+	switch {
+	case groupParam != "":
+		group := resolveGroupParam(groupParam)
+		if group == nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "group not found"})
+			return
+		}
+		manualIndexes := make([]int, 0, len(group.Servers))
+		subscriptionIndexes := make([]int, 0)
+		seenSubscriptions := make(map[int]struct{})
+		for _, ref := range group.Servers {
+			if !sourceAllows(ref.Type) {
+				continue
+			}
+			if ref.Type == "server" {
+				manualIndexes = append(manualIndexes, ref.Index)
+			} else if ref.Type == "sub_server" {
+				if _, exists := seenSubscriptions[ref.Sub]; !exists {
+					seenSubscriptions[ref.Sub] = struct{}{}
+					subscriptionIndexes = append(subscriptionIndexes, ref.Sub)
 				}
-				total++
-				if total > offset && len(results) < limit {
-					results = append(results, result{Server: newServerListItem(s), Ref: configure.NodeRef{Type: "sub_server", Index: i, Sub: si}})
+			}
+		}
+		manualServers := configure.GetServersByIndexes(manualIndexes)
+		subscriptions := configure.GetSubscriptionsByIndexes(subscriptionIndexes)
+		for _, ref := range group.Servers {
+			if !sourceAllows(ref.Type) {
+				continue
+			}
+			switch ref.Type {
+			case "server":
+				if server, ok := manualServers[ref.Index]; ok {
+					appendMatch(server, configure.NodeRef{Type: ref.Type, Index: ref.Index, Sub: ref.Sub})
+				}
+			case "sub_server":
+				sub, ok := subscriptions[ref.Sub]
+				if ok && ref.Index >= 0 && ref.Index < len(sub.Servers) {
+					appendMatch(sub.Servers[ref.Index], configure.NodeRef{Type: ref.Type, Index: ref.Index, Sub: ref.Sub})
+				}
+			}
+		}
+	case subscriptionParam != "":
+		subscriptionIndex, parseErr := strconv.Atoi(subscriptionParam)
+		if parseErr != nil || subscriptionIndex < 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "subscription must be a non-negative integer"})
+			return
+		}
+		sub := configure.GetSubscription(subscriptionIndex)
+		if sub == nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "subscription not found"})
+			return
+		}
+		if sourceAllows("sub_server") {
+			for i, server := range sub.Servers {
+				appendMatch(server, configure.NodeRef{Type: "sub_server", Index: i, Sub: subscriptionIndex})
+			}
+		}
+	default:
+		if sourceAllows("server") {
+			for i, server := range configure.GetServers() {
+				appendMatch(server, configure.NodeRef{Type: "server", Index: i})
+			}
+		}
+		if sourceAllows("sub_server") {
+			for subscriptionIndex, sub := range configure.GetSubscriptions() {
+				for i, server := range sub.Servers {
+					appendMatch(server, configure.NodeRef{Type: "sub_server", Index: i, Sub: subscriptionIndex})
 				}
 			}
 		}
