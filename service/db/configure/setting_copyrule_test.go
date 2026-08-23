@@ -61,6 +61,31 @@ func TestMigrateNodeCopyRulesIdempotent(t *testing.T) {
 	}
 }
 
+func TestMigrateNodeCleanupRulesClearsLegacyFields(t *testing.T) {
+	setting := &Setting{
+		NodeCleanupMode:           "fast",
+		NodeCleanupIntervalHour:   6,
+		NodeCleanupGroupIDs:       []string{"source"},
+		NodeCleanupRecycleGroupID: "recycle",
+	}
+	if !migrateNodeCleanupRules(setting) {
+		t.Fatal("旧清理字段应迁移为规则")
+	}
+	if len(setting.NodeCleanupRules) != 1 {
+		t.Fatalf("迁移后的规则数量 = %d, want 1", len(setting.NodeCleanupRules))
+	}
+	rule := setting.NodeCleanupRules[0]
+	if rule.Mode != "fast" || rule.IntervalHour != 6 || rule.RecycleGroupID != "recycle" || len(rule.GroupIDs) != 1 || rule.GroupIDs[0] != "source" {
+		t.Fatalf("迁移后的规则错误: %+v", rule)
+	}
+	if len(setting.NodeCleanupGroupIDs) != 0 || setting.NodeCleanupRecycleGroupID != "" {
+		t.Fatalf("旧清理字段未清除: %+v", setting)
+	}
+	if migrateNodeCleanupRules(setting) {
+		t.Fatal("迁移应幂等")
+	}
+}
+
 // 旧字段与新字段并存时不应产生重复项
 func TestMigrateNodeCopyRulesNoDuplicate(t *testing.T) {
 	rules := []SubscriptionNodeCopyRule{

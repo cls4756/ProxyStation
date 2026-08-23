@@ -6,6 +6,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -28,7 +30,7 @@ var global = &Scheduler{}
 type Scheduler struct {
 	mu              sync.Mutex
 	stopCh          chan struct{}
-	lastNodeCleanup map[int]time.Time
+	lastNodeCleanup map[string]time.Time
 }
 
 func Start() {
@@ -70,23 +72,30 @@ func (s *Scheduler) checkAndCleanupNodes() {
 		return
 	}
 	if s.lastNodeCleanup == nil {
-		s.lastNodeCleanup = make(map[int]time.Time)
+		s.lastNodeCleanup = make(map[string]time.Time)
 	}
-	for index, rule := range setting.NodeCleanupRules {
+	for _, rule := range setting.NodeCleanupRules {
 		if len(rule.GroupIDs) == 0 {
 			continue
 		}
+		ruleKey := nodeCleanupRuleKey(rule)
 		interval := time.Duration(rule.IntervalHour) * time.Hour
 		if interval <= 0 {
 			interval = 24 * time.Hour
 		}
-		if last := s.lastNodeCleanup[index]; !last.IsZero() && time.Since(last) < interval {
+		if last := s.lastNodeCleanup[ruleKey]; !last.IsZero() && time.Since(last) < interval {
 			continue
 		}
-		s.lastNodeCleanup[index] = time.Now()
+		s.lastNodeCleanup[ruleKey] = time.Now()
 		rule := rule
 		go cleanupInvalidNodes(rule)
 	}
+}
+
+func nodeCleanupRuleKey(rule configure.NodeCleanupRule) string {
+	groupIDs := append([]string(nil), rule.GroupIDs...)
+	sort.Strings(groupIDs)
+	return fmt.Sprintf("%s|%d|%s|%s", rule.Mode, rule.IntervalHour, rule.RecycleGroupID, strings.Join(groupIDs, ","))
 }
 
 func cleanupInvalidNodes(rule configure.NodeCleanupRule) {

@@ -838,12 +838,29 @@ function schedulePingFlush(key, state, refObj, patch) {
   pingFlushFrame = window.requestAnimationFrame(flushPendingPingUpdates)
 }
 
+function patchSearchResults(items) {
+  if (!searchResults.value.length) return
+  const patches = new Map()
+  for (const item of items || []) {
+    if (!item?.ref || !item?.patch) continue
+    patches.set(refKey(item.ref), item.patch)
+  }
+  if (!patches.size) return
+  searchResults.value = searchResults.value.map(item => {
+    const patch = patches.get(refKey(item.ref))
+    return patch ? { ...item, server: { ...item.server, ...patch } } : item
+  })
+}
+
 function flushPendingPingUpdates() {
   if (pingFlushFrame) window.cancelAnimationFrame(pingFlushFrame)
   if (Object.keys(pendingPingStates).length) {
     pingStates.value = { ...pingStates.value, ...pendingPingStates }
   }
-  if (pendingPingPatches.length) store.patchNodes(pendingPingPatches)
+  if (pendingPingPatches.length) {
+    store.patchNodes(pendingPingPatches)
+    patchSearchResults(pendingPingPatches)
+  }
   pendingPingStates = {}
   pendingPingPatches = []
   pingFlushFrame = 0
@@ -907,6 +924,9 @@ const editSubForm = ref({ name: '', url: '', format: 'auto', proxyOutbound: '' }
 const showBulkCopyModal = ref(false)
 const bulkCopyGroupId = ref('')
 const bulkCopying = ref(false)
+const showBulkMoveModal = ref(false)
+const bulkMoveGroupId = ref('')
+const bulkMoving = ref(false)
 
 // 单节点复制/移动到分组
 const showSingleCopyModal = ref(false)

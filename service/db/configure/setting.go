@@ -251,16 +251,22 @@ func GetSettingNotNil() *Setting {
 }
 
 func migrateNodeCleanupRules(s *Setting) bool {
-	if len(s.NodeCleanupRules) > 0 || len(s.NodeCleanupGroupIDs) == 0 {
-		return false
+	changed := false
+	if len(s.NodeCleanupRules) == 0 && len(s.NodeCleanupGroupIDs) > 0 {
+		s.NodeCleanupRules = []NodeCleanupRule{{
+			GroupIDs:       append([]string(nil), s.NodeCleanupGroupIDs...),
+			Mode:           s.NodeCleanupMode,
+			IntervalHour:   s.NodeCleanupIntervalHour,
+			RecycleGroupID: s.NodeCleanupRecycleGroupID,
+		}}
+		changed = true
 	}
-	s.NodeCleanupRules = []NodeCleanupRule{{
-		GroupIDs:       append([]string(nil), s.NodeCleanupGroupIDs...),
-		Mode:           s.NodeCleanupMode,
-		IntervalHour:   s.NodeCleanupIntervalHour,
-		RecycleGroupID: s.NodeCleanupRecycleGroupID,
-	}}
-	return true
+	if len(s.NodeCleanupGroupIDs) > 0 || s.NodeCleanupRecycleGroupID != "" {
+		s.NodeCleanupGroupIDs = nil
+		s.NodeCleanupRecycleGroupID = ""
+		changed = true
+	}
+	return changed
 }
 
 // migrateNodeCopyRules 把旧版单来源分组字段折叠进 SourceGroupIDs，返回是否有改动
