@@ -38,6 +38,7 @@ func NewRouter(guiDir string) *gin.Engine {
 		api.POST("/servers", importServers)
 		api.DELETE("/servers", deleteServers)
 		api.PUT("/servers/:index", editServer)
+		api.PUT("/server", editNode)
 		api.GET("/server/link", getServerLink)
 		api.POST("/server/copy-to-group", copyServerToGroup)
 		api.POST("/servers/batch-copy-to-group", batchCopyServersToGroup)
@@ -126,8 +127,14 @@ func NewRouter(guiDir string) *gin.Engine {
 		if _, err := os.Stat(guiDir); err == nil {
 			r.Static("/assets", filepath.Join(guiDir, "assets"))
 			r.StaticFile("/favicon.ico", filepath.Join(guiDir, "favicon.ico"))
+			r.StaticFile("/favicon.svg", filepath.Join(guiDir, "favicon.svg"))
 			// SPA fallback：所有非 /api 路由都返回 index.html
 			r.NoRoute(func(c *gin.Context) {
+				// 静态资源缺失时返回 404，避免浏览器把 index.html 当作图片/脚本解析
+				if ext := filepath.Ext(c.Request.URL.Path); ext != "" && ext != ".html" {
+					c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+					return
+				}
 				indexPath := filepath.Join(guiDir, "index.html")
 				if _, err := os.Stat(indexPath); err == nil {
 					c.File(indexPath)

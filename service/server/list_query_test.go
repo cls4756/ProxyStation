@@ -65,6 +65,38 @@ func TestListViewsOmitRawLinksAndSubscriptionNodes(t *testing.T) {
 	}
 }
 
+func TestSaveNodeEditSupportsManualAndSubscriptionNodes(t *testing.T) {
+	setupListQueryTestDB(t)
+	if err := configure.AppendServers([]*configure.ServerRaw{{Name: "manual", Host: "1.1.1.1", Port: 443, Type: "vless"}}); err != nil {
+		t.Fatalf("append manual server: %v", err)
+	}
+	if err := configure.AppendSubscriptions([]*configure.SubscriptionRaw{{
+		ID: "sub", Servers: []configure.ServerRaw{{Name: "sub-node", Host: "2.2.2.2", Port: 443, Type: "vmess"}},
+	}}); err != nil {
+		t.Fatalf("append subscription: %v", err)
+	}
+
+	manualFrontProxy := ""
+	manual, err := saveNodeEdit(configure.NodeRef{Type: "server", Index: 0}, editNodeRequest{
+		Name: "manual-edited", FrontProxy: &manualFrontProxy,
+	})
+	if err != nil || manual == nil || manual.Name != "manual-edited" {
+		t.Fatalf("edit manual node: server=%+v err=%v", manual, err)
+	}
+
+	subFrontProxy := ""
+	subNode, err := saveNodeEdit(configure.NodeRef{Type: "sub_server", Index: 0, Sub: 0}, editNodeRequest{
+		Name: "sub-edited", FrontProxy: &subFrontProxy,
+	})
+	if err != nil || subNode == nil || subNode.Name != "sub-edited" {
+		t.Fatalf("edit subscription node: server=%+v err=%v", subNode, err)
+	}
+	persisted := configure.GetSubscription(0)
+	if persisted == nil || len(persisted.Servers) != 1 || persisted.Servers[0].Name != "sub-edited" {
+		t.Fatalf("subscription node edit was not persisted: %+v", persisted)
+	}
+}
+
 func TestSubscriptionServersSupportsPagination(t *testing.T) {
 	setupListQueryTestDB(t)
 	sub := &configure.SubscriptionRaw{ID: "sub", Servers: []configure.ServerRaw{
@@ -281,6 +313,28 @@ func TestGetServerBySourceReturnsSingleMatch(t *testing.T) {
 	}
 	if recorder.Code != http.StatusOK || payload.Result.Ref.Index != 1 || payload.Result.Server.Name != "proxy" {
 		t.Fatalf("unexpected source lookup: %s", recorder.Body.String())
+	}
+}
+
+func TestGetServerLinkSupportsRawEditValue(t *testing.T) {
+	setupListQueryTestDB(t)
+	if err := configure.AppendServers([]*configure.ServerRaw{{Link: "clash://raw-link", Name: "raw-node", Type: "vless", Host: "1.1.1.1", Port: 443}}); err != nil {
+		t.Fatalf("append server: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest(http.MethodGet, "/api/server/link?type=server&index=0&raw=1", nil)
+	getServerLink(context)
+
+	var payload struct {
+		Link string `json:"link"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode raw link response: %v", err)
+	}
+	if recorder.Code != http.StatusOK || payload.Link != "clash://raw-link" {
+		t.Fatalf("unexpected raw link response: %s", recorder.Body.String())
 	}
 }
 

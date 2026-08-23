@@ -2,6 +2,7 @@
 package scheduler
 
 import (
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -25,8 +26,9 @@ var subHTTPClient = &http.Client{
 var global = &Scheduler{}
 
 type Scheduler struct {
-	mu     sync.Mutex
-	stopCh chan struct{}
+	mu              sync.Mutex
+	stopCh          chan struct{}
+	lastNodeCleanup map[int]time.Time
 }
 
 func Start() {
@@ -49,7 +51,7 @@ func Stop() {
 }
 
 func (s *Scheduler) run() {
-	ticker := time.NewTicker(10 * time.Minute) // 每10分钟检查一次
+	ticker := time.NewTicker(1 * time.Minute) // 每分钟检查一次配置到期任务
 	defer ticker.Stop()
 	for {
 		select {
@@ -57,8 +59,98 @@ func (s *Scheduler) run() {
 			return
 		case <-ticker.C:
 			s.checkAndUpdate()
+			s.checkAndCleanupNodes()
 		}
 	}
+}
+
+func (s *Scheduler) checkAndCleanupNodes() {
+	setting := configure.GetSettingNotNil()
+	if len(setting.NodeCleanupRules) == 0 {
+		return
+	}
+	if s.lastNodeCleanup == nil {
+		s.lastNodeCleanup = make(map[int]time.Time)
+	}
+	for index, rule := range setting.NodeCleanupRules {
+		if len(rule.GroupIDs) == 0 {
+			continue
+		}
+		interval := time.Duration(rule.IntervalHour) * time.Hour
+		if interval <= 0 {
+			interval = 24 * time.Hour
+		}
+		if last := s.lastNodeCleanup[index]; !last.IsZero() && time.Since(last) < interval {
+			continue
+		}
+		s.lastNodeCleanup[index] = time.Now()
+		rule := rule
+		go cleanupInvalidNodes(rule)
+	}
+}
+
+func cleanupInvalidNodes(rule configure.NodeCleanupRule) {
+	type cleanupGroup struct {
+		id   string
+		refs []configure.ServerRef
+	}
+	groups := make([]cleanupGroup, 0, len(rule.GroupIDs))
+	uniqueRefs := make([]configure.NodeRef, 0)
+	refIndexes := make(map[configure.NodeRef]int)
+	for _, groupID := range rule.GroupIDs {
+		_, group := configure.GetGroupByID(groupID)
+		if group == nil || len(group.Servers) == 0 || group.ID == rule.RecycleGroupID {
+			continue
+		}
+		groups = append(groups, cleanupGroup{id: group.ID, refs: append([]configure.ServerRef(nil), group.Servers...)})
+		for _, ref := range group.Servers {
+			nodeRef := configure.NodeRef{Type: ref.Type, Index: ref.Index, Sub: ref.Sub}
+			if _, exists := refIndexes[nodeRef]; exists {
+				continue
+			}
+			refIndexes[nodeRef] = len(uniqueRefs)
+			uniqueRefs = append(uniqueRefs, nodeRef)
+		}
+	}
+	invalidResults := observatory.ProbeInvalidNodes(uniqueRefs, rule.Mode)
+	for _, selectedGroup := range groups {
+		invalid := make([]configure.ServerRef, 0)
+		for _, ref := range selectedGroup.refs {
+			nodeRef := configure.NodeRef{Type: ref.Type, Index: ref.Index, Sub: ref.Sub}
+			if invalidResults[refIndexes[nodeRef]] {
+				invalid = append(invalid, ref)
+			}
+		}
+		if len(invalid) == 0 {
+			continue
+		}
+		sourceIndex, sourceGroup := configure.GetGroupByID(selectedGroup.id)
+		if sourceIndex < 0 || sourceGroup == nil {
+			continue
+		}
+		recycleIndex := -1
+		if rule.RecycleGroupID != "" {
+			recycleIndex, _ = configure.GetGroupByID(rule.RecycleGroupID)
+		}
+		if recycleIndex >= 0 {
+			if err := configure.AddServersToGroup(recycleIndex, invalid); err != nil {
+				log.Warn("node cleanup recycle group %s failed: %v", rule.RecycleGroupID, err)
+				continue
+			}
+		}
+		if err := configure.RemoveServersFromGroup(sourceIndex, invalid); err != nil {
+			log.Warn("node cleanup source group %s failed: %v", selectedGroup.id, err)
+			continue
+		}
+		log.Info("node cleanup removed %d invalid nodes from group %s%s", len(invalid), sourceGroup.Name, cleanupRecycleSuffix(recycleIndex >= 0, rule.RecycleGroupID))
+	}
+}
+
+func cleanupRecycleSuffix(recycled bool, groupID string) string {
+	if !recycled {
+		return ""
+	}
+	return fmt.Sprintf(" and recycled them to %s", groupID)
 }
 
 func (s *Scheduler) checkAndUpdate() {

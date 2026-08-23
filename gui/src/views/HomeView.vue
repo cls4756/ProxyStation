@@ -78,7 +78,7 @@
         <button v-if="singleSelectedRef" class="action-btn action-btn-primary mobile-only-action" @click="connectNode(singleSelectedRef)">
           🔗 连接 / 切换
         </button>
-        <button v-if="singleSelectedRef?.type === 'server' && singleSelectedServer" class="action-btn mobile-only-action" @click="openNodeMenu('edit', singleSelectedRef, singleSelectedServer)">
+        <button v-if="singleSelectedRef && singleSelectedServer" class="action-btn mobile-only-action" @click="openNodeMenu('edit', singleSelectedRef, singleSelectedServer)">
           ✏ 编辑
         </button>
         <button
@@ -194,6 +194,7 @@
               @select="toggleSelect"
               @select-start="startDragSelect"
               @select-enter="continueDragSelect"
+              @edit="(r, sv) => openNodeMenu('edit', r, sv)"
               @share="(r, sv) => openNodeMenu('share', r, sv)"
               @copy-to-group="ref => openSingleCopy(ref)"
             />
@@ -329,6 +330,7 @@
       :mode="nodeMenuMode"
       :ref-obj="nodeMenuRef"
       :server="nodeMenuServer"
+      @updated="handleNodeUpdated"
       @close="nodeMenuMode = ''"
     />
 
@@ -450,7 +452,7 @@
     </div>
 
     <!-- 批量复制到分组弹窗 -->
-    <div class="modal-overlay" v-if="showBulkCopyModal" @mousedown.self="showBulkCopyModal = false">
+    <div class="modal-overlay" v-if="showBulkCopyModal" @mousedown.self="!bulkCopying && (showBulkCopyModal = false)">
       <div class="modal-box" style="width:380px">
         <div class="modal-header">
           <span class="modal-title">复制到分组</span>
@@ -468,14 +470,16 @@
           </div>
         </div>
         <div class="modal-footer">
-          <button class="btn btn-light" @click="showBulkCopyModal = false">取消</button>
-          <button class="btn btn-primary" :disabled="!bulkCopyGroupId" @click="confirmBulkCopy">复制</button>
+          <button class="btn btn-light" :disabled="bulkCopying" @click="showBulkCopyModal = false">取消</button>
+          <button class="btn btn-primary" :disabled="!bulkCopyGroupId || bulkCopying" @click="confirmBulkCopy">
+            {{ bulkCopying ? '复制中…' : '复制' }}
+          </button>
         </div>
       </div>
     </div>
 
     <!-- 批量移动到分组弹窗 -->
-    <div class="modal-overlay" v-if="showBulkMoveModal" @mousedown.self="showBulkMoveModal = false">
+    <div class="modal-overlay" v-if="showBulkMoveModal" @mousedown.self="!bulkMoving && (showBulkMoveModal = false)">
       <div class="modal-box" style="width:380px">
         <div class="modal-header">
           <span class="modal-title">移动到分组</span>
@@ -493,14 +497,16 @@
           </div>
         </div>
         <div class="modal-footer">
-          <button class="btn btn-light" @click="showBulkMoveModal = false">取消</button>
-          <button class="btn btn-primary" :disabled="!bulkMoveGroupId" @click="confirmBulkMove">移动</button>
+          <button class="btn btn-light" :disabled="bulkMoving" @click="showBulkMoveModal = false">取消</button>
+          <button class="btn btn-primary" :disabled="!bulkMoveGroupId || bulkMoving" @click="confirmBulkMove">
+            {{ bulkMoving ? '移动中…' : '移动' }}
+          </button>
         </div>
       </div>
     </div>
 
     <!-- 单节点复制到分组弹窗 -->
-    <div class="modal-overlay" v-if="showSingleCopyModal" @mousedown.self="showSingleCopyModal = false">
+    <div class="modal-overlay" v-if="showSingleCopyModal" @mousedown.self="!singleCopying && (showSingleCopyModal = false)">
       <div class="modal-box" style="width:360px">
         <div class="modal-header">
           <span class="modal-title">复制节点到分组</span>
@@ -516,14 +522,16 @@
           </div>
         </div>
         <div class="modal-footer">
-          <button class="btn btn-light" @click="showSingleCopyModal = false">取消</button>
-          <button class="btn btn-primary" :disabled="!singleTargetGroupId" @click="confirmSingleCopy">复制</button>
+          <button class="btn btn-light" :disabled="singleCopying" @click="showSingleCopyModal = false">取消</button>
+          <button class="btn btn-primary" :disabled="!singleTargetGroupId || singleCopying" @click="confirmSingleCopy">
+            {{ singleCopying ? '复制中…' : '复制' }}
+          </button>
         </div>
       </div>
     </div>
 
     <!-- 单节点移动到分组弹窗 -->
-    <div class="modal-overlay" v-if="showSingleMoveModal" @mousedown.self="showSingleMoveModal = false">
+    <div class="modal-overlay" v-if="showSingleMoveModal" @mousedown.self="!singleMoving && (showSingleMoveModal = false)">
       <div class="modal-box" style="width:360px">
         <div class="modal-header">
           <span class="modal-title">移动节点到分组</span>
@@ -539,8 +547,10 @@
           </div>
         </div>
         <div class="modal-footer">
-          <button class="btn btn-light" @click="showSingleMoveModal = false">取消</button>
-          <button class="btn btn-primary" :disabled="!singleTargetGroupId" @click="confirmSingleMove">移动</button>
+          <button class="btn btn-light" :disabled="singleMoving" @click="showSingleMoveModal = false">取消</button>
+          <button class="btn btn-primary" :disabled="!singleTargetGroupId || singleMoving" @click="confirmSingleMove">
+            {{ singleMoving ? '移动中…' : '移动' }}
+          </button>
         </div>
       </div>
     </div>
@@ -612,15 +622,16 @@ const nodePage = ref(1)
 // 操作列也是一列：6 个按钮实际要 220px 左右，之前固定 180px 且右对齐 + 裁剪，
 // 导致最左侧的按钮被切掉。放进来后既有足够默认宽度，也能像其他列一样拖动调整。
 const COLUMN_DEFS = [
-  { key: 'name', label: '节点', min: 80, def: 200, sortable: true },
-  { key: 'addr', label: '地址', min: 90, def: 220, sortable: true },
-  { key: 'geo', label: '地区', min: 80, def: 150, sortable: true },
-  { key: 'type', label: '协议', min: 50, def: 76, sortable: true },
-  { key: 'iptype', label: 'IP 类型', min: 46, def: 62, sortable: true },
-  { key: 'ipscore', label: '评分', min: 46, def: 62, sortable: true },
-  { key: 'fastLatency', label: '快速延时', min: 54, def: 72, sortable: true },
-  { key: 'latency', label: '真连延时', min: 54, def: 76, sortable: true },
-  { key: 'ops', label: '操作', min: 120, def: 232, noResizer: true },
+  { key: 'name', label: '节点', min: 80, def: 170, sortable: true },
+  { key: 'addr', label: '地址', min: 90, def: 190, sortable: true },
+  { key: 'geo', label: '地区', min: 80, def: 120, sortable: true },
+  { key: 'type', label: '协议', min: 50, def: 68, sortable: true },
+  { key: 'frontProxy', label: '前置代理', min: 64, def: 88, sortable: true },
+  { key: 'iptype', label: 'IP 类型', min: 46, def: 56, sortable: true },
+  { key: 'ipscore', label: '评分', min: 46, def: 56, sortable: true },
+  { key: 'fastLatency', label: '快速延时', min: 54, def: 66, sortable: true },
+  { key: 'latency', label: '真连延时', min: 54, def: 70, sortable: true },
+  { key: 'ops', label: '操作', min: 120, def: 220, noResizer: true },
 ]
 const COLUMN_WIDTH_STORAGE_KEY = 'ps.serverList.columnWidths'
 
@@ -735,6 +746,7 @@ function compareText(a, b) {
 function compareServers(key, a, b) {
   if (key === 'name') return compareText(a?.name, b?.name)
   if (key === 'type') return compareText(a?.type, b?.type)
+  if (key === 'frontProxy') return compareText(a?.frontProxy || '直连', b?.frontProxy || '直连')
   if (key === 'geo') {
     return compareText(a?.ipGeoCountry, b?.ipGeoCountry) ||
       compareText(a?.ipGeoRegion, b?.ipGeoRegion) ||
@@ -887,6 +899,16 @@ const editSubForm = ref({ name: '', url: '', format: 'auto', proxyOutbound: '' }
 // 批量复制到分组
 const showBulkCopyModal = ref(false)
 const bulkCopyGroupId = ref('')
+const bulkCopying = ref(false)
+
+// 单节点复制/移动到分组
+const showSingleCopyModal = ref(false)
+const showSingleMoveModal = ref(false)
+const singleCopyRef = ref(null)
+const singleMoveRef = ref(null)
+const singleTargetGroupId = ref('')
+const singleCopying = ref(false)
+const singleMoving = ref(false)
 
 // NodeMenu 状态
 const nodeMenuMode = ref('')
@@ -1303,11 +1325,14 @@ const canBulkRemove = computed(() => {
 // 一次性把所有 refs 提交给后端，由后端 worker pool 按配置的并发数调度
 // （real 默认 4、fast 16），前端只消费 SSE 进度事件更新状态。
 async function pingRefsWithProgress(refs, mode = 'fast') {
-  pingProgress.value = { total: refs.length, done: 0, current: '' }
+  const validRefs = (refs || []).filter(ref => ref && typeof ref.type === 'string')
+  if (!validRefs.length) return
+
+  pingProgress.value = { total: validRefs.length, done: 0, current: '' }
   pingAborted.value = false
   pingAbortController.value = new AbortController()
 
-  const queue = refs.map(ref => ({ type: ref.type, index: ref.index, sub: ref.sub || 0 }))
+  const queue = validRefs.map(ref => ({ type: ref.type, index: ref.index, sub: ref.sub || 0 }))
   const enableTransProxyFallback = mode === 'real' && transProxyFallbackEnabled.value
   const stateMap = {}
   for (const ref of queue) {
@@ -1325,6 +1350,13 @@ async function pingRefsWithProgress(refs, mode = 'fast') {
         const key = refKey({ type: ref.type, index: ref.index, sub: ref.sub || 0 })
         if (evt === 'running') {
           schedulePingFlush(key, { status: 'running', mode })
+        } else if (evt === 'fast') {
+          const latency = typeof payload.latency === 'number' ? payload.latency : -1
+          const probeTime = Math.floor(Date.now() / 1000)
+          schedulePingFlush(key, null, ref, {
+            fastLatency: latency,
+            lastFastProbeTime: probeTime,
+          })
         } else if (evt === 'done') {
           const lat = payload.latency
           const latency = typeof lat === 'number' ? lat : -1
@@ -1424,6 +1456,14 @@ function openNodeMenu(mode, refObj, server) {
   nodeMenuRef.value = refObj
   nodeMenuServer.value = server
   nodeMenuMode.value = mode
+}
+
+function handleNodeUpdated(refObj, server) {
+  if (!refObj || !server) return
+  const key = refKey(refObj)
+  searchResults.value = searchResults.value.map(item =>
+    refKey(item.ref) === key ? { ...item, server: { ...item.server, ...server } } : item
+  )
 }
 
 let searchAbortController = null
@@ -1736,7 +1776,9 @@ async function pingCurrentTab(mode = 'fast') {
     } else if (activeTab.value.startsWith('group-')) {
       const gi = parseInt(activeTab.value.replace('group-', ''))
       group = manualGroups.value[gi] || null
-      if (group) refs = (group.servers || []).map(r => ({ type: r.type, index: r.index, sub: r.sub || 0 }))
+      if (group) {
+        refs = getGroupPageRefs(group).map(r => ({ type: r.type, index: r.index, sub: r.sub || 0 }))
+      }
     }
     if (refs.length) await pingRefsWithProgress(refs, mode)
     // 中途中断时数据只有一半，用它判定切换会挑到"恰好先测完"的节点
@@ -1773,7 +1815,7 @@ async function detectIPTypeForCurrentTab() {
   } else if (activeTab.value.startsWith('group-')) {
     const gi = parseInt(activeTab.value.replace('group-', ''))
     const group = manualGroups.value[gi]
-    refs = (group?.servers || []).map(r => ({ type: r.type, index: r.index, sub: r.sub || 0 }))
+    refs = getGroupPageRefs(group).map(r => ({ type: r.type, index: r.index, sub: r.sub || 0 }))
   }
   await detectIPTypeForRefs(refs)
 }
@@ -1971,36 +2013,42 @@ async function confirmAddToGroup() {
 }
 
 async function confirmBulkCopy() {
-  if (!bulkCopyGroupId.value || !selectedRefs.value.length) return
-  const { data } = await api.batchCopyServersToGroup(selectedRefs.value, bulkCopyGroupId.value)
-  store.patchGroup(data.group)
-  showBulkCopyModal.value = false
-  bulkCopyGroupId.value = ''
-  selectedRefs.value = []
-  await ensureActiveTabNodes()
+  if (!bulkCopyGroupId.value || !selectedRefs.value.length || bulkCopying.value) return
+  bulkCopying.value = true
+  try {
+    const { data } = await api.batchCopyServersToGroup(selectedRefs.value, bulkCopyGroupId.value)
+    store.patchGroupCount(data.groupId, data.groupServerCount)
+    showBulkCopyModal.value = false
+    bulkCopyGroupId.value = ''
+    selectedRefs.value = []
+  } catch (error) {
+    showNotice('复制失败：' + (error?.response?.data?.error || error?.message || '未知错误'), true)
+  } finally {
+    bulkCopying.value = false
+  }
 }
 
 // 移动到分组（从当前分组移除，加入目标分组）
-const showBulkMoveModal = ref(false)
-const bulkMoveGroupId = ref('')
-const singleMoveRef = ref(null)
-const singleCopyRef = ref(null)
-const showSingleCopyModal = ref(false)
-const showSingleMoveModal = ref(false)
-const singleTargetGroupId = ref('')
-
 async function confirmBulkMove() {
-  if (!bulkMoveGroupId.value || !selectedRefs.value.length) return
+  if (!bulkMoveGroupId.value || !selectedRefs.value.length || bulkMoving.value) return
   if (!activeTab.value.startsWith('group-')) return
   const gi = parseInt(activeTab.value.replace('group-', ''))
   const group = manualGroups.value[gi]
-  const { data } = await api.batchMoveServersToGroup(selectedRefs.value, group.id, bulkMoveGroupId.value)
-  store.patchGroup(data.sourceGroup)
-  store.patchGroup(data.targetGroup)
-  showBulkMoveModal.value = false
-  bulkMoveGroupId.value = ''
-  selectedRefs.value = []
-  await ensureActiveTabNodes()
+  if (!group) return
+  bulkMoving.value = true
+  try {
+    const { data } = await api.batchMoveServersToGroup(selectedRefs.value, group.id, bulkMoveGroupId.value)
+    store.patchGroupCount(data.sourceGroupId, data.sourceServerCount)
+    store.patchGroupCount(data.targetGroupId, data.targetServerCount)
+    showBulkMoveModal.value = false
+    bulkMoveGroupId.value = ''
+    selectedRefs.value = []
+    await store.fetchGroupServers(realGroupIndex(group), true, nodePage.value, nodePageSize.value)
+  } catch (error) {
+    showNotice('移动失败：' + (error?.response?.data?.error || error?.message || '未知错误'), true)
+  } finally {
+    bulkMoving.value = false
+  }
 }
 
 function openSingleCopy(ref) {
@@ -2016,26 +2064,43 @@ function openSingleMove(ref) {
 }
 
 async function confirmSingleCopy() {
-  if (!singleTargetGroupId.value || !singleCopyRef.value) return
-  await api.copyServerToGroup(singleCopyRef.value, singleTargetGroupId.value)
-  showSingleCopyModal.value = false
-  await store.fetchGroups()
-  await ensureActiveTabNodes()
+  if (!singleTargetGroupId.value || !singleCopyRef.value || singleCopying.value) return
+  singleCopying.value = true
+  try {
+    const { data } = await api.copyServerToGroup(singleCopyRef.value, singleTargetGroupId.value)
+    store.patchGroupCount(data.groupId, data.groupServerCount)
+    showSingleCopyModal.value = false
+    singleCopyRef.value = null
+    singleTargetGroupId.value = ''
+  } catch (error) {
+    showNotice('复制失败：' + (error?.response?.data?.error || error?.message || '未知错误'), true)
+  } finally {
+    singleCopying.value = false
+  }
 }
 
 async function confirmSingleMove() {
-  if (!singleTargetGroupId.value || !singleMoveRef.value) return
-  await api.copyServerToGroup(singleMoveRef.value, singleTargetGroupId.value, false)
-  // 从当前分组移除
-  if (activeTab.value.startsWith('group-')) {
-    const gi = parseInt(activeTab.value.replace('group-', ''))
-    const group = manualGroups.value[gi]
-    await api.removeServerFromGroup(realGroupIndex(group), singleMoveRef.value)
+  if (!singleTargetGroupId.value || !singleMoveRef.value || singleMoving.value) return
+  if (!activeTab.value.startsWith('group-')) return
+  const gi = parseInt(activeTab.value.replace('group-', ''))
+  const group = manualGroups.value[gi]
+  if (!group) return
+  singleMoving.value = true
+  try {
+    const { data } = await api.batchMoveServersToGroup([singleMoveRef.value], group.id, singleTargetGroupId.value)
+    store.patchGroupCount(data.sourceGroupId, data.sourceServerCount)
+    store.patchGroupCount(data.targetGroupId, data.targetServerCount)
+    showSingleMoveModal.value = false
+    singleMoveRef.value = null
+    singleTargetGroupId.value = ''
+    await store.fetchGroupServers(realGroupIndex(group), true, nodePage.value, nodePageSize.value)
+  } catch (error) {
+    showNotice('移动失败：' + (error?.response?.data?.error || error?.message || '未知错误'), true)
+  } finally {
+    singleMoving.value = false
   }
-  showSingleMoveModal.value = false
-  await store.fetchGroups()
-  await ensureActiveTabNodes()
-}</script>
+}
+</script>
 
 <style scoped>
 .home { display: flex; flex-direction: column; height: 100%; background: #f0f2f5; }
@@ -2053,7 +2118,7 @@ async function confirmSingleMove() {
   display: flex;
   align-items: stretch;
   justify-content: space-between;
-  max-width: 1200px;
+  max-width: 1440px;
   margin: 0 auto;
   padding: 0 24px;
   min-height: 46px;
@@ -2244,7 +2309,7 @@ async function confirmSingleMove() {
   flex: 1;
   overflow: hidden;
   padding: 20px 24px;
-  max-width: 1200px;
+  max-width: 1440px;
   width: 100%;
   margin: 0 auto;
   box-sizing: border-box;

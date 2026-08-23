@@ -32,6 +32,9 @@
       <span :class="['tag', `tag-${server.type || 'vmess'}`]">{{ server.type || '?' }}</span>
     </div>
 
+    <!-- 前置代理 -->
+    <div class="row-front-proxy" :title="frontProxyTitle">{{ server.frontProxy || '直连' }}</div>
+
     <!-- IP 类型 -->
     <span :class="['row-iptype', ipTypeClass]" :title="ipTypeTitle">{{ ipTypeText }}</span>
 
@@ -70,8 +73,8 @@
         ✂<span class="row-btn-label">移动</span>
       </button>
       
-      <!-- 编辑按钮（仅手动节点） -->
-      <button v-if="refObj.type === 'server'" class="row-btn" title="编辑" @click="$emit('edit', refObj, server)">
+      <!-- 编辑按钮 -->
+      <button class="row-btn" title="编辑" @click="$emit('edit', refObj, server)">
         ✏<span class="row-btn-label">编辑</span>
       </button>
       
@@ -139,6 +142,12 @@ const connectionButtonTitle = computed(() => {
   if (!connected.value) return '连接此节点'
   const outbound = props.outbounds.find(o => o.name === props.currentOutbound)
   return outbound?.target?.targetType === 'group' ? '当前分组节点' : '断开连接'
+})
+
+const frontProxyTitle = computed(() => {
+  return props.server.frontProxy
+    ? `前置代理：${props.server.frontProxy}`
+    : '未配置前置代理，节点将直连'
 })
 
 function probeValues(mode) {
@@ -303,7 +312,7 @@ const ipGeoTitle = computed(() => {
 }
 
 /* 文字单元格允许划词，方便右键复制节点名/地址 */
-.row-name, .row-addr, .row-geo, .row-type, .row-iptype, .row-ipscore, .row-fast-lat, .row-real-lat {
+.row-name, .row-addr, .row-geo, .row-type, .row-front-proxy, .row-iptype, .row-ipscore, .row-fast-lat, .row-real-lat {
   user-select: text;
   -webkit-user-select: text;
 }
@@ -365,6 +374,16 @@ const ipGeoTitle = computed(() => {
   flex: 0 0 var(--col-type);
   width: var(--col-type);
   overflow: hidden;
+}
+.row-front-proxy {
+  flex: 0 0 var(--col-frontProxy);
+  width: var(--col-frontProxy);
+  min-width: 0;
+  overflow: hidden;
+  color: #595959;
+  font-size: 11px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 .row-groups {
   max-width: 100%;
@@ -574,6 +593,7 @@ const ipGeoTitle = computed(() => {
   }
 
   .row-type,
+  .row-front-proxy,
   .row-iptype,
   .row-ipscore {
     grid-row: 4;
@@ -586,8 +606,9 @@ const ipGeoTitle = computed(() => {
   }
 
   .row-type { grid-column: 1 / 3; }
-  .row-iptype { grid-column: 3; }
-  .row-ipscore { grid-column: 4; }
+  .row-front-proxy { grid-column: 3 / 5; }
+  .row-iptype { grid-column: 1 / 3; grid-row: 5; }
+  .row-ipscore { grid-column: 3 / 5; grid-row: 5; }
 
   .row-ops {
     display: none !important;

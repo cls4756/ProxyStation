@@ -15,7 +15,10 @@
         <div class="form-group">
           <label class="form-label">节点链接</label>
           <textarea class="input" v-model="editLink" rows="4"
+            :disabled="editLoading"
+            :placeholder="editLoading ? '正在加载节点链接…' : '节点链接'"
             style="font-family:monospace; font-size:12px; resize:vertical" />
+          <div v-if="editError" class="form-error">{{ editError }}</div>
         </div>
         <div class="form-group">
           <label class="form-label">前置代理</label>
@@ -30,7 +33,7 @@
       </div>
       <div class="modal-footer">
         <button class="btn btn-light" @click="close">取消</button>
-        <button class="btn btn-primary" @click="saveEdit">保存</button>
+        <button class="btn btn-primary" :disabled="editLoading || !!editError" @click="saveEdit">保存</button>
       </div>
     </div>
   </div>
@@ -98,6 +101,8 @@ const store = useProxyStore()
 const editName = ref('')
 const editLink = ref('')
 const editFrontProxy = ref('')
+const editLoading = ref(false)
+const editError = ref('')
 const shareLink = ref('')
 const qrCanvas = ref(null)
 const copied = ref(false)
@@ -107,10 +112,20 @@ const manualGroups = computed(() => store.groups.filter(g => !g.fromSub))
 
 // 初始化编辑表单
 watch(() => props.mode, async (m) => {
-  if (m === 'edit' && props.server) {
+  if (m === 'edit' && props.server && props.refObj) {
     editName.value = props.server.name || ''
-    editLink.value = props.server.link || ''
     editFrontProxy.value = props.server.frontProxy || ''
+    editLink.value = ''
+    editError.value = ''
+    editLoading.value = true
+    try {
+      const { data } = await api.getServerLink(props.refObj.type, props.refObj.index, props.refObj.sub || 0, true)
+      editLink.value = data.link || ''
+    } catch (error) {
+      editError.value = '节点链接加载失败：' + (error?.response?.data?.error || error?.message || '未知错误')
+    } finally {
+      editLoading.value = false
+    }
   }
   if (m === 'share' && props.refObj) {
     const { data } = await api.getServerLink(props.refObj.type, props.refObj.index, props.refObj.sub || 0)
@@ -136,17 +151,17 @@ function close() {
 }
 
 async function saveEdit() {
-  if (!props.refObj || props.refObj.type !== 'server') return
-  const { data } = await api.editServer(props.refObj.index, {
+  if (!props.refObj) return
+  const { data } = await api.editNode(props.refObj, {
     name: editName.value,
     link: editLink.value,
     frontProxy: editFrontProxy.value,
   })
   // 只更新这个节点的数据，不重新拉取所有内容
   if (data.server) {
-    store.servers[props.refObj.index] = data.server
+    store.patchNode(props.refObj, data.server)
   }
-  emit('updated')
+  emit('updated', props.refObj, data.server)
   close()
 }
 
@@ -172,6 +187,12 @@ async function doCopy() {
   font-size: 11px;
   color: #8c8c8c;
   margin-top: 4px;
+  line-height: 1.5;
+}
+.form-error {
+  margin-top: 4px;
+  color: #ff4d4f;
+  font-size: 11px;
   line-height: 1.5;
 }
 </style>

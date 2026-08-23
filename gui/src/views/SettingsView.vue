@@ -6,6 +6,8 @@
           <span :class="['tab', activeTab === 'kernel' ? 'tab-active' : '']" @click="activeTab = 'kernel'">内核和代理</span>
           <span :class="['tab', activeTab === 'inbounds' ? 'tab-active' : '']" @click="activeTab = 'inbounds'">出入站</span>
           <span :class="['tab', activeTab === 'rules' ? 'tab-active' : '']" @click="activeTab = 'rules'">分流规则</span>
+          <span :class="['tab', activeTab === 'subscription-copy' ? 'tab-active' : '']" @click="activeTab = 'subscription-copy'">节点复制</span>
+          <span :class="['tab', activeTab === 'node-cleanup' ? 'tab-active' : '']" @click="activeTab = 'node-cleanup'">失效节点清理</span>
           <span :class="['tab', activeTab === 'other' ? 'tab-active' : '']" @click="activeTab = 'other'">其他设置</span>
         </div>
       </div>
@@ -181,8 +183,14 @@
           <label class="field-label"></label>
           <div class="field-tip">订阅更新后自动测速使用的方式。出站分组的周期测速在绑定分组时单独设置，手动点击检测按钮不受影响。</div>
         </div>
+      </div>
+
+      <div class="settings-block" v-if="activeTab === 'subscription-copy'">
+        <div class="block-header">
+          <span class="block-title">节点复制规则</span>
+        </div>
         <div class="field-row field-row-tip">
-          <label class="field-label">节点复制规则</label>
+          <label class="field-label"></label>
           <div class="copy-rules-wrap">
             <div class="field-tip">订阅分组自动更新并完成测速后，按规则向指定本地分组复制节点。目标分组已存在该节点时会跳过。</div>
             <div v-for="(rule, ri) in form.subscriptionBestNodeCopyRules" :key="ri" class="copy-rule-card">
@@ -230,6 +238,53 @@
               <button class="action-btn action-btn-danger" @click="removeCopyRule(ri)">删除</button>
             </div>
             <button class="action-btn action-btn-add" @click="addCopyRule">+ 添加规则</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="settings-block" v-if="activeTab === 'node-cleanup'">
+        <div class="block-header">
+          <span class="block-title">定期清理失效节点</span>
+        </div>
+        <div class="field-row field-row-tip">
+          <label class="field-label"></label>
+          <div class="copy-rules-wrap">
+            <div class="field-tip">每条规则可选择多个来源分组，使用独立的失效判定、运行周期和回收分组。未选择来源分组的规则不会运行。</div>
+            <div v-for="(rule, ri) in form.nodeCleanupRules" :key="ri" class="copy-rule-card">
+              <div class="copy-rule-content">
+                <div class="copy-rule-row">
+                  <label class="copy-section-label">来源分组</label>
+                  <div class="cleanup-groups">
+                    <label v-for="g in groups" :key="g.id" class="cleanup-group-item">
+                      <input type="checkbox" :value="g.id" v-model="rule.groupIds" />
+                      <span>{{ g.name }}</span>
+                    </label>
+                    <span v-if="groups.length === 0" class="empty-text">暂无分组</span>
+                  </div>
+                </div>
+                <div class="copy-rule-row">
+                  <label class="copy-section-label">失效判定</label>
+                  <select class="input field-input" v-model="rule.mode">
+                    <option value="real">快速成功但真连接失败才清理</option>
+                    <option value="fast">快速连接失败就清理</option>
+                  </select>
+                </div>
+                <div class="copy-rule-row">
+                  <label class="copy-section-label">运行周期</label>
+                  <input type="number" class="input field-input" v-model.number="rule.intervalHour" min="1" />
+                  <span class="field-inline-suffix">小时</span>
+                </div>
+                <div class="copy-rule-row">
+                  <label class="copy-section-label">失效节点处理</label>
+                  <select class="input field-input" v-model="rule.recycleGroupId">
+                    <option value="">直接删除（仅从原分组移除）</option>
+                    <option v-for="g in groups.filter(g => !rule.groupIds.includes(g.id))" :key="g.id" :value="g.id">移到：{{ g.name }}</option>
+                  </select>
+                </div>
+              </div>
+              <button class="action-btn action-btn-danger" @click="removeCleanupRule(ri)">删除</button>
+            </div>
+            <button class="action-btn action-btn-add" @click="addCleanupRule">+ 添加规则</button>
           </div>
         </div>
       </div>
@@ -403,6 +458,7 @@ const form = reactive({
   groupProbeMode: 'real',
   groupSwitchThresholdMs: 100,
   groupSwitchCooldownSec: 600,
+  nodeCleanupRules: [],
   ipScoreEnabled: false,
   ipScoreProvider: 'cleanip',
   // 自定义地址单独存一份，切到 cleanip 再切回来时不会丢
@@ -455,6 +511,7 @@ async function loadSetting() {
       groupProbeMode: s.groupProbeMode || 'real',
       groupSwitchThresholdMs: typeof s.groupSwitchThresholdMs === 'number' ? s.groupSwitchThresholdMs : 100,
       groupSwitchCooldownSec: typeof s.groupSwitchCooldownSec === 'number' ? s.groupSwitchCooldownSec : 600,
+      nodeCleanupRules: normalizeCleanupRules(s),
       ipScoreEnabled: !!s.ipScoreEnabled,
       ipScoreProvider: s.ipScoreProvider || 'cleanip',
       ipScoreCustomEndpoint: s.ipScoreEndpoint || '',
@@ -503,6 +560,45 @@ function sanitizeCopyRules(rules) {
       targetGroupIds: rule.targetGroupIds.filter(id => !rule.sourceGroupIds.includes(id)),
     }))
     .filter(rule => rule.sourceGroupIds.length > 0 && rule.targetGroupIds.length > 0)
+}
+
+function normalizeCleanupRules(setting) {
+  if (Array.isArray(setting?.nodeCleanupRules) && setting.nodeCleanupRules.length > 0) {
+    return setting.nodeCleanupRules.map(rule => ({
+      groupIds: Array.isArray(rule?.groupIds) ? [...new Set(rule.groupIds.filter(Boolean))] : [],
+      mode: rule?.mode === 'fast' ? 'fast' : 'real',
+      intervalHour: Number(rule?.intervalHour) > 0 ? Number(rule.intervalHour) : 24,
+      recycleGroupId: rule?.recycleGroupId || '',
+    }))
+  }
+  if (Array.isArray(setting?.nodeCleanupGroupIds) && setting.nodeCleanupGroupIds.length > 0) {
+    return [{
+      groupIds: [...new Set(setting.nodeCleanupGroupIds.filter(Boolean))],
+      mode: setting.nodeCleanupMode === 'fast' ? 'fast' : 'real',
+      intervalHour: Number(setting.nodeCleanupIntervalHour) > 0 ? Number(setting.nodeCleanupIntervalHour) : 24,
+      recycleGroupId: setting.nodeCleanupRecycleGroupId || '',
+    }]
+  }
+  return []
+}
+
+function sanitizeCleanupRules(rules) {
+  return rules
+    .map(rule => ({
+      groupIds: [...new Set((rule.groupIds || []).filter(Boolean))],
+      mode: rule.mode === 'fast' ? 'fast' : 'real',
+      intervalHour: Number(rule.intervalHour) > 0 ? Number(rule.intervalHour) : 24,
+      recycleGroupId: (rule.recycleGroupId && !(rule.groupIds || []).includes(rule.recycleGroupId)) ? rule.recycleGroupId : '',
+    }))
+    .filter(rule => rule.groupIds.length > 0)
+}
+
+function addCleanupRule() {
+  form.nodeCleanupRules.push({ groupIds: [], mode: 'real', intervalHour: 24, recycleGroupId: '' })
+}
+
+function removeCleanupRule(index) {
+  form.nodeCleanupRules.splice(index, 1)
 }
 
 function addCopyRule() {
@@ -590,6 +686,7 @@ async function saveSettings() {
   saving.value = true
   saveMsg.value = null
   const copyRules = sanitizeCopyRules(form.subscriptionBestNodeCopyRules)
+  const cleanupRules = sanitizeCleanupRules(form.nodeCleanupRules)
   try {
     const { data } = await api.setSetting({
       ...fullSetting,
@@ -608,6 +705,7 @@ async function saveSettings() {
       groupProbeMode: form.groupProbeMode,
       groupSwitchThresholdMs: form.groupSwitchThresholdMs,
       groupSwitchCooldownSec: form.groupSwitchCooldownSec,
+      nodeCleanupRules: cleanupRules,
       ipScoreEnabled: form.ipScoreEnabled,
       ipScoreProvider: form.ipScoreProvider,
       ipScoreEndpoint: ipScoreEndpointToSave(),
@@ -635,6 +733,7 @@ async function saveSettings() {
       groupProbeMode: form.groupProbeMode,
       groupSwitchThresholdMs: form.groupSwitchThresholdMs,
       groupSwitchCooldownSec: form.groupSwitchCooldownSec,
+      nodeCleanupRules: cleanupRules,
       ipScoreEnabled: form.ipScoreEnabled,
       ipScoreProvider: form.ipScoreProvider,
       ipScoreEndpoint: ipScoreEndpointToSave(),
@@ -644,6 +743,7 @@ async function saveSettings() {
       githubMirror: form.githubMirror,
     }
     form.subscriptionBestNodeCopyRules = normalizeCopyRules(copyRules)
+    form.nodeCleanupRules = normalizeCleanupRules({ nodeCleanupRules: cleanupRules })
     if (data?.warning) {
       saveMsg.value = { error: true, text: data.warning }
     } else {
@@ -834,6 +934,25 @@ async function saveSettings() {
   gap: 8px;
   flex: 1;
   min-width: 0;
+}
+.cleanup-groups {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+}
+.cleanup-group-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 8px;
+  border: 1px solid #e8e8e8;
+  border-radius: 999px;
+  background: #fff;
+  font-size: 12px;
+  color: #595959;
+  cursor: pointer;
 }
 .copy-source-item,
 .copy-target-item {

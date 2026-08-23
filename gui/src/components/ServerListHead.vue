@@ -105,6 +105,7 @@ onBeforeUnmount(stopResize)
 .head-col-addr { flex: 0 0 var(--col-addr); width: var(--col-addr); }
 .head-col-geo { flex: 0 0 var(--col-geo); width: var(--col-geo); }
 .head-col-type { flex: 0 0 var(--col-type); width: var(--col-type); }
+.head-col-frontProxy { flex: 0 0 var(--col-frontProxy); width: var(--col-frontProxy); }
 .head-col-iptype {
   flex: 0 0 var(--col-iptype);
   width: var(--col-iptype);

@@ -43,7 +43,10 @@ export const api = {
   importServers: (links, groupId) => http.post('/servers', { links, groupId }),
   deleteServers: (indexes) => http.delete('/servers', { data: { indexes } }),
   editServer: (index, data) => http.put(`/servers/${index}`, data),
-  getServerLink: (type, index, sub = 0) => http.get('/server/link', { params: { type, index, sub } }),
+  editNode: (ref, data) => http.put('/server', { ref, ...data }),
+  getServerLink: (type, index, sub = 0, raw = false) => http.get('/server/link', {
+    params: { type, index, sub, ...(raw ? { raw: 1 } : {}) },
+  }),
   copyServerToGroup: (ref, groupId, clone = true) => http.post('/server/copy-to-group', { ref, groupId, clone }),
   batchCopyServersToGroup: (refs, groupId, clone = true) => http.post('/servers/batch-copy-to-group', { refs, groupId, clone }),
   batchMoveServersToGroup: (refs, sourceGroupId, targetGroupId) => http.post('/servers/batch-move-to-group', { refs, sourceGroupId, targetGroupId }),

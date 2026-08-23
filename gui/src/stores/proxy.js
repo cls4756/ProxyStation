@@ -244,6 +244,14 @@ export const useProxyStore = defineStore('proxy', () => {
     groups.value = next
   }
 
+  function patchGroupCount(groupId, serverCount) {
+    const index = groups.value.findIndex(item => item.id === groupId)
+    if (index < 0) return
+    const next = [...groups.value]
+    next[index] = { ...next[index], serverCount: Number(serverCount || 0) }
+    groups.value = next
+  }
+
   async function fetchCustomInbounds() {
     const { data } = await api.getCustomInbounds()
     customInbounds.value = data.inbounds || []
@@ -302,6 +310,7 @@ export const useProxyStore = defineStore('proxy', () => {
     fetchGroups,
     fetchGroupServers,
     patchGroup,
+    patchGroupCount,
     fetchOutbounds,
     fetchCustomInbounds,
     fetchAll, 

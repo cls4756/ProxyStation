@@ -24,6 +24,7 @@ service/cf-proxy-src/cf-proxy-poc/*.exe
 
 # Runtime data / secrets
 data/
+memory/
 service/data/
 service/*.db
 service/*.db-*

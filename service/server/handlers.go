@@ -962,54 +962,109 @@ func importCfGoodNetCAToSystem(c *gin.Context) {
 	})
 }
 
-// editServer 修改手动节点的名称或链接
+type editNodeRequest struct {
+	Ref        configure.NodeRef `json:"ref"`
+	Name       string            `json:"name"`
+	Link       string            `json:"link"`
+	FrontProxy *string           `json:"frontProxy"`
+}
+
+func applyNodeEdit(server *configure.ServerRaw, req editNodeRequest) error {
+	if req.Name != "" {
+		server.Name = req.Name
+	}
+	if req.FrontProxy != nil {
+		frontProxy := strings.TrimSpace(*req.FrontProxy)
+		if frontProxy != "" && configure.GetOutbound(frontProxy) == nil {
+			return fmt.Errorf("前置代理出站 %s 不存在", frontProxy)
+		}
+		server.FrontProxy = frontProxy
+	}
+	if req.Link != "" {
+		server.Link = req.Link
+		parsed, _, err := subscription.Parse([]byte(req.Link), configure.FormatV2ray)
+		if err == nil && len(parsed) > 0 {
+			server.Host = parsed[0].Host
+			server.Port = parsed[0].Port
+			server.Type = parsed[0].Type
+		}
+	}
+	return nil
+}
+
+func saveNodeEdit(ref configure.NodeRef, req editNodeRequest) (*configure.ServerRaw, error) {
+	switch ref.Type {
+	case "server":
+		server := configure.GetServer(ref.Index)
+		if server == nil {
+			return nil, nil
+		}
+		if err := applyNodeEdit(server, req); err != nil {
+			return nil, err
+		}
+		if err := configure.SetServer(ref.Index, server); err != nil {
+			return nil, err
+		}
+		return server, nil
+	case "sub_server":
+		sub := configure.GetSubscription(ref.Sub)
+		if sub == nil || ref.Index < 0 || ref.Index >= len(sub.Servers) {
+			return nil, nil
+		}
+		if err := applyNodeEdit(&sub.Servers[ref.Index], req); err != nil {
+			return nil, err
+		}
+		if err := configure.SetSubscription(ref.Sub, sub); err != nil {
+			return nil, err
+		}
+		server := sub.Servers[ref.Index]
+		return &server, nil
+	default:
+		return nil, fmt.Errorf("unsupported node type %q", ref.Type)
+	}
+}
+
+func editNode(c *gin.Context) {
+	var req editNodeRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	server, err := saveNodeEdit(req.Ref, req)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if server == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "server not found"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ref": req.Ref, "server": newServerListItem(*server)})
+}
+
+// editServer 保留旧接口，统一复用按引用编辑逻辑。
 func editServer(c *gin.Context) {
 	index, err := strconv.Atoi(c.Param("index"))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid index"})
 		return
 	}
-	var req struct {
-		Name string `json:"name"`
-		Link string `json:"link"`
-		// 指针类型：区分「未传」与「显式清空」
-		FrontProxy *string `json:"frontProxy"`
-	}
+	var req editNodeRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	s := configure.GetServer(index)
-	if s == nil {
+	req.Ref = configure.NodeRef{Type: "server", Index: index}
+	server, err := saveNodeEdit(req.Ref, req)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if server == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "server not found"})
 		return
 	}
-	if req.Name != "" {
-		s.Name = req.Name
-	}
-	if req.FrontProxy != nil {
-		fp := strings.TrimSpace(*req.FrontProxy)
-		if fp != "" && configure.GetOutbound(fp) == nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("前置代理出站 %s 不存在", fp)})
-			return
-		}
-		s.FrontProxy = fp
-	}
-	if req.Link != "" {
-		s.Link = req.Link
-		// 重新解析 host/port/type
-		servers, _, err := subscription.Parse([]byte(req.Link), configure.FormatV2ray)
-		if err == nil && len(servers) > 0 {
-			s.Host = servers[0].Host
-			s.Port = servers[0].Port
-			s.Type = servers[0].Type
-		}
-	}
-	if err := configure.SetServer(index, s); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"server": s})
+	c.JSON(http.StatusOK, gin.H{"server": server})
 }
 
 // getServerLink 获取节点的标准分享链接（用于生成二维码）
@@ -1037,12 +1092,14 @@ func getServerLink(c *gin.Context) {
 	}
 
 	link := s.Link
-	// clash:// 是内部存储格式，需要还原为标准分享链接
-	if strings.HasPrefix(link, "clash://") {
-		link = clashLinkToShareURI(s)
-	} else if strings.HasPrefix(link, "singbox://") {
-		// singbox:// 格式同样需要还原
-		link = singboxLinkToShareURI(s)
+	if c.Query("raw") != "1" {
+		// clash:// 是内部存储格式，需要还原为标准分享链接
+		if strings.HasPrefix(link, "clash://") {
+			link = clashLinkToShareURI(s)
+		} else if strings.HasPrefix(link, "singbox://") {
+			// singbox:// 格式同样需要还原
+			link = singboxLinkToShareURI(s)
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{"link": link, "name": s.Name, "type": s.Type})
@@ -1439,7 +1496,7 @@ func copyServerToGroup(c *gin.Context) {
 		}
 		// 检查目标分组内是否已有配置相同的节点（不比较名称）
 		if groupHasServerRaw(group.Servers, *server) {
-			c.JSON(http.StatusOK, gin.H{"ok": true, "skipped": true})
+			c.JSON(http.StatusOK, gin.H{"ok": true, "skipped": true, "groupId": group.ID, "groupServerCount": len(group.Servers)})
 			return
 		}
 		// 每次都创建新的独立副本，不复用已有节点
@@ -1455,7 +1512,7 @@ func copyServerToGroup(c *gin.Context) {
 		return
 	}
 	enrichMissingNodeMetadataAsync([]configure.NodeRef{{Type: ref.Type, Index: ref.Index, Sub: ref.Sub}})
-	c.JSON(http.StatusOK, gin.H{"ok": true})
+	c.JSON(http.StatusOK, gin.H{"ok": true, "groupId": group.ID, "groupServerCount": len(configure.GetGroup(groupIndex).Servers)})
 }
 
 func batchCopyServersToGroup(c *gin.Context) {
@@ -1511,7 +1568,7 @@ func batchCopyServersToGroup(c *gin.Context) {
 		nodeRefs = append(nodeRefs, configure.NodeRef{Type: ref.Type, Index: ref.Index, Sub: ref.Sub})
 	}
 	enrichMissingNodeMetadataAsync(nodeRefs)
-	c.JSON(http.StatusOK, gin.H{"ok": true, "group": configure.GetGroup(groupIndex)})
+	c.JSON(http.StatusOK, gin.H{"ok": true, "groupId": group.ID, "groupServerCount": len(configure.GetGroup(groupIndex).Servers)})
 }
 
 func batchMoveServersToGroup(c *gin.Context) {
@@ -1531,7 +1588,8 @@ func batchMoveServersToGroup(c *gin.Context) {
 		return
 	}
 	if sourceGroup.ID == targetGroup.ID {
-		c.JSON(http.StatusOK, gin.H{"ok": true, "sourceGroup": sourceGroup, "targetGroup": targetGroup})
+		c.JSON(http.StatusOK, gin.H{"ok": true, "sourceGroupId": sourceGroup.ID, "targetGroupId": targetGroup.ID,
+			"sourceServerCount": len(sourceGroup.Servers), "targetServerCount": len(targetGroup.Servers)})
 		return
 	}
 	if err := configure.AddServersToGroup(targetIndex, req.Refs); err != nil {
@@ -1543,9 +1601,11 @@ func batchMoveServersToGroup(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
-		"ok":          true,
-		"sourceGroup": configure.GetGroup(sourceIndex),
-		"targetGroup": configure.GetGroup(targetIndex),
+		"ok":                true,
+		"sourceGroupId":     sourceGroup.ID,
+		"targetGroupId":     targetGroup.ID,
+		"sourceServerCount": len(configure.GetGroup(sourceIndex).Servers),
+		"targetServerCount": len(configure.GetGroup(targetIndex).Servers),
 	})
 }
 
@@ -2602,7 +2662,7 @@ func pingNodes(c *gin.Context) {
 		}
 	}
 
-	observatory.ProbeNodesWithProgressOptions(req.Refs, mode, observatory.ProbeOptions{
+	observatory.ProbeNodesWithProgressFast(req.Refs, mode, observatory.ProbeOptions{
 		EnableTransProxyFallback: req.EnableTransProxyFallback && strictProbeMode,
 	},
 		func(i int, ref configure.NodeRef) {
@@ -2610,6 +2670,12 @@ func pingNodes(c *gin.Context) {
 				return
 			}
 			send("running", result{Ref: ref, Latency: 0})
+		},
+		func(i int, ref configure.NodeRef, latency int) {
+			if ctx.Err() != nil {
+				return
+			}
+			send("fast", result{Ref: ref, Latency: latency})
 		},
 		func(i int, ref configure.NodeRef, latency int) {
 			if ctx.Err() != nil {
@@ -2680,7 +2746,7 @@ func pingGroup(c *gin.Context) {
 		refs[i] = configure.NodeRef{Type: ref.Type, Index: ref.Index, Sub: ref.Sub}
 	}
 
-	observatory.ProbeNodesWithProgressOptions(refs, mode, observatory.ProbeOptions{
+	observatory.ProbeNodesWithProgressFast(refs, mode, observatory.ProbeOptions{
 		EnableTransProxyFallback: enableTransProxyFallback,
 	},
 		func(i int, _ configure.NodeRef) {
@@ -2688,6 +2754,12 @@ func pingGroup(c *gin.Context) {
 				return
 			}
 			send("running", result{Ref: serverRefs[i], Latency: 0})
+		},
+		func(i int, _ configure.NodeRef, latency int) {
+			if ctx.Err() != nil {
+				return
+			}
+			send("fast", result{Ref: serverRefs[i], Latency: latency})
 		},
 		func(i int, _ configure.NodeRef, latency int) {
 			if ctx.Err() != nil {
@@ -2958,6 +3030,48 @@ func setSetting(c *gin.Context) {
 	}
 	if s.GroupSwitchCooldownSec < 0 {
 		s.GroupSwitchCooldownSec = 600
+	}
+	validGroups := make(map[string]struct{})
+	for _, group := range configure.GetGroups() {
+		validGroups[group.ID] = struct{}{}
+	}
+	for i := range s.NodeCleanupRules {
+		rule := &s.NodeCleanupRules[i]
+		switch rule.Mode {
+		case "", "real":
+			rule.Mode = "real"
+		case "fast":
+		default:
+			c.JSON(http.StatusBadRequest, gin.H{"error": "node cleanup mode 非法"})
+			return
+		}
+		if rule.IntervalHour <= 0 {
+			rule.IntervalHour = 24
+		}
+		selected := make([]string, 0, len(rule.GroupIDs))
+		seen := make(map[string]struct{}, len(rule.GroupIDs))
+		for _, id := range rule.GroupIDs {
+			if _, ok := validGroups[id]; !ok {
+				continue
+			}
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			selected = append(selected, id)
+		}
+		rule.GroupIDs = selected
+		if rule.RecycleGroupID != "" {
+			if _, ok := validGroups[rule.RecycleGroupID]; !ok {
+				rule.RecycleGroupID = ""
+			}
+		}
+		for _, id := range rule.GroupIDs {
+			if id == rule.RecycleGroupID {
+				rule.RecycleGroupID = ""
+				break
+			}
+		}
 	}
 	for i := range s.SubscriptionBestNodeCopyRules {
 		r := &s.SubscriptionBestNodeCopyRules[i]

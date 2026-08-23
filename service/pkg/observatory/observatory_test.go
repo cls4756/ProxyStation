@@ -90,6 +90,41 @@ func TestServerRawByRefInheritsSubscriptionProxyOutbound(t *testing.T) {
 	}
 }
 
+func TestTransProxyFallbackHelpersAvoidSelfReferenceAndPersist(t *testing.T) {
+	setupTestDB(t)
+	if err := configure.SetServers([]configure.ServerRaw{
+		{Name: "trans", Host: "trans.example.com", Port: 443},
+		{Name: "target", Host: "target.example.com", Port: 443},
+	}); err != nil {
+		t.Fatalf("SetServers: %v", err)
+	}
+	if err := configure.SetOutbound("trans-proxy", &configure.Outbound{
+		Name: "trans-proxy", Target: configure.OutboundTarget{
+			TargetType: "node", NodeRef: &configure.NodeRef{Type: "server", Index: 0},
+		},
+	}); err != nil {
+		t.Fatalf("SetOutbound: %v", err)
+	}
+
+	if !outboundUsesNode("trans-proxy", configure.NodeRef{Type: "server", Index: 0}) {
+		t.Fatal("trans-proxy 应识别为目标节点自身")
+	}
+	if canUseTransProxy(configure.NodeRef{Type: "server", Index: 0}) {
+		t.Fatal("不能把 trans-proxy 自身作为自己的前置代理")
+	}
+	if !canUseTransProxy(configure.NodeRef{Type: "server", Index: 1}) {
+		t.Fatal("其他节点应允许使用 trans-proxy")
+	}
+
+	if !saveTransProxyFrontProxy(configure.NodeRef{Type: "server", Index: 1}) {
+		t.Fatal("保存 trans-proxy 前置代理失败")
+	}
+	target := configure.GetServer(1)
+	if target == nil || target.FrontProxy != "trans-proxy" {
+		t.Fatalf("节点前置代理未保存: %+v", target)
+	}
+}
+
 // 稳定优先的唯一卖点：当前节点还连得上就不动，哪怕它比最优节点慢一个数量级。
 // 这条语义必须在阈值判断之前���效，否则和最低延迟策略没有区别。
 func TestShouldSwitchStableKeepsCurrentWhenAlive(t *testing.T) {
@@ -198,5 +233,28 @@ func TestResolveTaskIntervalClampsTooSmall(t *testing.T) {
 
 	if got := resolveTaskInterval("1s"); got != minProbeInterval {
 		t.Fatalf("过小的间隔应被钳到 %v，got %v", minProbeInterval, got)
+	}
+}
+
+func TestCleanupProbeInvalidRules(t *testing.T) {
+	tests := []struct {
+		name        string
+		mode        string
+		fastLatency int
+		realLatency int
+		want        bool
+	}{
+		{name: "快速失败规则会清理", mode: "fast", fastLatency: -1, want: true},
+		{name: "快速成功规则会保留", mode: "fast", fastLatency: 20, want: false},
+		{name: "真连规则仅清理快速成功真连失败", mode: "real", fastLatency: 20, realLatency: -1, want: true},
+		{name: "真连规则保留快速失败", mode: "real", fastLatency: -1, realLatency: -1, want: false},
+		{name: "真连规则保留完整成功", mode: "real", fastLatency: 20, realLatency: 80, want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := cleanupProbeInvalid(test.mode, test.fastLatency, test.realLatency); got != test.want {
+				t.Fatalf("cleanupProbeInvalid(%q, %d, %d) = %v, want %v", test.mode, test.fastLatency, test.realLatency, got, test.want)
+			}
+		})
 	}
 }

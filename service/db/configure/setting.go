@@ -20,9 +20,9 @@ type Setting struct {
 	EnableSniff bool `json:"enableSniff"`
 	// 内置 socks/http 入站各自的嗅探开关。指针用于区分"从未设置"（需从 EnableSniff 迁移）
 	// 和"显式关闭"，否则老用户开着的嗅探会在升级后被静默关掉。
-	Socks5SniffEnabled *bool `json:"socks5SniffEnabled,omitempty"`
-	HttpSniffEnabled   *bool `json:"httpSniffEnabled,omitempty"`
-	EnableHijackDNS    bool  `json:"enableHijackDNS"`
+	Socks5SniffEnabled                 *bool  `json:"socks5SniffEnabled,omitempty"`
+	HttpSniffEnabled                   *bool  `json:"httpSniffEnabled,omitempty"`
+	EnableHijackDNS                    bool   `json:"enableHijackDNS"`
 	DNSMode                            string `json:"dnsMode"`
 	SubscriptionAutoUpdateMode         string `json:"subscriptionAutoUpdateMode"`
 	SubscriptionAutoUpdateIntervalHour int    `json:"subscriptionAutoUpdateIntervalHour"`
@@ -48,6 +48,13 @@ type Setting struct {
 	GroupSwitchThresholdMs int `json:"groupSwitchThresholdMs,omitempty"`
 	// 分组出站切换冷却时间（秒），冷却期内不重复切换
 	GroupSwitchCooldownSec int `json:"groupSwitchCooldownSec,omitempty"`
+	// 定期清理失效节点规则。每条规则可选择多个来源分组。
+	NodeCleanupRules []NodeCleanupRule `json:"nodeCleanupRules,omitempty"`
+	// 旧版单规则字段，保留用于升级迁移。
+	NodeCleanupMode           string   `json:"nodeCleanupMode,omitempty"`
+	NodeCleanupIntervalHour   int      `json:"nodeCleanupIntervalHour,omitempty"`
+	NodeCleanupGroupIDs       []string `json:"nodeCleanupGroupIds,omitempty"`
+	NodeCleanupRecycleGroupID string   `json:"nodeCleanupRecycleGroupId,omitempty"`
 	// 订阅分组更新测速后，向指定本地分组复制节点的规则
 	SubscriptionBestNodeCopyRules []SubscriptionNodeCopyRule `json:"subscriptionBestNodeCopyRules,omitempty"`
 	// IP 纯净度评分。默认关闭：评分要把节点地址发给第三方服务，且这些服务都没有
@@ -87,6 +94,13 @@ type SubscriptionNodeCopyRule struct {
 	// 旧版本只支持单个来源分组。这是已落库的用户配置，直接删字段会导致规则丢失，
 	// 因此保留用于读取，GetSettingNotNil 会折叠进 SourceGroupIDs 后清空。
 	LegacySourceGroupID string `json:"sourceGroupId,omitempty"`
+}
+
+type NodeCleanupRule struct {
+	GroupIDs       []string `json:"groupIds"`
+	Mode           string   `json:"mode"` // fast | real
+	IntervalHour   int      `json:"intervalHour"`
+	RecycleGroupID string   `json:"recycleGroupId,omitempty"`
 }
 
 // CopyCount 本规则应复制的节点数，0 表示不限（全部连通）
@@ -130,6 +144,8 @@ func NewSetting() *Setting {
 		GroupProbeMode:                     "real",
 		GroupSwitchThresholdMs:             100,
 		GroupSwitchCooldownSec:             600,
+		NodeCleanupMode:                    "real",
+		NodeCleanupIntervalHour:            24,
 		IPScoreEnabled:                     false,
 		IPScoreProvider:                    "cleanip",
 		IPScoreMinIntervalMs:               1500,
@@ -194,6 +210,17 @@ func GetSettingNotNil() *Setting {
 		s.GroupSwitchCooldownSec = 600
 		changed = true
 	}
+	if s.NodeCleanupMode != "fast" && s.NodeCleanupMode != "real" {
+		s.NodeCleanupMode = "real"
+		changed = true
+	}
+	if s.NodeCleanupIntervalHour <= 0 {
+		s.NodeCleanupIntervalHour = 24
+		changed = true
+	}
+	if migrateNodeCleanupRules(s) {
+		changed = true
+	}
 	if s.IPScoreProvider != "cleanip" && s.IPScoreProvider != "custom" {
 		s.IPScoreProvider = "cleanip"
 		changed = true
@@ -221,6 +248,19 @@ func GetSettingNotNil() *Setting {
 		_ = db.Set("system", "setting", s)
 	}
 	return s
+}
+
+func migrateNodeCleanupRules(s *Setting) bool {
+	if len(s.NodeCleanupRules) > 0 || len(s.NodeCleanupGroupIDs) == 0 {
+		return false
+	}
+	s.NodeCleanupRules = []NodeCleanupRule{{
+		GroupIDs:       append([]string(nil), s.NodeCleanupGroupIDs...),
+		Mode:           s.NodeCleanupMode,
+		IntervalHour:   s.NodeCleanupIntervalHour,
+		RecycleGroupID: s.NodeCleanupRecycleGroupID,
+	}}
+	return true
 }
 
 // migrateNodeCopyRules 把旧版单来源分组字段折叠进 SourceGroupIDs，返回是否有改动

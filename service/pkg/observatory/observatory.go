@@ -23,6 +23,7 @@ import (
 const (
 	defaultProbeIntervalSec = 300
 	defaultSwitchThreshold  = 100
+	transProxyFallbackName  = "trans-proxy"
 	// minProbeInterval 测速任务的最小间隔，与界面上的提示保持一致
 	minProbeInterval = 10 * time.Second
 )
@@ -260,7 +261,7 @@ func resolveProbeConcurrencyForMode(mode string) int {
 // probeNodesConcurrent 并发测速一组节点，保持返回结果与输入顺序一致。
 // 每个 worker 独立处理一个节点：fast 模式走 TCP 拨测，real 模式起独立探测内核。
 func probeNodesConcurrent(refs []configure.NodeRef) []probeResult {
-	return probeNodesWithProgress(refs, "", nil, nil)
+	return probeNodesWithProgress(refs, "", ProbeOptions{}, nil, nil, nil)
 }
 
 // ProbeProgressStart 在某个节点开始测速时回调，i 为其在 refs 中的索引。
@@ -269,16 +270,62 @@ type ProbeProgressStart func(i int, ref configure.NodeRef)
 // ProbeProgressDone 在某个节点测速完成时回调，latency 为结果（-1 表示失败）。
 type ProbeProgressDone func(i int, ref configure.NodeRef, latency int)
 
+type ProbeProgressFast func(i int, ref configure.NodeRef, latency int)
+
+type ProbeOptions struct {
+	EnableTransProxyFallback bool
+}
+
 // ProbeNodesWithProgress 与 probeNodesConcurrent 相同的并发调度，额外在每个节点
 // 开始/完成时触发回调，供 HTTP 层推送 SSE 进度。mode 显式指定 fast/real（为空回退
 // 全局设置），并发上限由 resolveProbeConcurrencyForMode(mode) 控制，与定时任务、
 // 出站探测共用同一节流设置。onStart/onDone 可能被多个 worker 并发调用，调用方需
 // 自行保证回调内的并发安全。
 func ProbeNodesWithProgress(refs []configure.NodeRef, mode string, onStart ProbeProgressStart, onDone ProbeProgressDone) []probeResult {
-	return probeNodesWithProgress(refs, mode, onStart, onDone)
+	return probeNodesWithProgress(refs, mode, ProbeOptions{}, onStart, onDone, nil)
 }
 
-func probeNodesWithProgress(refs []configure.NodeRef, mode string, onStart ProbeProgressStart, onDone ProbeProgressDone) []probeResult {
+func ProbeNodesWithProgressOptions(refs []configure.NodeRef, mode string, options ProbeOptions, onStart ProbeProgressStart, onDone ProbeProgressDone) []probeResult {
+	return probeNodesWithProgress(refs, mode, options, onStart, onDone, nil)
+}
+
+func ProbeNodesWithProgressFast(refs []configure.NodeRef, mode string, options ProbeOptions, onStart ProbeProgressStart, onFast ProbeProgressFast, onDone ProbeProgressDone) []probeResult {
+	return probeNodesWithProgress(refs, mode, options, onStart, onDone, onFast)
+}
+
+// ProbeInvalidNodes applies the cleanup rule in the same order as refs.
+// fast: fast connection failure is invalid.
+// real: only fast success followed by real connection failure is invalid.
+func ProbeInvalidNodes(refs []configure.NodeRef, mode string) []bool {
+	invalid := make([]bool, len(refs))
+	if mode == "fast" {
+		results := probeNodesWithProgress(refs, "fast", ProbeOptions{}, nil, nil, nil)
+		for i, result := range results {
+			invalid[i] = cleanupProbeInvalid(mode, result.latency, 0)
+		}
+		return invalid
+	}
+	fastLatencies := make([]int, len(refs))
+	realLatencies := make([]int, len(refs))
+	probeNodesWithProgress(refs, "real", ProbeOptions{}, nil, func(i int, _ configure.NodeRef, latency int) {
+		realLatencies[i] = latency
+	}, func(i int, _ configure.NodeRef, latency int) {
+		fastLatencies[i] = latency
+	})
+	for i := range refs {
+		invalid[i] = cleanupProbeInvalid(mode, fastLatencies[i], realLatencies[i])
+	}
+	return invalid
+}
+
+func cleanupProbeInvalid(mode string, fastLatency, realLatency int) bool {
+	if mode == "fast" {
+		return fastLatency <= 0
+	}
+	return fastLatency > 0 && realLatency <= 0
+}
+
+func probeNodesWithProgress(refs []configure.NodeRef, mode string, options ProbeOptions, onStart ProbeProgressStart, onDone ProbeProgressDone, onFast ProbeProgressFast) []probeResult {
 	results := make([]probeResult, len(refs))
 	if len(refs) == 0 {
 		return results
@@ -302,7 +349,14 @@ func probeNodesWithProgress(refs []configure.NodeRef, mode string, onStart Probe
 				if onStart != nil {
 					onStart(i, refs[i])
 				}
-				latency := probeNodeByMode(refs[i], mode)
+				latency := probeNodeByModeWithFast(refs[i], mode, options, func(value int) {
+					if mode == "real" {
+						saveLatency(refs[i], "fast", value)
+					}
+					if onFast != nil && mode == "real" {
+						onFast(i, refs[i], value)
+					}
+				})
 				results[i] = probeResult{ref: refs[i], latency: latency}
 				saveLatency(refs[i], mode, latency)
 				if onDone != nil {
@@ -313,6 +367,16 @@ func probeNodesWithProgress(refs []configure.NodeRef, mode string, onStart Probe
 	}
 	wg.Wait()
 	return results
+}
+
+func probeNodeByModeWithFast(ref configure.NodeRef, mode string, options ProbeOptions, onFast func(int)) int {
+	if mode == "" {
+		mode = configure.GetSettingNotNil().GroupProbeMode
+	}
+	if mode == "fast" {
+		return probeNodeFast(ref)
+	}
+	return probeNodeViaCoreWithFast(ref, options, onFast)
 }
 
 // probeAndUpdate 对出站绑定 Group 的所有节点测速，按阈值更新最优节点
@@ -332,7 +396,7 @@ func probeAndUpdate(outboundName string) {
 		refs = append(refs, configure.NodeRef{Type: ref.Type, Index: ref.Index, Sub: ref.Sub})
 	}
 	// 出站绑定分组时可单独指定测速方式，为空才回退到设置里的默认测速方式
-	results := probeNodesWithProgress(refs, o.ProbeMode, nil, nil)
+	results := probeNodesWithProgress(refs, o.ProbeMode, ProbeOptions{}, nil, nil, nil)
 
 	available := make([]probeResult, 0, len(results))
 	for _, r := range results {
@@ -845,22 +909,53 @@ func allocProbePort() int {
 	return engine.ProbeInboundSocksPort + int(n%probePortSpan) + 1
 }
 
-func probeNodeViaCore(ref configure.NodeRef) int {
-	if !fastReachableRef(ref) {
-		return -1
-	}
-	if outboundName := engine.Manager.LoadedOutboundForNode(ref); outboundName != "" {
-		latency, err := probeViaMainOutboundTargets(outboundName)
-		if err == nil && engine.Manager.LoadedOutboundForNode(ref) == outboundName {
-			return latency
-		}
-		if !errors.Is(err, engine.ErrMainProbeUnavailable) {
-			return -1
-		}
-	}
+func probeNodeViaCore(ref configure.NodeRef, options ProbeOptions) int {
+	return probeNodeViaCoreWithFast(ref, options, nil)
+}
+
+func probeNodeViaCoreWithFast(ref configure.NodeRef, options ProbeOptions, onFast func(int)) int {
 	s := serverRawByRef(ref)
 	if s == nil {
+		if onFast != nil {
+			onFast(-1)
+		}
 		return -1
+	}
+	fastLatency, _ := probeServerFast(s)
+	if onFast != nil {
+		onFast(fastLatency)
+	}
+	if fastLatency > 0 {
+		return probeServerViaCore(ref, s, true)
+	}
+	if options.EnableTransProxyFallback && s.FrontProxy == "" && canUseTransProxy(ref) {
+		if latency, err := probeServerFastViaOutbound(s, transProxyFallbackName); err == nil && latency > 0 {
+			if onFast != nil {
+				onFast(latency)
+			}
+			fallback := *s
+			fallback.FrontProxy = transProxyFallbackName
+			latency := probeServerViaCore(ref, &fallback, false)
+			if latency > 0 && saveTransProxyFrontProxy(ref) {
+				addLog(fmt.Sprintf("🛠️ 节点 %s:%d:%d 真连接成功，已自动保存前置代理 %s", ref.Type, ref.Sub, ref.Index, transProxyFallbackName))
+			}
+			return latency
+		}
+	}
+	return -1
+}
+
+func probeServerViaCore(ref configure.NodeRef, s *configure.ServerRaw, allowMainOutbound bool) int {
+	if allowMainOutbound {
+		if outboundName := engine.Manager.LoadedOutboundForNode(ref); outboundName != "" {
+			latency, err := probeViaMainOutboundTargets(outboundName)
+			if err == nil && engine.Manager.LoadedOutboundForNode(ref) == outboundName {
+				return latency
+			}
+			if !errors.Is(err, engine.ErrMainProbeUnavailable) {
+				return -1
+			}
+		}
 	}
 	socksPort := allocProbePort()
 	inst, err := engine.StartProbeInstance(s, socksPort)
@@ -919,26 +1014,13 @@ func probeNodeDirect(ref configure.NodeRef) int {
 }
 
 func probeNodeFast(ref configure.NodeRef) int {
-	const timeout = 1200 * time.Millisecond
 	s := serverRawByRef(ref)
-	if s == nil || strings.TrimSpace(s.Host) == "" || s.Port <= 0 {
-		return -1
-	}
-	start := time.Now()
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(s.Host, strconv.Itoa(s.Port)), timeout)
-	if err != nil {
-		return -1
-	}
-	_ = conn.Close()
-	ms := int(time.Since(start).Milliseconds())
-	if ms <= 0 {
-		return 1
-	}
-	return ms
+	latency, _ := probeServerFast(s)
+	return latency
 }
 
 // probeNodeByMode 按显式 mode 探测；mode 为空时回退全局设置 GroupProbeMode。
-func probeNodeByMode(ref configure.NodeRef, mode string) int {
+func probeNodeByMode(ref configure.NodeRef, mode string, options ProbeOptions) int {
 	if mode == "" {
 		mode = configure.GetSettingNotNil().GroupProbeMode
 	}
@@ -946,7 +1028,7 @@ func probeNodeByMode(ref configure.NodeRef, mode string) int {
 		return probeNodeFast(ref)
 	}
 	// real 模式：经内核走完整代理链路做真连测试，仅 TCP 可达但无法真正代理的节点会被判定失败
-	return probeNodeViaCore(ref)
+	return probeNodeViaCore(ref, options)
 }
 
 func serverRawByRef(ref configure.NodeRef) *configure.ServerRaw {
@@ -969,24 +1051,102 @@ func serverRawByRef(ref configure.NodeRef) *configure.ServerRaw {
 }
 
 func fastReachableRef(ref configure.NodeRef) bool {
-	const fastProbeTimeout = 1200 * time.Millisecond
-	s := serverRawByRef(ref)
-	if s == nil {
-		return false
-	}
-	if s.FrontProxy == "" {
-		return probe.FastReachable(s, fastProbeTimeout)
-	}
-	conn, err := engine.DialTCPViaOutbound(
-		s.FrontProxy,
-		net.JoinHostPort(s.Host, strconv.Itoa(s.Port)),
-		fastProbeTimeout,
-	)
+	return fastReachableServer(serverRawByRef(ref))
+}
+
+func fastReachableServer(s *configure.ServerRaw) bool {
+	latency, err := probeServerFast(s)
 	if err != nil {
 		// 主内核未运行或内部探测入口不可用时，保留原行为，交给独立探测内核验证完整链路。
 		return errors.Is(err, engine.ErrMainProbeUnavailable)
 	}
+	return latency > 0
+}
+
+func probeServerFast(s *configure.ServerRaw) (int, error) {
+	const timeout = 1200 * time.Millisecond
+	if s == nil || strings.TrimSpace(s.Host) == "" || s.Port <= 0 {
+		return -1, fmt.Errorf("invalid probe server")
+	}
+	start := time.Now()
+	var conn net.Conn
+	var err error
+	if s.FrontProxy != "" {
+		conn, err = engine.DialTCPViaOutbound(
+			s.FrontProxy,
+			net.JoinHostPort(s.Host, strconv.Itoa(s.Port)),
+			timeout,
+		)
+	} else {
+		conn, err = net.DialTimeout("tcp", net.JoinHostPort(s.Host, strconv.Itoa(s.Port)), timeout)
+	}
+	if err != nil {
+		return -1, err
+	}
 	_ = conn.Close()
+	ms := int(time.Since(start).Milliseconds())
+	if ms <= 0 {
+		return 1, nil
+	}
+	return ms, nil
+}
+
+func probeServerFastViaOutbound(s *configure.ServerRaw, outboundName string) (int, error) {
+	if s == nil {
+		return -1, fmt.Errorf("invalid probe server")
+	}
+	scopy := *s
+	scopy.FrontProxy = outboundName
+	return probeServerFast(&scopy)
+}
+
+func canUseTransProxy(ref configure.NodeRef) bool {
+	if configure.GetOutbound(transProxyFallbackName) == nil {
+		return false
+	}
+	return !outboundUsesNode(transProxyFallbackName, ref)
+}
+
+func outboundUsesNode(name string, ref configure.NodeRef) bool {
+	o := configure.GetOutbound(name)
+	if o == nil {
+		return false
+	}
+	var target *configure.NodeRef
+	switch o.Target.TargetType {
+	case "node":
+		target = o.Target.NodeRef
+	case "group":
+		target = o.Target.ActiveNodeRef
+		if target == nil {
+			_, group := configure.GetGroupByID(o.Target.GroupID)
+			if group != nil && len(group.Servers) > 0 {
+				first := group.Servers[0]
+				target = &configure.NodeRef{Type: first.Type, Index: first.Index, Sub: first.Sub}
+			}
+		}
+	}
+	return target != nil && target.Type == ref.Type && target.Index == ref.Index && target.Sub == ref.Sub
+}
+
+func saveTransProxyFrontProxy(ref configure.NodeRef) bool {
+	var err error
+	switch ref.Type {
+	case "server":
+		err = configure.UpdateServer(ref.Index, func(server *configure.ServerRaw) {
+			server.FrontProxy = transProxyFallbackName
+		})
+	case "sub_server":
+		err = configure.UpdateSubscriptionServer(ref.Sub, ref.Index, func(server *configure.ServerRaw) {
+			server.FrontProxy = transProxyFallbackName
+		})
+	default:
+		return false
+	}
+	if err != nil {
+		addLog(fmt.Sprintf("⚠️ 自动保存节点前置代理失败（%s:%d:%d）：%v", ref.Type, ref.Sub, ref.Index, err))
+		return false
+	}
 	return true
 }
 
