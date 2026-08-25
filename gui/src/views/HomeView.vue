@@ -1472,6 +1472,12 @@ async function removeSelected() {
     try {
       const { data } = await api.removeServersFromGroup(groupIndex, refs)
       store.patchGroup(data.group)
+      if (isSearching.value) {
+        await onSearch(false)
+        if (nodePage.value > 1 && searchTotal.value > 0 && !searchResults.value.length) {
+          await onSearch(true)
+        }
+      }
     } catch (error) {
       store.patchGroup(group)
       throw error
