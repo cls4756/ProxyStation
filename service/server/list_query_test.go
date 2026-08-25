@@ -67,11 +67,11 @@ func TestListViewsOmitRawLinksAndSubscriptionNodes(t *testing.T) {
 
 func TestSaveNodeEditSupportsManualAndSubscriptionNodes(t *testing.T) {
 	setupListQueryTestDB(t)
-	if err := configure.AppendServers([]*configure.ServerRaw{{Name: "manual", Host: "1.1.1.1", Port: 443, Type: "vless"}}); err != nil {
+	if err := configure.AppendServers([]*configure.ServerRaw{{Name: "manual", Host: "1.1.1.1", Port: 443, Type: "vless", FrontProxy: "proxy"}}); err != nil {
 		t.Fatalf("append manual server: %v", err)
 	}
 	if err := configure.AppendSubscriptions([]*configure.SubscriptionRaw{{
-		ID: "sub", Servers: []configure.ServerRaw{{Name: "sub-node", Host: "2.2.2.2", Port: 443, Type: "vmess"}},
+		ID: "sub", Servers: []configure.ServerRaw{{Name: "sub-node", Host: "2.2.2.2", Port: 443, Type: "vmess", FrontProxy: "proxy"}},
 	}}); err != nil {
 		t.Fatalf("append subscription: %v", err)
 	}
@@ -80,19 +80,24 @@ func TestSaveNodeEditSupportsManualAndSubscriptionNodes(t *testing.T) {
 	manual, err := saveNodeEdit(configure.NodeRef{Type: "server", Index: 0}, editNodeRequest{
 		Name: "manual-edited", FrontProxy: &manualFrontProxy,
 	})
-	if err != nil || manual == nil || manual.Name != "manual-edited" {
+	if err != nil || manual == nil || manual.Name != "manual-edited" || manual.FrontProxy != "" {
 		t.Fatalf("edit manual node: server=%+v err=%v", manual, err)
+	}
+	manualItem := newServerListItem(*manual)
+	manualJSON, err := json.Marshal(manualItem)
+	if err != nil || !bytes.Contains(manualJSON, []byte(`"frontProxy":""`)) {
+		t.Fatalf("manual edit response should explicitly clear frontProxy: json=%s err=%v", manualJSON, err)
 	}
 
 	subFrontProxy := ""
 	subNode, err := saveNodeEdit(configure.NodeRef{Type: "sub_server", Index: 0, Sub: 0}, editNodeRequest{
 		Name: "sub-edited", FrontProxy: &subFrontProxy,
 	})
-	if err != nil || subNode == nil || subNode.Name != "sub-edited" {
+	if err != nil || subNode == nil || subNode.Name != "sub-edited" || subNode.FrontProxy != "" {
 		t.Fatalf("edit subscription node: server=%+v err=%v", subNode, err)
 	}
 	persisted := configure.GetSubscription(0)
-	if persisted == nil || len(persisted.Servers) != 1 || persisted.Servers[0].Name != "sub-edited" {
+	if persisted == nil || len(persisted.Servers) != 1 || persisted.Servers[0].Name != "sub-edited" || persisted.Servers[0].FrontProxy != "" {
 		t.Fatalf("subscription node edit was not persisted: %+v", persisted)
 	}
 }
@@ -290,6 +295,37 @@ func TestSearchServersSupportsMultipleFiltersAndIndependentTotal(t *testing.T) {
 	}
 	if recorder.Code != http.StatusOK || payload.Total != 2 || len(payload.Results) != 1 || payload.Results[0].Server.Name != "tokyo-b" {
 		t.Fatalf("unexpected paged filtered response: %s", recorder.Body.String())
+	}
+}
+
+func TestSearchServersSupportsThousandItemPageAndCapsLargerLimits(t *testing.T) {
+	setupListQueryTestDB(t)
+	servers := make([]*configure.ServerRaw, 1001)
+	for index := range servers {
+		servers[index] = &configure.ServerRaw{Name: fmt.Sprintf("match-%04d", index), Type: "vless"}
+	}
+	if err := configure.AppendServers(servers); err != nil {
+		t.Fatalf("append servers: %v", err)
+	}
+
+	for _, limit := range []string{"1000", "2000"} {
+		recorder := httptest.NewRecorder()
+		context, _ := gin.CreateTestContext(recorder)
+		context.Request = httptest.NewRequest(http.MethodGet, "/api/servers/search?q=match&limit="+limit, nil)
+		searchServers(context)
+
+		var payload struct {
+			Results []struct {
+				Ref configure.NodeRef `json:"ref"`
+			} `json:"results"`
+			Total int `json:"total"`
+		}
+		if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("decode limit %s response: %v", limit, err)
+		}
+		if recorder.Code != http.StatusOK || payload.Total != 1001 || len(payload.Results) != 1000 {
+			t.Fatalf("unexpected limit %s response: status=%d total=%d results=%d", limit, recorder.Code, payload.Total, len(payload.Results))
+		}
 	}
 }
 

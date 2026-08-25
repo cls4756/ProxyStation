@@ -89,7 +89,7 @@
         <button
           :class="['action-btn', { 'action-btn-danger': pinging && activePingMode === 'real' }]"
           :disabled="pinging && activePingMode !== 'real'"
-          @click="pinging && activePingMode === 'real' ? abortPing() : pingSelected('real')"
+          @click="handleRealPingClick($event, () => pingSelected('real'))"
         >{{ pinging && activePingMode === 'real' ? '⏹ 中止检测' : '🧪 批量真连' }}</button>
         <button class="action-btn" @click="detectIPTypeForRefs(selectedRefs)" :disabled="detectingIPType">
           🌐 {{ detectingIPType ? '检测中…' : '检测 IP 类型' }}
@@ -132,7 +132,7 @@
               <button
                 :class="['action-btn', { 'action-btn-danger': pinging && activePingMode === 'real' }]"
                 :disabled="pinging && activePingMode !== 'real'"
-                @click="pinging && activePingMode === 'real' ? abortPing() : pingCurrentTab('real')"
+                @click="handleRealPingClick($event, () => pingCurrentTab('real'))"
               >{{ pinging && activePingMode === 'real' ? '⏹ 中止检测' : '🧪 真连接检测' }}</button>
               <button class="action-btn" @click="detectIPTypeForCurrentTab" :disabled="detectingIPType" title="查询节点地址是机房还是家宽">
                 🌐 {{ detectingIPType ? '检测中…' : 'IP 类型' }}
@@ -241,7 +241,7 @@
               <button
                 :class="['action-btn', { 'action-btn-danger': pinging && activePingMode === 'real' }]"
                 :disabled="pinging && activePingMode !== 'real'"
-                @click="pinging && activePingMode === 'real' ? abortPing() : pingCurrentTab('real')"
+                @click="handleRealPingClick($event, () => pingCurrentTab('real'))"
               >{{ pinging && activePingMode === 'real' ? '⏹ 中止检测' : '🧪 真连接检测' }}</button>
               <button class="action-btn" @click="detectIPTypeForCurrentTab" :disabled="detectingIPType" title="查询节点地址是机房还是家宽">
                 🌐 {{ detectingIPType ? '检测中…' : 'IP 类型' }}
@@ -1040,11 +1040,16 @@ onMounted(async () => {
   window.addEventListener('pointerup', endDragSelect)
   window.addEventListener('pointercancel', endDragSelect)
   window.addEventListener('blur', endDragSelect)
+  window.addEventListener('proxystation-data-mutated', onDataMutated)
   // 评分任务跑在后端，刷新页面后要接回进度显示
   resumeIPScoreIfRunning()
   await store.fetchSubscriptions(false)
   ensureActiveTabNodes()
 })
+
+function onDataMutated() {
+  if (isSearching.value) refreshSearchResultsAfterMutation()
+}
 
 onBeforeUnmount(() => {
   const proxyStation = window.ProxyStation
@@ -1062,6 +1067,7 @@ onBeforeUnmount(() => {
   searchAbortController?.abort()
   addSearchAbortController?.abort()
   cancelPingFlush()
+  window.removeEventListener('proxystation-data-mutated', onDataMutated)
 })
 
 async function resumeIPScoreIfRunning() {
@@ -1415,6 +1421,18 @@ function abortPing() {
   }
 }
 
+function handleRealPingClick(event, start) {
+  if (pinging.value && activePingMode.value === 'real') {
+    abortPing()
+    return
+  }
+  if (event?.shiftKey) {
+    transProxyFallbackEnabled.value = true
+    console.info('[ProxyStation] 真连接 trans-proxy 回退已开启（Shift 点击）')
+  }
+  start()
+}
+
 async function pingSelected(mode = 'fast') {
   if (!selectedRefs.value.length) return
   activePingMode.value = mode
@@ -1473,10 +1491,7 @@ async function removeSelected() {
       const { data } = await api.removeServersFromGroup(groupIndex, refs)
       store.patchGroup(data.group)
       if (isSearching.value) {
-        await onSearch(false)
-        if (nodePage.value > 1 && searchTotal.value > 0 && !searchResults.value.length) {
-          await onSearch(true)
-        }
+        await refreshSearchResultsAfterMutation()
       }
     } catch (error) {
       store.patchGroup(group)
@@ -1493,11 +1508,13 @@ function openNodeMenu(mode, refObj, server) {
 }
 
 function handleNodeUpdated(refObj, server) {
-  if (!refObj || !server) return
-  const key = refKey(refObj)
-  searchResults.value = searchResults.value.map(item =>
-    refKey(item.ref) === key ? { ...item, server: { ...item.server, ...server } } : item
-  )
+  if (refObj && server) {
+    const key = refKey(refObj)
+    searchResults.value = searchResults.value.map(item =>
+      refKey(item.ref) === key ? { ...item, server: { ...item.server, ...server } } : item
+    )
+  }
+  if (isSearching.value) refreshSearchResultsAfterMutation()
 }
 
 let searchAbortController = null
@@ -1505,7 +1522,7 @@ const activeSearchFilterCount = computed(() => Object.values(searchFilters.value
 const searchConditionCount = computed(() => activeSearchFilterCount.value + (searchQuery.value.trim() ? 1 : 0))
 
 function searchRequestParams() {
-  const pageSize = nodePageSize.value > 0 ? nodePageSize.value : 500
+  const pageSize = nodePageSize.value > 0 ? nodePageSize.value : 1000
   const params = {
     limit: pageSize,
     offset: (nodePage.value - 1) * pageSize,
@@ -1565,7 +1582,7 @@ async function onSearch(resetPage = true) {
     searchTotal.value = 0
     return
   }
-  if (nodePageSize.value <= 0) nodePageSize.value = 500
+  if (nodePageSize.value <= 0) nodePageSize.value = 1000
   const params = searchRequestParams()
   searchAbortController?.abort()
   const controller = new AbortController()
@@ -1587,6 +1604,14 @@ async function onSearch(resetPage = true) {
       searchAbortController = null
       searchLoading.value = false
     }
+  }
+}
+
+async function refreshSearchResultsAfterMutation() {
+  if (!isSearching.value) return
+  await onSearch(false)
+  if (nodePage.value > 1 && searchTotal.value > 0 && !searchResults.value.length) {
+    await onSearch(true)
   }
 }
 
@@ -1981,7 +2006,8 @@ async function refreshSub(si) {
   store.invalidateSubscriptions()
   store.invalidateNodeDetails()
   await store.fetchSubscriptions(false, true)
-  await ensureActiveTabNodes()
+  if (isSearching.value) await refreshSearchResultsAfterMutation()
+  else await ensureActiveTabNodes()
 }
 
 function openEditSub(si) {
@@ -2003,6 +2029,7 @@ async function saveEditSub() {
   store.invalidateSubscriptions()
   store.invalidateNodeDetails()
   await store.fetchSubscriptions(false, true)
+  if (isSearching.value) await refreshSearchResultsAfterMutation()
 }
 
 async function deleteSub(si) {
@@ -2012,6 +2039,7 @@ async function deleteSub(si) {
   store.invalidateNodeDetails()
   // 删除订阅需要刷新订阅和分组数据
   await Promise.all([store.fetchSubscriptions(false, true), store.fetchGroups()])
+  if (isSearching.value) await refreshSearchResultsAfterMutation()
 }
 
 async function deleteGroup(gi) {
@@ -2020,6 +2048,7 @@ async function deleteGroup(gi) {
   activeTab.value = 'group-0'
   store.invalidateNodeDetails()
   await store.fetchGroups()
+  if (isSearching.value) await refreshSearchResultsAfterMutation()
 }
 
 async function createGroup() {
@@ -2044,6 +2073,7 @@ async function saveEditGroup() {
   editGroupIdx.value = -1
   // 只刷新分组数据
   await store.fetchGroups()
+  if (isSearching.value) await refreshSearchResultsAfterMutation()
 }
 
 async function openAddToGroup(gi) {
@@ -2062,6 +2092,7 @@ async function confirmAddToGroup() {
   selectedAddIdx.value = -1
   // 只刷新分组数据
   await store.fetchGroups()
+  if (isSearching.value) await refreshSearchResultsAfterMutation()
 }
 
 async function confirmBulkCopy() {
@@ -2073,6 +2104,7 @@ async function confirmBulkCopy() {
     showBulkCopyModal.value = false
     bulkCopyGroupId.value = ''
     selectedRefs.value = []
+    if (isSearching.value) await refreshSearchResultsAfterMutation()
   } catch (error) {
     showNotice('复制失败：' + (error?.response?.data?.error || error?.message || '未知错误'), true)
   } finally {
@@ -2095,7 +2127,8 @@ async function confirmBulkMove() {
     showBulkMoveModal.value = false
     bulkMoveGroupId.value = ''
     selectedRefs.value = []
-    await store.fetchGroupServers(realGroupIndex(group), true, nodePage.value, nodePageSize.value)
+    if (isSearching.value) await refreshSearchResultsAfterMutation()
+    else await store.fetchGroupServers(realGroupIndex(group), true, nodePage.value, nodePageSize.value)
   } catch (error) {
     showNotice('移动失败：' + (error?.response?.data?.error || error?.message || '未知错误'), true)
   } finally {
@@ -2145,7 +2178,8 @@ async function confirmSingleMove() {
     showSingleMoveModal.value = false
     singleMoveRef.value = null
     singleTargetGroupId.value = ''
-    await store.fetchGroupServers(realGroupIndex(group), true, nodePage.value, nodePageSize.value)
+    if (isSearching.value) await refreshSearchResultsAfterMutation()
+    else await store.fetchGroupServers(realGroupIndex(group), true, nodePage.value, nodePageSize.value)
   } catch (error) {
     showNotice('移动失败：' + (error?.response?.data?.error || error?.message || '未知错误'), true)
   } finally {

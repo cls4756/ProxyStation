@@ -542,7 +542,7 @@ type serverListItem struct {
 	FastLatency       int    `json:"fastLatency"`
 	LastFastProbeTime int64  `json:"lastFastProbeTime"`
 	Source            string `json:"source"`
-	FrontProxy        string `json:"frontProxy,omitempty"`
+	FrontProxy        string `json:"frontProxy"`
 	IPType            string `json:"ipType,omitempty"`
 	IPTypeAddr        string `json:"ipTypeAddr,omitempty"`
 	IPTypeISP         string `json:"ipTypeIsp,omitempty"`
@@ -822,8 +822,10 @@ func searchServers(c *gin.Context) {
 	var results []result
 	total := 0
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "100"))
-	if limit < 1 || limit > 500 {
+	if limit < 1 {
 		limit = 100
+	} else if limit > 1000 {
+		limit = 1000
 	}
 	offset, _ := strconv.Atoi(c.DefaultQuery("offset", "0"))
 	if offset < 0 {

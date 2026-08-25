@@ -614,11 +614,12 @@ watch(showLogs, (newVal) => {
   }
 })
 
-function onImportDone() {
+async function onImportDone() {
   showImport.value = false
   store.invalidateSubscriptions()
   store.invalidateNodeDetails()
-  Promise.all([store.fetchSubscriptions(false, true), store.fetchGroups()])
+  await Promise.all([store.fetchSubscriptions(false, true), store.fetchGroups()])
+  window.dispatchEvent(new CustomEvent('proxystation-data-mutated'))
 }
 
 function resetAccountMessages() {

@@ -107,24 +107,37 @@ const shareLink = ref('')
 const qrCanvas = ref(null)
 const copied = ref(false)
 const targetGroupId = ref('')
+let editLoadVersion = 0
 
 const manualGroups = computed(() => store.groups.filter(g => !g.fromSub))
 
 // 初始化编辑表单
-watch(() => props.mode, async (m) => {
-  if (m === 'edit' && props.server && props.refObj) {
+watch(() => [props.mode, props.refObj], async ([m, refObj]) => {
+  if (m === 'edit' && props.server && refObj) {
+    const version = ++editLoadVersion
     editName.value = props.server.name || ''
     editFrontProxy.value = props.server.frontProxy || ''
     editLink.value = ''
     editError.value = ''
     editLoading.value = true
     try {
-      const { data } = await api.getServerLink(props.refObj.type, props.refObj.index, props.refObj.sub || 0, true)
-      editLink.value = data.link || ''
+      const [{ data: nodeData }, { data: linkData }] = await Promise.all([
+        api.queryServers([refObj]),
+        api.getServerLink(refObj.type, refObj.index, refObj.sub || 0, true),
+      ])
+      if (version !== editLoadVersion) return
+      const latestServer = nodeData.results?.[0]?.server
+      if (!latestServer) throw new Error('节点不存在')
+      editName.value = latestServer?.name ?? props.server.name ?? ''
+      editFrontProxy.value = latestServer?.frontProxy ?? props.server.frontProxy ?? ''
+      editLink.value = linkData.link || ''
     } catch (error) {
+      if (version !== editLoadVersion) return
+      editName.value = props.server.name || ''
+      editFrontProxy.value = props.server.frontProxy || ''
       editError.value = '节点链接加载失败：' + (error?.response?.data?.error || error?.message || '未知错误')
     } finally {
-      editLoading.value = false
+      if (version === editLoadVersion) editLoading.value = false
     }
   }
   if (m === 'share' && props.refObj) {
@@ -177,7 +190,7 @@ async function doCopy() {
   await api.copyServerToGroup(props.refObj, targetGroupId.value)
   // 只刷新分组数据，不需要拉取订阅和服务器
   await store.fetchGroups()
-  emit('updated')
+  emit('updated', props.refObj)
   close()
 }
 </script>
