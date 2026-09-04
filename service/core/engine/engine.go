@@ -64,6 +64,7 @@ var ProtocolKernelMap = map[string]KernelType{
 var Manager = &EngineManager{}
 
 type EngineManager struct {
+	lifecycleMu         sync.RWMutex
 	mu                  sync.Mutex
 	proc                *os.Process
 	cancel              context.CancelFunc
@@ -83,6 +84,12 @@ func DataDir() string {
 
 // Start 根据当前出站节点协议选择内核并启动
 func (em *EngineManager) Start() error {
+	em.lifecycleMu.Lock()
+	defer em.lifecycleMu.Unlock()
+	return em.start()
+}
+
+func (em *EngineManager) start() error {
 	em.mu.Lock()
 	defer em.mu.Unlock()
 
@@ -308,6 +315,8 @@ func (em *EngineManager) Start() error {
 }
 
 func (em *EngineManager) Stop() {
+	em.lifecycleMu.Lock()
+	defer em.lifecycleMu.Unlock()
 	em.mu.Lock()
 	defer em.mu.Unlock()
 	em.stopLocked()
@@ -328,6 +337,12 @@ func (em *EngineManager) stopLocked() {
 }
 
 func (em *EngineManager) Restart() error {
+	em.lifecycleMu.Lock()
+	defer em.lifecycleMu.Unlock()
+	return em.restart()
+}
+
+func (em *EngineManager) restart() error {
 	// 检查实际的进程状态而不是数据库状态
 	if !em.IsRunning() {
 		if LogCallback != nil {
@@ -338,7 +353,7 @@ func (em *EngineManager) Restart() error {
 	if LogCallback != nil {
 		LogCallback("🔄 开始重启代理...")
 	}
-	if err := em.Start(); err != nil {
+	if err := em.start(); err != nil {
 		// 重启失败时，确保状态被设置为未运行
 		_ = configure.SetRunning(false)
 		if LogCallback != nil {
@@ -350,6 +365,20 @@ func (em *EngineManager) Restart() error {
 		LogCallback("✅ 代理重启成功")
 	}
 	return nil
+}
+
+// UpdateAndRestart serializes a configuration update with a possible restart.
+// The callback runs after active main-probe users finish and before new users
+// can enter. It returns whether the update requires a restart.
+func (em *EngineManager) UpdateAndRestart(update func() (bool, error)) (bool, error) {
+	em.lifecycleMu.Lock()
+	defer em.lifecycleMu.Unlock()
+
+	changed, err := update()
+	if err != nil || !changed {
+		return changed, err
+	}
+	return true, em.restart()
 }
 
 // IsRunning 检查实际的进程状态（不依赖数据库）
@@ -481,11 +510,6 @@ func getServerRaw(ref *configure.NodeRef) *configure.ServerRaw {
 			return nil
 		}
 		s := sub.Servers[ref.Index]
-		// 订阅需要代理才能拉取时，其节点通常也需经同一前置代理才能连通。
-		// 节点未显式设置前置代理时，继承订阅的代理出站。
-		if s.FrontProxy == "" && sub.ProxyOutbound != "" {
-			s.FrontProxy = sub.ProxyOutbound
-		}
 		return &s
 	}
 	return nil
@@ -941,7 +965,7 @@ func RuleSetStatus() map[string]string {
 func DownloadRuleSets(mirror string, progressCh chan<- DownloadProgress) error {
 	// 若前端未传 mirror，从设置里读
 	if mirror == "" {
-		mirror = configure.GetSettingNotNil().GithubMirror
+		mirror = configure.GetDownloadConfig().Mirror
 	}
 	ruleSetDir := filepath.Join(Manager.dataDir, "rule-set")
 	if err := os.MkdirAll(ruleSetDir, 0755); err != nil {

@@ -51,10 +51,10 @@ func applyMirrorURL(originalURL, mirror string) string {
 
 // newHTTPClient 创建支持代理的 HTTP 客户端
 func newHTTPClient(timeout time.Duration) *http.Client {
-	setting := configure.GetSettingNotNil()
+	downloadConfig := configure.GetDownloadConfig()
 	transport := &http.Transport{}
-	if setting.DownloadProxy != "" {
-		if proxyURL, err := url.Parse(setting.DownloadProxy); err == nil {
+	if downloadConfig.Proxy != "" {
+		if proxyURL, err := url.Parse(downloadConfig.Proxy); err == nil {
 			transport.Proxy = http.ProxyURL(proxyURL)
 		}
 	}
@@ -63,15 +63,15 @@ func newHTTPClient(timeout time.Duration) *http.Client {
 
 // newDownloadClient 创建用于大文件下载的 HTTP 客户端（只设连接超时，不限制读取时间）
 func newDownloadClient() *http.Client {
-	setting := configure.GetSettingNotNil()
+	downloadConfig := configure.GetDownloadConfig()
 	transport := &http.Transport{
 		DialContext: (&net.Dialer{
 			Timeout: 30 * time.Second,
 		}).DialContext,
 		TLSHandshakeTimeout: 30 * time.Second,
 	}
-	if setting.DownloadProxy != "" {
-		if proxyURL, err := url.Parse(setting.DownloadProxy); err == nil {
+	if downloadConfig.Proxy != "" {
+		if proxyURL, err := url.Parse(downloadConfig.Proxy); err == nil {
 			transport.Proxy = http.ProxyURL(proxyURL)
 		}
 	}
@@ -116,18 +116,18 @@ func appendUniqueURL(urls []string, seen map[string]struct{}, u string) []string
 }
 
 func buildDataDownloadCandidates(dataType, primaryURL string) []string {
-	setting := configure.GetSettingNotNil()
+	downloadConfig := configure.GetDownloadConfig()
 	seen := map[string]struct{}{}
 	candidates := make([]string, 0, 8)
 
 	// 1) 当前选择的 URL
 	candidates = appendUniqueURL(candidates, seen, primaryURL)
 	// 2) 镜像 URL 的原始 GitHub URL（用于镜像 403/限流时回退）
-	candidates = appendUniqueURL(candidates, seen, stripMirrorURL(primaryURL, setting.GithubMirror))
+	candidates = appendUniqueURL(candidates, seen, stripMirrorURL(primaryURL, downloadConfig.Mirror))
 
 	// 3) 兜底列表：镜像版 + 原始版
 	for _, fb := range dataDownloadFallbacks[dataType] {
-		candidates = appendUniqueURL(candidates, seen, applyMirrorURL(fb.URL, setting.GithubMirror))
+		candidates = appendUniqueURL(candidates, seen, applyMirrorURL(fb.URL, downloadConfig.Mirror))
 		candidates = appendUniqueURL(candidates, seen, fb.URL)
 	}
 	return candidates
@@ -237,7 +237,7 @@ func GetLatestRelease(kernel string) (string, string, error) {
 		return "", "", fmt.Errorf("unknown kernel: %v", kernel)
 	}
 
-	setting := configure.GetSettingNotNil()
+	downloadConfig := configure.GetDownloadConfig()
 	url := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", repo)
 	client := newHTTPClient(30 * time.Second)
 	resp, err := client.Get(url)
@@ -261,7 +261,7 @@ func GetLatestRelease(kernel string) (string, string, error) {
 	}
 
 	// 应用 GitHub 镜像加速
-	downloadURL := applyMirrorURL(asset.DownloadURL, setting.GithubMirror)
+	downloadURL := applyMirrorURL(asset.DownloadURL, downloadConfig.Mirror)
 
 	return release.TagName, downloadURL, nil
 }
@@ -273,7 +273,7 @@ func GetLatestDataRelease(dataType string) (string, string, error) {
 		return "", "", fmt.Errorf("unknown data type: %v", dataType)
 	}
 
-	setting := configure.GetSettingNotNil()
+	downloadConfig := configure.GetDownloadConfig()
 	client := newHTTPClient(30 * time.Second)
 	var errs []string
 
@@ -301,7 +301,7 @@ func GetLatestDataRelease(dataType string) (string, string, error) {
 		for _, asset := range release.Assets {
 			for _, name := range source.AssetNames {
 				if strings.EqualFold(asset.Name, name) {
-					downloadURL := applyMirrorURL(asset.BrowserDownloadURL, setting.GithubMirror)
+					downloadURL := applyMirrorURL(asset.BrowserDownloadURL, downloadConfig.Mirror)
 					return release.TagName, downloadURL, nil
 				}
 			}
@@ -311,7 +311,7 @@ func GetLatestDataRelease(dataType string) (string, string, error) {
 
 	for _, fb := range dataDownloadFallbacks[dataType] {
 		if strings.TrimSpace(fb.URL) != "" {
-			return fb.Version, applyMirrorURL(fb.URL, setting.GithubMirror), nil
+			return fb.Version, applyMirrorURL(fb.URL, downloadConfig.Mirror), nil
 		}
 	}
 
@@ -734,7 +734,6 @@ func isBinFile(name string, binNames []string) bool {
 	}
 	return false
 }
-
 
 // GetKernelVersion 获取本地内核版本
 func GetKernelVersion(kernel string) string {

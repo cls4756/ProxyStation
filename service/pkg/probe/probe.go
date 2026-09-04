@@ -30,8 +30,7 @@ var probeHosts = []string{
 }
 
 func resolveProbeHosts() []string {
-	setting := configure.GetSettingNotNil()
-	raw := strings.TrimSpace(setting.ProbeTargets)
+	raw := strings.TrimSpace(configure.GetProbeConfig().Targets)
 	if raw == "" {
 		return probeHosts
 	}

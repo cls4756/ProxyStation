@@ -27,10 +27,14 @@ var subHTTPClient = &http.Client{
 
 var global = &Scheduler{}
 
+const subscriptionRetryInterval = 5 * time.Minute
+
 type Scheduler struct {
-	mu              sync.Mutex
-	stopCh          chan struct{}
-	lastNodeCleanup map[string]time.Time
+	mu                      sync.Mutex
+	stopCh                  chan struct{}
+	lastNodeCleanup         map[string]time.Time
+	lastSubscriptionAttempt map[int]time.Time
+	subscriptionUpdating    map[int]bool
 }
 
 func Start() {
@@ -40,6 +44,12 @@ func Start() {
 		return
 	}
 	global.stopCh = make(chan struct{})
+	if global.lastSubscriptionAttempt == nil {
+		global.lastSubscriptionAttempt = make(map[int]time.Time)
+	}
+	if global.subscriptionUpdating == nil {
+		global.subscriptionUpdating = make(map[int]bool)
+	}
 	go global.run()
 }
 
@@ -67,14 +77,14 @@ func (s *Scheduler) run() {
 }
 
 func (s *Scheduler) checkAndCleanupNodes() {
-	setting := configure.GetSettingNotNil()
-	if len(setting.NodeCleanupRules) == 0 {
+	schedulerConfig := configure.GetSchedulerConfig()
+	if len(schedulerConfig.NodeCleanupRules) == 0 {
 		return
 	}
 	if s.lastNodeCleanup == nil {
 		s.lastNodeCleanup = make(map[string]time.Time)
 	}
-	for _, rule := range setting.NodeCleanupRules {
+	for _, rule := range schedulerConfig.NodeCleanupRules {
 		if len(rule.GroupIDs) == 0 {
 			continue
 		}
@@ -163,11 +173,11 @@ func cleanupRecycleSuffix(recycled bool, groupID string) string {
 }
 
 func (s *Scheduler) checkAndUpdate() {
-	setting := configure.GetSettingNotNil()
-	if setting.SubscriptionAutoUpdateMode != "on" {
+	schedulerConfig := configure.GetSchedulerConfig()
+	if schedulerConfig.SubscriptionAutoUpdateMode != "on" {
 		return
 	}
-	intervalHour := setting.SubscriptionAutoUpdateIntervalHour
+	intervalHour := schedulerConfig.SubscriptionAutoUpdateIntervalHour
 	if intervalHour <= 0 {
 		intervalHour = 12
 	}
@@ -181,9 +191,36 @@ func (s *Scheduler) checkAndUpdate() {
 		if time.Since(sub.UpdatedAt) < interval {
 			continue
 		}
+		if !s.beginSubscriptionUpdate(i, interval) {
+			continue
+		}
 		log.Info("auto updating subscription: %s", sub.Name)
-		go updateSub(i, &subs[i])
+		go func(index int, subscription *configure.SubscriptionRaw) {
+			defer s.endSubscriptionUpdate(index)
+			updateSub(index, subscription)
+		}(i, &subs[i])
 	}
+}
+
+func (s *Scheduler) beginSubscriptionUpdate(index int, interval time.Duration) bool {
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.subscriptionUpdating[index] {
+		return false
+	}
+	if lastAttempt := s.lastSubscriptionAttempt[index]; !lastAttempt.IsZero() && now.Sub(lastAttempt) < subscriptionRetryInterval {
+		return false
+	}
+	s.lastSubscriptionAttempt[index] = now
+	s.subscriptionUpdating[index] = true
+	return true
+}
+
+func (s *Scheduler) endSubscriptionUpdate(index int) {
+	s.mu.Lock()
+	delete(s.subscriptionUpdating, index)
+	s.mu.Unlock()
 }
 
 func updateSub(index int, sub *configure.SubscriptionRaw) {

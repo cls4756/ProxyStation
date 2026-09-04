@@ -60,8 +60,8 @@ func startProbeInstance(s *configure.ServerRaw, socksPort int, options probeInst
 	if s == nil {
 		return nil, fmt.Errorf("nil server")
 	}
-	setting := configure.GetSettingNotNil()
-	kernel := probeInstanceKernel(s, setting)
+	probeConfig := configure.GetProbeConfig()
+	kernel := probeInstanceKernel(s, probeConfig.KernelMode)
 
 	binPath, err := probeKernelBin(kernel)
 	if err != nil {
@@ -162,13 +162,13 @@ func (pi *ProbeInstance) Close() {
 
 // probeInstanceKernel 按节点协议决定使用哪个内核，比全局 selectKernel 更精准：
 // 只要该节点协议要求 sing-box 就用 sing-box，否则回退到用户设置的内核倾向。
-func probeInstanceKernel(s *configure.ServerRaw, setting *configure.Setting) KernelType {
+func probeInstanceKernel(s *configure.ServerRaw, kernelMode string) KernelType {
 	if s != nil {
 		if k, ok := ProtocolKernelMap[s.Type]; ok && k == KernelSingbox {
 			return KernelSingbox
 		}
 	}
-	switch setting.KernelMode {
+	switch kernelMode {
 	case "singbox":
 		return KernelSingbox
 	case "xray":

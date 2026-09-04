@@ -253,6 +253,45 @@ func ListUpdate(bucket, key string, index int, update func([]byte) ([]byte, erro
 	})
 }
 
+// ListUpdateMany atomically updates multiple items in one list. The callbacks
+// run inside one transaction so callers can batch related changes and avoid
+// repeatedly parsing and rewriting the same large JSON array.
+func ListUpdateMany(bucket, key string, updates map[int]func([]byte) ([]byte, error)) error {
+	if len(updates) == 0 {
+		return nil
+	}
+	return database.Update(func(tx *bolt.Tx) error {
+		b, err := tx.CreateBucketIfNotExists([]byte(bucket))
+		if err != nil {
+			return err
+		}
+		var existing []json.RawMessage
+		if data := b.Get([]byte(key)); data != nil {
+			if err := json.Unmarshal(data, &existing); err != nil {
+				return err
+			}
+		}
+		for index, update := range updates {
+			if index < 0 || index >= len(existing) {
+				return fmt.Errorf("index %d out of range", index)
+			}
+			updated, err := update(append([]byte(nil), existing[index]...))
+			if err != nil {
+				return err
+			}
+			if !json.Valid(updated) {
+				return fmt.Errorf("updated item at index %d is not valid JSON", index)
+			}
+			existing[index] = append(json.RawMessage(nil), updated...)
+		}
+		data, err := json.Marshal(existing)
+		if err != nil {
+			return err
+		}
+		return b.Put([]byte(key), data)
+	})
+}
+
 func ListRemove(bucket, key string, indexes []int) error {
 	return database.Update(func(tx *bolt.Tx) error {
 		b, err := tx.CreateBucketIfNotExists([]byte(bucket))

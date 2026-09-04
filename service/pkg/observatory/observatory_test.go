@@ -74,7 +74,7 @@ func TestSaveLatencySeparatesSubscriptionProbeModes(t *testing.T) {
 	}
 }
 
-func TestServerRawByRefInheritsSubscriptionProxyOutbound(t *testing.T) {
+func TestServerRawByRefDoesNotInheritSubscriptionProxyOutbound(t *testing.T) {
 	setupTestDB(t)
 	if err := configure.AppendSubscriptions([]*configure.SubscriptionRaw{{
 		ID: "sub", ProxyOutbound: "hk", Servers: []configure.ServerRaw{{
@@ -85,8 +85,8 @@ func TestServerRawByRefInheritsSubscriptionProxyOutbound(t *testing.T) {
 	}
 
 	server := serverRawByRef(configure.NodeRef{Type: "sub_server", Sub: 0, Index: 0})
-	if server == nil || server.FrontProxy != "hk" {
-		t.Fatalf("订阅节点未继承 ProxyOutbound: %+v", server)
+	if server == nil || server.FrontProxy != "" {
+		t.Fatalf("订阅拉取代理不应成为节点前置代理: %+v", server)
 	}
 }
 
@@ -122,6 +122,45 @@ func TestTransProxyFallbackHelpersAvoidSelfReferenceAndPersist(t *testing.T) {
 	target := configure.GetServer(1)
 	if target == nil || target.FrontProxy != "trans-proxy" {
 		t.Fatalf("节点前置代理未保存: %+v", target)
+	}
+}
+
+func TestFailoverFrontProxyMarksFailedNodeAndUsesGroupRule(t *testing.T) {
+	setupTestDB(t)
+	servers := []configure.ServerRaw{
+		{Name: "front-down", Host: "front-down.example.com", Port: 443, Latency: 200},
+		{Name: "front-good", Host: "front-good.example.com", Port: 443, Latency: 20},
+		{Name: "target", Host: "target.example.com", Port: 443, FrontProxy: "front"},
+	}
+	if err := configure.SetServers(servers); err != nil {
+		t.Fatalf("SetServers: %v", err)
+	}
+	if err := configure.AppendGroup(&configure.Group{ID: "front-group", Name: "Front", Servers: []configure.ServerRef{
+		{Type: "server", Index: 0}, {Type: "server", Index: 1},
+	}}); err != nil {
+		t.Fatalf("AppendGroup: %v", err)
+	}
+	threshold, cooldown := 0, 0
+	if err := configure.SetOutbound("front", &configure.Outbound{
+		Name: "front", Target: configure.OutboundTarget{
+			TargetType: "group", GroupID: "front-group", Mode: configure.ModeLeastPing,
+			ActiveNodeRef: &configure.NodeRef{Type: "server", Index: 0},
+		},
+		ProbeMode: "real", SwitchThresholdMs: &threshold, SwitchCooldownSec: &cooldown,
+	}); err != nil {
+		t.Fatalf("SetOutbound front: %v", err)
+	}
+	failed := configure.NodeRef{Type: "server", Index: 0}
+	if !markFrontProxyFailure("front", failed) {
+		t.Fatal("前置出站故障应切换到分组内其他可用节点")
+	}
+	front := configure.GetOutbound("front")
+	if front == nil || front.Target.ActiveNodeRef == nil || front.Target.ActiveNodeRef.Index != 1 {
+		t.Fatalf("前置出站未切换：%+v", front)
+	}
+	server := configure.GetServer(0)
+	if server == nil || server.Latency != -1 || server.LastProbeTime == 0 {
+		t.Fatalf("前置故障节点真连接结果未写回：%+v", server)
 	}
 }
 
@@ -256,5 +295,165 @@ func TestCleanupProbeInvalidRules(t *testing.T) {
 				t.Fatalf("cleanupProbeInvalid(%q, %d, %d) = %v, want %v", test.mode, test.fastLatency, test.realLatency, got, test.want)
 			}
 		})
+	}
+}
+
+func TestResolveActiveNodeProbeIntervalClampsTooSmall(t *testing.T) {
+	if got := resolveActiveNodeProbeInterval(1); got != minActiveNodeProbeInterval {
+		t.Fatalf("过小的活动节点巡检间隔应被钳到 %v，got %v", minActiveNodeProbeInterval, got)
+	}
+	if got := resolveActiveNodeProbeInterval(180); got != 180*time.Second {
+		t.Fatalf("活动节点巡检间隔应使用设置值，got %v", got)
+	}
+}
+
+func TestProbeActiveOutboundOnlyExpandsCandidatesAfterFailure(t *testing.T) {
+	setupTestDB(t)
+	if err := configure.SetServers([]configure.ServerRaw{
+		{Name: "direct-slow", Host: "a.example.com", Port: 443, Latency: 80},
+		{Name: "current", Host: "b.example.com", Port: 443, Latency: 10},
+		{Name: "fronted-fast", Host: "c.example.com", Port: 443, Latency: 5, FrontProxy: "front"},
+		{Name: "direct-fast", Host: "d.example.com", Port: 443, Latency: 20},
+	}); err != nil {
+		t.Fatalf("SetServers: %v", err)
+	}
+	if err := configure.AppendGroup(&configure.Group{ID: "g1", Name: "G1", Servers: []configure.ServerRef{
+		{Type: "server", Index: 0}, {Type: "server", Index: 1},
+		{Type: "server", Index: 2}, {Type: "server", Index: 3},
+	}}); err != nil {
+		t.Fatalf("AppendGroup: %v", err)
+	}
+	if err := configure.SetOutbound("proxy", &configure.Outbound{Name: "proxy", Target: configure.OutboundTarget{
+		TargetType: "group", GroupID: "g1", Mode: configure.ModeLeastPing,
+		ActiveNodeRef: &configure.NodeRef{Type: "server", Index: 1},
+	}}); err != nil {
+		t.Fatalf("SetOutbound: %v", err)
+	}
+
+	var probed []int
+	probeResults := map[int]int{1: -1, 3: -1, 0: 45, 2: 5}
+	probe := func(ref configure.NodeRef) int {
+		probed = append(probed, ref.Index)
+		return probeResults[ref.Index]
+	}
+	activate := func(name, groupID string, failedRef, candidateRef configure.NodeRef) (bool, error) {
+		if name != "proxy" || groupID != "g1" || failedRef.Index != 1 {
+			t.Fatalf("故障切换上下文错误：%s %s %+v", name, groupID, failedRef)
+		}
+		if err := configure.SetOutboundActiveNode(name, &candidateRef); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+
+	probeActiveOutbound("proxy", probe, activate)
+	want := []int{1, 3, 0}
+	if len(probed) != len(want) {
+		t.Fatalf("探测顺序错误：got %v want %v", probed, want)
+	}
+	for i := range want {
+		if probed[i] != want[i] {
+			t.Fatalf("探测顺序错误：got %v want %v", probed, want)
+		}
+	}
+	outbound := configure.GetOutbound("proxy")
+	if outbound == nil || outbound.Target.ActiveNodeRef == nil || outbound.Target.ActiveNodeRef.Index != 0 {
+		t.Fatalf("应切换到首个真连成功候选：%+v", outbound)
+	}
+}
+
+func TestProbeActiveOutboundHealthyOnlyTestsCurrentNode(t *testing.T) {
+	setupTestDB(t)
+	if err := configure.SetServers([]configure.ServerRaw{
+		{Name: "candidate", Host: "a.example.com", Port: 443},
+		{Name: "current", Host: "b.example.com", Port: 443},
+	}); err != nil {
+		t.Fatalf("SetServers: %v", err)
+	}
+	if err := configure.AppendGroup(&configure.Group{ID: "g1", Servers: []configure.ServerRef{
+		{Type: "server", Index: 0}, {Type: "server", Index: 1},
+	}}); err != nil {
+		t.Fatalf("AppendGroup: %v", err)
+	}
+	if err := configure.SetOutbound("proxy", &configure.Outbound{Name: "proxy", Target: configure.OutboundTarget{
+		TargetType: "group", GroupID: "g1", Mode: configure.ModeStable,
+		ActiveNodeRef: &configure.NodeRef{Type: "server", Index: 1},
+	}}); err != nil {
+		t.Fatalf("SetOutbound: %v", err)
+	}
+
+	var probed []int
+	probeActiveOutbound("proxy", func(ref configure.NodeRef) int {
+		probed = append(probed, ref.Index)
+		return 30
+	}, func(string, string, configure.NodeRef, configure.NodeRef) (bool, error) {
+		t.Fatal("活动节点正常时不应进入故障切换")
+		return false, nil
+	})
+	if len(probed) != 1 || probed[0] != 1 {
+		t.Fatalf("只应探测当前实际活动节点，got %v", probed)
+	}
+}
+
+func TestCollectActiveNodeProbeTargetsDirectFirst(t *testing.T) {
+	setupTestDB(t)
+	if err := configure.SetServers([]configure.ServerRaw{
+		{Name: "fronted", Host: "a.example.com", Port: 443, FrontProxy: "front"},
+		{Name: "direct", Host: "b.example.com", Port: 443},
+	}); err != nil {
+		t.Fatalf("SetServers: %v", err)
+	}
+	if err := configure.AppendGroup(&configure.Group{ID: "front-group", Servers: []configure.ServerRef{{Type: "server", Index: 0}}}); err != nil {
+		t.Fatalf("AppendGroup front: %v", err)
+	}
+	if err := configure.AppendGroup(&configure.Group{ID: "direct-group", Servers: []configure.ServerRef{{Type: "server", Index: 1}}}); err != nil {
+		t.Fatalf("AppendGroup direct: %v", err)
+	}
+	if err := configure.SetOutbound("proxy", &configure.Outbound{Name: "proxy", Target: configure.OutboundTarget{
+		TargetType: "group", GroupID: "front-group", ActiveNodeRef: &configure.NodeRef{Type: "server", Index: 0},
+	}}); err != nil {
+		t.Fatalf("SetOutbound proxy: %v", err)
+	}
+	if err := configure.AddOutbound("direct-out"); err != nil {
+		t.Fatalf("AddOutbound: %v", err)
+	}
+	if err := configure.SetOutbound("direct-out", &configure.Outbound{Name: "direct-out", Target: configure.OutboundTarget{
+		TargetType: "group", GroupID: "direct-group", ActiveNodeRef: &configure.NodeRef{Type: "server", Index: 1},
+	}}); err != nil {
+		t.Fatalf("SetOutbound direct-out: %v", err)
+	}
+
+	targets := collectActiveNodeProbeTargets()
+	if len(targets) != 2 || targets[0].outboundName != "direct-out" || targets[1].outboundName != "proxy" {
+		t.Fatalf("活动节点应按直连优先排序：%+v", targets)
+	}
+}
+
+func TestActivateFailoverNodeRejectsStaleCurrent(t *testing.T) {
+	setupTestDB(t)
+	if err := configure.SetServers([]configure.ServerRaw{{Name: "old"}, {Name: "new"}, {Name: "other"}}); err != nil {
+		t.Fatalf("SetServers: %v", err)
+	}
+	if err := configure.AppendGroup(&configure.Group{ID: "g1", Servers: []configure.ServerRef{
+		{Type: "server", Index: 0}, {Type: "server", Index: 1}, {Type: "server", Index: 2},
+	}}); err != nil {
+		t.Fatalf("AppendGroup: %v", err)
+	}
+	if err := configure.SetOutbound("proxy", &configure.Outbound{Name: "proxy", Target: configure.OutboundTarget{
+		TargetType: "group", GroupID: "g1", ActiveNodeRef: &configure.NodeRef{Type: "server", Index: 2},
+	}}); err != nil {
+		t.Fatalf("SetOutbound: %v", err)
+	}
+
+	changed, err := activateFailoverNode("proxy", "g1", nodeRef(0), nodeRef(1))
+	if err != nil {
+		t.Fatalf("activateFailoverNode: %v", err)
+	}
+	if changed {
+		t.Fatal("过期任务不应覆盖已变化的活动节点")
+	}
+	outbound := configure.GetOutbound("proxy")
+	if outbound == nil || outbound.Target.ActiveNodeRef == nil || outbound.Target.ActiveNodeRef.Index != 2 {
+		t.Fatalf("活动节点被过期任务覆盖：%+v", outbound)
 	}
 }

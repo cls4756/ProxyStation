@@ -142,6 +142,23 @@
           <label class="field-label">切换冷却时间（秒）</label>
           <input type="number" class="input field-input" v-model.number="form.groupSwitchCooldownSec" min="0" />
         </div>
+        <div class="field-row">
+          <label class="field-label">活动节点真连巡检</label>
+          <label class="toggle-wrap">
+            <input type="checkbox" v-model="form.groupActiveNodeProbeEnabled" />
+            <span>{{ form.groupActiveNodeProbeEnabled ? '已开启' : '已关闭' }}</span>
+          </label>
+        </div>
+        <div class="field-row" v-if="form.groupActiveNodeProbeEnabled">
+          <label class="field-label">活动节点巡检间隔（秒）</label>
+          <input type="number" class="input field-input" v-model.number="form.groupActiveNodeProbeIntervalSec" min="30" />
+        </div>
+        <div class="field-row field-row-tip" v-if="form.groupActiveNodeProbeEnabled">
+          <label class="field-label"></label>
+          <div class="field-tip">
+            仅串行真连检测各分组出站当前实际活动节点，直连节点优先。活动节点失败时才按策略逐个验证候选节点并立即故障切换，不会全量测速整个分组。
+          </div>
+        </div>
         <div class="field-row field-row-tip">
           <label class="field-label">当前监听</label>
           <div class="listen-summary">
@@ -458,6 +475,8 @@ const form = reactive({
   groupProbeMode: 'real',
   groupSwitchThresholdMs: 100,
   groupSwitchCooldownSec: 600,
+  groupActiveNodeProbeEnabled: true,
+  groupActiveNodeProbeIntervalSec: 180,
   nodeCleanupRules: [],
   ipScoreEnabled: false,
   ipScoreProvider: 'cleanip',
@@ -511,6 +530,8 @@ async function loadSetting() {
       groupProbeMode: s.groupProbeMode || 'real',
       groupSwitchThresholdMs: typeof s.groupSwitchThresholdMs === 'number' ? s.groupSwitchThresholdMs : 100,
       groupSwitchCooldownSec: typeof s.groupSwitchCooldownSec === 'number' ? s.groupSwitchCooldownSec : 600,
+      groupActiveNodeProbeEnabled: s.groupActiveNodeProbeEnabled !== false,
+      groupActiveNodeProbeIntervalSec: s.groupActiveNodeProbeIntervalSec || 180,
       nodeCleanupRules: normalizeCleanupRules(s),
       ipScoreEnabled: !!s.ipScoreEnabled,
       ipScoreProvider: s.ipScoreProvider || 'cleanip',
@@ -705,6 +726,8 @@ async function saveSettings() {
       groupProbeMode: form.groupProbeMode,
       groupSwitchThresholdMs: form.groupSwitchThresholdMs,
       groupSwitchCooldownSec: form.groupSwitchCooldownSec,
+      groupActiveNodeProbeEnabled: form.groupActiveNodeProbeEnabled,
+      groupActiveNodeProbeIntervalSec: form.groupActiveNodeProbeIntervalSec,
       nodeCleanupRules: cleanupRules,
       ipScoreEnabled: form.ipScoreEnabled,
       ipScoreProvider: form.ipScoreProvider,
@@ -733,6 +756,8 @@ async function saveSettings() {
       groupProbeMode: form.groupProbeMode,
       groupSwitchThresholdMs: form.groupSwitchThresholdMs,
       groupSwitchCooldownSec: form.groupSwitchCooldownSec,
+      groupActiveNodeProbeEnabled: form.groupActiveNodeProbeEnabled,
+      groupActiveNodeProbeIntervalSec: form.groupActiveNodeProbeIntervalSec,
       nodeCleanupRules: cleanupRules,
       ipScoreEnabled: form.ipScoreEnabled,
       ipScoreProvider: form.ipScoreProvider,

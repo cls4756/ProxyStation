@@ -145,8 +145,8 @@ func TestResolveFrontProxyTagAllowsChain(t *testing.T) {
 	}
 }
 
-// 订阅走代理拉取时，其节点应继承订阅的代理出站作为前置代理
-func TestSubscriptionNodeInheritsProxyOutbound(t *testing.T) {
+// 订阅走代理拉取时，节点连接不应继承订阅的代理出站。
+func TestSubscriptionNodeDoesNotInheritProxyOutbound(t *testing.T) {
 	setupTestDB(t)
 
 	if err := configure.AppendSubscriptions([]*configure.SubscriptionRaw{
@@ -170,16 +170,16 @@ func TestSubscriptionNodeInheritsProxyOutbound(t *testing.T) {
 		t.Fatalf("append subscriptions: %v", err)
 	}
 
-	// 未显式设置的节点继承订阅的 ProxyOutbound
+	// 未显式设置的节点不使用订阅的 ProxyOutbound
 	got := getServerRaw(&configure.NodeRef{Type: "sub_server", Index: 0, Sub: 0})
 	if got == nil {
 		t.Fatal("getServerRaw 返回 nil")
 	}
-	if got.FrontProxy != "hk" {
-		t.Errorf("应继承订阅代理出站 hk，实际 %q", got.FrontProxy)
+	if got.FrontProxy != "" {
+		t.Errorf("不应继承订阅代理出站，实际 %q", got.FrontProxy)
 	}
 
-	// 节点自身已设置时不被订阅覆盖
+	// 节点自身已设置时仍使用自己的前置代理
 	got = getServerRaw(&configure.NodeRef{Type: "sub_server", Index: 1, Sub: 0})
 	if got.FrontProxy != "jp" {
 		t.Errorf("节点自身设置的 jp 不应被覆盖，实际 %q", got.FrontProxy)

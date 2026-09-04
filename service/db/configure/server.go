@@ -121,6 +121,22 @@ func UpdateServer(index int, update func(*ServerRaw)) error {
 	})
 }
 
+func UpdateServers(updates map[int]func(*ServerRaw)) error {
+	callbacks := make(map[int]func([]byte) ([]byte, error), len(updates))
+	for index, update := range updates {
+		update := update
+		callbacks[index] = func(raw []byte) ([]byte, error) {
+			server, err := Bytes2ServerRaw(raw)
+			if err != nil {
+				return nil, err
+			}
+			update(server)
+			return json.Marshal(server)
+		}
+	}
+	return db.ListUpdateMany("touch", "servers", callbacks)
+}
+
 func RemoveServers(indexes []int) error {
 	return db.ListRemove("touch", "servers", indexes)
 }

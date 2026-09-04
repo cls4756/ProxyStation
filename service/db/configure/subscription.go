@@ -150,6 +150,22 @@ func UpdateSubscriptionServer(subIndex, serverIndex int, update func(*ServerRaw)
 	})
 }
 
+func UpdateSubscriptionServers(subIndex int, updates map[int]func(*ServerRaw)) error {
+	return db.ListUpdate("touch", "subscriptions", subIndex, func(raw []byte) ([]byte, error) {
+		sub, err := Bytes2SubscriptionRaw(raw)
+		if err != nil {
+			return nil, err
+		}
+		for serverIndex, update := range updates {
+			if serverIndex < 0 || serverIndex >= len(sub.Servers) {
+				return nil, fmt.Errorf("server index %d out of range", serverIndex)
+			}
+			update(&sub.Servers[serverIndex])
+		}
+		return json.Marshal(sub)
+	})
+}
+
 func RemoveSubscriptions(indexes []int) error {
 	return db.ListRemove("touch", "subscriptions", indexes)
 }

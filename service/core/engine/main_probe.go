@@ -41,6 +41,29 @@ func MainProbeAvailable(timeout time.Duration) bool {
 	return true
 }
 
+// AcquireMainProbe waits for readiness and keeps the main kernel configuration
+// stable while callers use its internal probe inbound. Start, Stop and Restart
+// wait for the returned release function to be called.
+func AcquireMainProbe(ctx context.Context) (func(), error) {
+	Manager.lifecycleMu.RLock()
+	if !Manager.IsRunning() {
+		Manager.lifecycleMu.RUnlock()
+		return nil, ErrMainProbeUnavailable
+	}
+	for {
+		if MainProbeAvailable(300 * time.Millisecond) {
+			return Manager.lifecycleMu.RUnlock, nil
+		}
+
+		select {
+		case <-ctx.Done():
+			Manager.lifecycleMu.RUnlock()
+			return nil, ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
 func mainProbeAddress() string {
 	return net.JoinHostPort(ProbeInboundListen, strconv.Itoa(ProbeInboundSocksPort))
 }

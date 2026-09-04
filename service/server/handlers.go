@@ -2420,12 +2420,12 @@ func normalizeProbeMode(raw string) (string, error) {
 }
 
 func outboundSwitchDefaults() (int, int) {
-	s := configure.GetSettingNotNil()
-	threshold := s.GroupSwitchThresholdMs
+	probeConfig := configure.GetProbeConfig()
+	threshold := probeConfig.SwitchThresholdMs
 	if threshold < 0 {
 		threshold = 100
 	}
-	cooldown := s.GroupSwitchCooldownSec
+	cooldown := probeConfig.SwitchCooldownSec
 	if cooldown < 0 {
 		cooldown = 600
 	}
@@ -2664,13 +2664,16 @@ func setOutboundActiveNode(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"ok": true, "outbound": o})
 		return
 	}
-	if err := configure.SetOutboundActiveNode(name, &req.Ref); err != nil {
+	_, err := engine.Manager.UpdateAndRestart(func() (bool, error) {
+		if err := configure.SetOutboundActiveNode(name, &req.Ref); err != nil {
+			return false, err
+		}
+		observatory.MarkManualSwitch(name)
+		return true, nil
+	})
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
-	}
-	observatory.MarkManualSwitch(name)
-	if engine.Manager.IsRunning() {
-		_ = engine.Manager.Restart()
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true, "outbound": configure.GetOutbound(name)})
 }
@@ -2980,7 +2983,7 @@ func ipTypeHTTPClient() *http.Client {
 		DialContext:         (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
 		TLSHandshakeTimeout: 10 * time.Second,
 	}
-	if raw := strings.TrimSpace(configure.GetSettingNotNil().DownloadProxy); raw != "" {
+	if raw := strings.TrimSpace(configure.GetDownloadConfig().Proxy); raw != "" {
 		if proxyURL, err := url.Parse(raw); err == nil {
 			transport.Proxy = http.ProxyURL(proxyURL)
 			return &http.Client{Timeout: timeout, Transport: transport}
@@ -3041,16 +3044,16 @@ func builtinSocksProxyURL() (*url.URL, error) {
 	if !engine.Manager.IsRunning() {
 		return nil, fmt.Errorf("内核未运行")
 	}
-	setting := configure.GetSettingNotNil()
+	inboundConfig := configure.GetInboundConfig()
 	// 构造带认证的 SOCKS5 URL（若配置了认证账号）
-	accounts := setting.Socks5AuthAccounts()
+	accounts := inboundConfig.Socks5Accounts
 	if len(accounts) > 0 {
 		// 使用第一个账号
 		acc := accounts[0]
 		return url.Parse(fmt.Sprintf("socks5://%s:%s@127.0.0.1:%d",
-			url.QueryEscape(acc.Username), url.QueryEscape(acc.Password), setting.Socks5Port))
+			url.QueryEscape(acc.Username), url.QueryEscape(acc.Password), inboundConfig.Socks5Port))
 	}
-	return url.Parse(fmt.Sprintf("socks5://127.0.0.1:%d", setting.Socks5Port))
+	return url.Parse(fmt.Sprintf("socks5://127.0.0.1:%d", inboundConfig.Socks5Port))
 }
 
 // ---- Setting ----
@@ -3169,6 +3172,16 @@ func setSetting(c *gin.Context) {
 		}
 	}
 	current := configure.GetSettingNotNil()
+	if s.GroupActiveNodeProbeEnabled == nil {
+		s.GroupActiveNodeProbeEnabled = current.GroupActiveNodeProbeEnabled
+	}
+	if s.GroupActiveNodeProbeIntervalSec <= 0 {
+		s.GroupActiveNodeProbeIntervalSec = current.GroupActiveNodeProbeIntervalSec
+	}
+	if s.GroupActiveNodeProbeOn() && s.GroupActiveNodeProbeIntervalSec < 30 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "活动节点巡检间隔不能小于 30 秒"})
+		return
+	}
 	if s.WebPassword == "" {
 		s.WebPassword = current.WebPassword
 	} else if !configure.IsWebPasswordHashed(s.WebPassword) {

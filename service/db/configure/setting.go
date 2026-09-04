@@ -1,7 +1,9 @@
 package configure
 
 import (
+	"encoding/json"
 	"strings"
+	"sync"
 
 	"github.com/ProxyStation/proxystation/db"
 	"golang.org/x/crypto/bcrypt"
@@ -10,6 +12,13 @@ import (
 const (
 	DefaultWebUsername = "admin"
 	DefaultWebPassword = "admin"
+)
+
+var (
+	defaultWebPasswordHashOnce  sync.Once
+	defaultWebPasswordHashValue string
+	settingCacheMu              sync.RWMutex
+	settingCache                *Setting
 )
 
 type Setting struct {
@@ -48,6 +57,10 @@ type Setting struct {
 	GroupSwitchThresholdMs int `json:"groupSwitchThresholdMs,omitempty"`
 	// 分组出站切换冷却时间（秒），冷却期内不重复切换
 	GroupSwitchCooldownSec int `json:"groupSwitchCooldownSec,omitempty"`
+	// 已绑定分组出站的活动节点真连接巡检。指针用于区分旧配置未设置和显式关闭。
+	GroupActiveNodeProbeEnabled *bool `json:"groupActiveNodeProbeEnabled,omitempty"`
+	// 活动节点真连接巡检间隔（秒）
+	GroupActiveNodeProbeIntervalSec int `json:"groupActiveNodeProbeIntervalSec,omitempty"`
 	// 定期清理失效节点规则。每条规则可选择多个来源分组。
 	NodeCleanupRules []NodeCleanupRule `json:"nodeCleanupRules,omitempty"`
 	// 旧版单规则字段，保留用于升级迁移。
@@ -76,6 +89,51 @@ type Setting struct {
 	// Web 管理端认证
 	WebUsername string `json:"webUsername,omitempty"`
 	WebPassword string `json:"webPassword,omitempty"`
+}
+
+type WebAuthConfig struct {
+	Username string
+	Password string
+}
+
+type ProbeConfig struct {
+	KernelMode                    string
+	Targets                       string
+	Mode                          string
+	Concurrency                   int
+	IntervalSec                   int
+	SwitchThresholdMs             int
+	SwitchCooldownSec             int
+	ActiveNodeProbeEnabled        bool
+	ActiveNodeProbeIntervalSec    int
+	SubscriptionBestNodeCopyRules []SubscriptionNodeCopyRule
+}
+
+type DownloadConfig struct {
+	Proxy  string
+	Mirror string
+}
+
+type SchedulerConfig struct {
+	SubscriptionAutoUpdateMode         string
+	SubscriptionAutoUpdateIntervalHour int
+	NodeCleanupRules                   []NodeCleanupRule
+}
+
+type IPScoreConfig struct {
+	Enabled       bool
+	Provider      string
+	Endpoint      string
+	MinIntervalMs int
+}
+
+type InboundConfig struct {
+	Socks5Port     int
+	HttpPort       int
+	Socks5Sniff    bool
+	HttpSniff      bool
+	Socks5Accounts []InboundAccount
+	HttpAccounts   []InboundAccount
 }
 
 // 订阅节点复制方式
@@ -120,10 +178,7 @@ func (r SubscriptionNodeCopyRule) CopyCount() int {
 }
 
 func NewSetting() *Setting {
-	defaultPassword, err := HashWebPassword(DefaultWebPassword)
-	if err != nil {
-		panic(err)
-	}
+	activeNodeProbeEnabled := true
 	return &Setting{
 		LogLevel:                           "info",
 		KernelMode:                         "auto",
@@ -144,13 +199,15 @@ func NewSetting() *Setting {
 		GroupProbeMode:                     "real",
 		GroupSwitchThresholdMs:             100,
 		GroupSwitchCooldownSec:             600,
+		GroupActiveNodeProbeEnabled:        &activeNodeProbeEnabled,
+		GroupActiveNodeProbeIntervalSec:    180,
 		NodeCleanupMode:                    "real",
 		NodeCleanupIntervalHour:            24,
 		IPScoreEnabled:                     false,
 		IPScoreProvider:                    "cleanip",
 		IPScoreMinIntervalMs:               1500,
 		WebUsername:                        DefaultWebUsername,
-		WebPassword:                        defaultPassword,
+		WebPassword:                        defaultWebPasswordHash(),
 	}
 }
 
@@ -170,7 +227,29 @@ func (s *Setting) HttpSniffOn() bool {
 	return s.EnableSniff
 }
 
+func (s *Setting) GroupActiveNodeProbeOn() bool {
+	return s != nil && s.GroupActiveNodeProbeEnabled != nil && *s.GroupActiveNodeProbeEnabled
+}
+
 func GetSettingNotNil() *Setting {
+	settingCacheMu.RLock()
+	if settingCache != nil {
+		cached := cloneSetting(settingCache)
+		settingCacheMu.RUnlock()
+		return cached
+	}
+	settingCacheMu.RUnlock()
+
+	settingCacheMu.Lock()
+	defer settingCacheMu.Unlock()
+	if settingCache != nil {
+		return cloneSetting(settingCache)
+	}
+	settingCache = loadSettingNotNil()
+	return cloneSetting(settingCache)
+}
+
+func loadSettingNotNil() *Setting {
 	s := NewSetting()
 	_ = db.Get("system", "setting", s)
 	changed := false
@@ -208,6 +287,15 @@ func GetSettingNotNil() *Setting {
 	}
 	if s.GroupSwitchCooldownSec < 0 {
 		s.GroupSwitchCooldownSec = 600
+		changed = true
+	}
+	if s.GroupActiveNodeProbeEnabled == nil {
+		enabled := true
+		s.GroupActiveNodeProbeEnabled = &enabled
+		changed = true
+	}
+	if s.GroupActiveNodeProbeIntervalSec <= 0 {
+		s.GroupActiveNodeProbeIntervalSec = 180
 		changed = true
 	}
 	if s.NodeCleanupMode != "fast" && s.NodeCleanupMode != "real" {
@@ -295,15 +383,134 @@ func migrateNodeCopyRules(rules []SubscriptionNodeCopyRule) bool {
 }
 
 func SetSetting(s *Setting) error {
-	return db.Set("system", "setting", s)
+	if err := db.Set("system", "setting", s); err != nil {
+		return err
+	}
+	normalized := loadSettingNotNil()
+	settingCacheMu.Lock()
+	settingCache = normalized
+	settingCacheMu.Unlock()
+	return nil
 }
 
-func (s *Setting) WebPasswordOrDefault() string {
-	hashed, err := HashWebPassword(DefaultWebPassword)
+func GetWebAuthConfig() WebAuthConfig {
+	s := cachedSetting()
+	return WebAuthConfig{Username: s.WebUsername, Password: s.WebPassword}
+}
+
+func GetProbeConfig() ProbeConfig {
+	s := cachedSetting()
+	return ProbeConfig{
+		KernelMode:                    s.KernelMode,
+		Targets:                       s.ProbeTargets,
+		Mode:                          s.GroupProbeMode,
+		Concurrency:                   s.GroupProbeConcurrency,
+		IntervalSec:                   s.GroupRealProbeIntervalSec,
+		SwitchThresholdMs:             s.GroupSwitchThresholdMs,
+		SwitchCooldownSec:             s.GroupSwitchCooldownSec,
+		ActiveNodeProbeEnabled:        s.GroupActiveNodeProbeOn(),
+		ActiveNodeProbeIntervalSec:    s.GroupActiveNodeProbeIntervalSec,
+		SubscriptionBestNodeCopyRules: cloneSubscriptionNodeCopyRules(s.SubscriptionBestNodeCopyRules),
+	}
+}
+
+func GetDownloadConfig() DownloadConfig {
+	s := cachedSetting()
+	return DownloadConfig{Proxy: s.DownloadProxy, Mirror: s.GithubMirror}
+}
+
+func GetSchedulerConfig() SchedulerConfig {
+	s := cachedSetting()
+	return SchedulerConfig{
+		SubscriptionAutoUpdateMode:         s.SubscriptionAutoUpdateMode,
+		SubscriptionAutoUpdateIntervalHour: s.SubscriptionAutoUpdateIntervalHour,
+		NodeCleanupRules:                   cloneNodeCleanupRules(s.NodeCleanupRules),
+	}
+}
+
+func GetIPScoreConfig() IPScoreConfig {
+	s := cachedSetting()
+	return IPScoreConfig{
+		Enabled:       s.IPScoreEnabled,
+		Provider:      s.IPScoreProvider,
+		Endpoint:      s.IPScoreEndpoint,
+		MinIntervalMs: s.IPScoreMinIntervalMs,
+	}
+}
+
+func GetInboundConfig() InboundConfig {
+	s := cachedSetting()
+	return InboundConfig{
+		Socks5Port:     s.Socks5Port,
+		HttpPort:       s.HttpPort,
+		Socks5Sniff:    s.Socks5SniffOn(),
+		HttpSniff:      s.HttpSniffOn(),
+		Socks5Accounts: cloneInboundAccounts(s.Socks5AuthAccounts()),
+		HttpAccounts:   cloneInboundAccounts(s.HTTPAuthAccounts()),
+	}
+}
+
+func cachedSetting() *Setting {
+	settingCacheMu.RLock()
+	if settingCache != nil {
+		s := settingCache
+		settingCacheMu.RUnlock()
+		return s
+	}
+	settingCacheMu.RUnlock()
+	GetSettingNotNil()
+	settingCacheMu.RLock()
+	s := settingCache
+	settingCacheMu.RUnlock()
+	return s
+}
+
+func cloneSetting(s *Setting) *Setting {
+	if s == nil {
+		return nil
+	}
+	data, err := json.Marshal(s)
 	if err != nil {
 		panic(err)
 	}
-	return hashed
+	var cloned Setting
+	if err := json.Unmarshal(data, &cloned); err != nil {
+		panic(err)
+	}
+	return &cloned
+}
+
+func cloneNodeCleanupRules(rules []NodeCleanupRule) []NodeCleanupRule {
+	return append([]NodeCleanupRule(nil), rules...)
+}
+
+func cloneSubscriptionNodeCopyRules(rules []SubscriptionNodeCopyRule) []SubscriptionNodeCopyRule {
+	cloned := make([]SubscriptionNodeCopyRule, len(rules))
+	for i, rule := range rules {
+		cloned[i] = rule
+		cloned[i].SourceGroupIDs = append([]string(nil), rule.SourceGroupIDs...)
+		cloned[i].TargetGroupIDs = append([]string(nil), rule.TargetGroupIDs...)
+	}
+	return cloned
+}
+
+func cloneInboundAccounts(accounts []InboundAccount) []InboundAccount {
+	return append([]InboundAccount(nil), accounts...)
+}
+
+func (s *Setting) WebPasswordOrDefault() string {
+	return defaultWebPasswordHash()
+}
+
+func defaultWebPasswordHash() string {
+	defaultWebPasswordHashOnce.Do(func() {
+		hashed, err := HashWebPassword(DefaultWebPassword)
+		if err != nil {
+			panic(err)
+		}
+		defaultWebPasswordHashValue = hashed
+	})
+	return defaultWebPasswordHashValue
 }
 
 func IsWebPasswordHashed(password string) bool {

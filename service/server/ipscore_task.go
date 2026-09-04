@@ -69,11 +69,11 @@ func startIPScoreTask(refs []configure.NodeRef) error {
 }
 
 func startIPScoreTaskSerialized(refs []configure.NodeRef) error {
-	setting := configure.GetSettingNotNil()
-	if !setting.IPScoreEnabled {
+	ipScoreConfig := configure.GetIPScoreConfig()
+	if !ipScoreConfig.Enabled {
 		return fmt.Errorf("IP 评分未启用，请先在设置中开启并选择服务商")
 	}
-	provider, endpoint, err := ipscore.ValidateSettings(setting.IPScoreProvider, setting.IPScoreEndpoint)
+	provider, endpoint, err := ipscore.ValidateSettings(ipScoreConfig.Provider, ipScoreConfig.Endpoint)
 	if err != nil {
 		return err
 	}
@@ -102,7 +102,7 @@ func startIPScoreTaskSerialized(refs []configure.NodeRef) error {
 	opt := ipscore.Options{
 		Provider:    provider,
 		Endpoint:    endpoint,
-		MinInterval: time.Duration(setting.IPScoreMinIntervalMs) * time.Millisecond,
+		MinInterval: time.Duration(ipScoreConfig.MinIntervalMs) * time.Millisecond,
 		Timeout:     20 * time.Second,
 	}
 
@@ -116,8 +116,7 @@ func queueIPScoreTask(refs []configure.NodeRef) error {
 	if len(refs) == 0 {
 		return nil
 	}
-	setting := configure.GetSettingNotNil()
-	if !setting.IPScoreEnabled {
+	if !configure.GetIPScoreConfig().Enabled {
 		return nil
 	}
 
@@ -139,6 +138,7 @@ func runIPScoreTask(client *ipscore.Client, refs []configure.NodeRef, opt ipscor
 
 	// 同一地址只查一次：同一个落地 IP 的多个节点没必要重复消耗外部额度
 	cache := map[string]ipscore.Result{}
+	pendingScores := make([]ipScoreUpdate, 0, len(refs))
 	failed := 0
 	canceled := false
 
@@ -173,11 +173,13 @@ func runIPScoreTask(client *ipscore.Client, refs []configure.NodeRef, opt ipscor
 		if res.Err != nil {
 			failed++
 			errMsg = res.Err.Error()
-		} else if err := saveIPScore(ref, res); err != nil {
-			failed++
-			errMsg = fmt.Sprintf("保存评分失败：%v", err)
+		} else {
+			pendingScores = append(pendingScores, ipScoreUpdate{ref: ref, result: res})
 		}
 		bumpIPScoreProgress(host, failed, errMsg)
+	}
+	if err := saveIPScores(pendingScores); err != nil {
+		addLog(fmt.Sprintf("⚠️ 批量保存 IP 评分失败：%v", err))
 	}
 
 	ipScoreTask.mu.Lock()
@@ -203,6 +205,11 @@ func runIPScoreTask(client *ipscore.Client, refs []configure.NodeRef, opt ipscor
 			}
 		}()
 	}
+}
+
+type ipScoreUpdate struct {
+	ref    configure.NodeRef
+	result ipscore.Result
 }
 
 func uniqueNodeRefs(refs []configure.NodeRef) []configure.NodeRef {
@@ -252,7 +259,14 @@ func bumpIPScoreProgress(host string, failed int, errMsg string) {
 
 // saveIPScore 把评分写回节点。失败结果不落库，保留上一次的有效评分。
 func saveIPScore(ref configure.NodeRef, res ipscore.Result) error {
-	apply := func(s *configure.ServerRaw) {
+	return saveIPScores([]ipScoreUpdate{{ref: ref, result: res}})
+}
+
+func saveIPScores(updates []ipScoreUpdate) error {
+	if len(updates) == 0 {
+		return nil
+	}
+	apply := func(s *configure.ServerRaw, res ipscore.Result) {
 		score := res.Score
 		s.IPScore = &score
 		s.IPScoreGrade = res.Grade
@@ -267,12 +281,32 @@ func saveIPScore(ref configure.NodeRef, res ipscore.Result) error {
 			s.IPGeoCity = res.City
 		}
 	}
-	switch ref.Type {
-	case "server":
-		return configure.UpdateServer(ref.Index, apply)
-	case "sub_server":
-		return configure.UpdateSubscriptionServer(ref.Sub, ref.Index, apply)
-	default:
-		return fmt.Errorf("不支持的节点类型 %q", ref.Type)
+	serverUpdates := make(map[int]func(*configure.ServerRaw))
+	subscriptionUpdates := make(map[int]map[int]func(*configure.ServerRaw))
+	for _, item := range updates {
+		item := item
+		update := func(server *configure.ServerRaw) {
+			apply(server, item.result)
+		}
+		switch item.ref.Type {
+		case "server":
+			serverUpdates[item.ref.Index] = update
+		case "sub_server":
+			if subscriptionUpdates[item.ref.Sub] == nil {
+				subscriptionUpdates[item.ref.Sub] = make(map[int]func(*configure.ServerRaw))
+			}
+			subscriptionUpdates[item.ref.Sub][item.ref.Index] = update
+		default:
+			return fmt.Errorf("不支持的节点类型 %q", item.ref.Type)
+		}
 	}
+	if err := configure.UpdateServers(serverUpdates); err != nil {
+		return err
+	}
+	for subIndex, subUpdates := range subscriptionUpdates {
+		if err := configure.UpdateSubscriptionServers(subIndex, subUpdates); err != nil {
+			return err
+		}
+	}
+	return nil
 }

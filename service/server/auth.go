@@ -49,8 +49,8 @@ func login(c *gin.Context) {
 		return
 	}
 
-	setting := configure.GetSettingNotNil()
-	if !validCredentialPair(setting, req.Username, req.Password) {
+	authConfig := configure.GetWebAuthConfig()
+	if !validCredentialPair(authConfig.Username, authConfig.Password, req.Username, req.Password) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "用户名或密码错误"})
 		return
 	}
@@ -65,7 +65,7 @@ func login(c *gin.Context) {
 	expiresAt := now.Add(authSessionTTL)
 	session := &configure.Session{
 		SessionID:  sessionID,
-		Username:   setting.WebUsername,
+		Username:   authConfig.Username,
 		ExpiresAt:  expiresAt,
 		LastAccess: now,
 	}
@@ -78,7 +78,7 @@ func login(c *gin.Context) {
 	c.SetCookie(authCookieName, sessionID, int(authSessionTTL.Seconds()), "/", "", false, true)
 	c.JSON(http.StatusOK, gin.H{
 		"ok":       true,
-		"username": setting.WebUsername,
+		"username": authConfig.Username,
 		"expires":  expiresAt.Unix(),
 	})
 }
@@ -111,8 +111,8 @@ func changePassword(c *gin.Context) {
 		return
 	}
 
-	setting := configure.GetSettingNotNil()
-	if !configure.VerifyWebPassword(setting.WebPassword, req.OldPassword) {
+	authConfig := configure.GetWebAuthConfig()
+	if !configure.VerifyWebPassword(authConfig.Password, req.OldPassword) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "旧密码错误"})
 		return
 	}
@@ -122,6 +122,7 @@ func changePassword(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "密码加密失败"})
 		return
 	}
+	setting := configure.GetSettingNotNil()
 	setting.WebPassword = hashed
 	if err := configure.SetSetting(setting); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -169,8 +170,8 @@ func validateSession(c *gin.Context) (string, bool) {
 	}
 
 	now := time.Now()
-	setting := configure.GetSettingNotNil()
-	if !sessionIsValid(session, setting.WebUsername, now) {
+	authConfig := configure.GetWebAuthConfig()
+	if !sessionIsValid(session, authConfig.Username, now) {
 		_ = configure.DeleteSession(sessionID)
 		return "", false
 	}
@@ -188,8 +189,8 @@ func validateSession(c *gin.Context) (string, bool) {
 		return "", false
 	}
 	now = time.Now()
-	setting = configure.GetSettingNotNil()
-	if !sessionIsValid(session, setting.WebUsername, now) {
+	authConfig = configure.GetWebAuthConfig()
+	if !sessionIsValid(session, authConfig.Username, now) {
 		_ = configure.DeleteSession(sessionID)
 		return "", false
 	}
@@ -216,9 +217,9 @@ func sessionIsValid(session *configure.Session, username string, now time.Time) 
 	return session.Username == username
 }
 
-func validCredentialPair(setting *configure.Setting, username string, password string) bool {
-	return subtle.ConstantTimeCompare([]byte(strings.TrimSpace(username)), []byte(strings.TrimSpace(setting.WebUsername))) == 1 &&
-		configure.VerifyWebPassword(setting.WebPassword, password)
+func validCredentialPair(configuredUsername, configuredPassword, username, password string) bool {
+	return subtle.ConstantTimeCompare([]byte(strings.TrimSpace(username)), []byte(strings.TrimSpace(configuredUsername))) == 1 &&
+		configure.VerifyWebPassword(configuredPassword, password)
 }
 
 func newSessionID() (string, error) {

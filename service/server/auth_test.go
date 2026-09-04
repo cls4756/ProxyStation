@@ -1,6 +1,8 @@
 package server
 
 import (
+	"bytes"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -32,6 +34,45 @@ func authTestContext(sessionID string) (*gin.Context, *httptest.ResponseRecorder
 	request.AddCookie(&http.Cookie{Name: authCookieName, Value: sessionID})
 	context.Request = request
 	return context, recorder
+}
+
+func TestLoginReturnsAndPersistsSession(t *testing.T) {
+	setupAuthTestDB(t)
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	requestBody, err := json.Marshal(map[string]string{
+		"username": configure.DefaultWebUsername,
+		"password": configure.DefaultWebPassword,
+	})
+	if err != nil {
+		t.Fatalf("marshal login request: %v", err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewReader(requestBody))
+	request.Header.Set("Content-Type", "application/json")
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = request
+
+	done := make(chan struct{})
+	go func() {
+		login(context)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("login did not return within 5 seconds")
+	}
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("login status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	cookie := recorder.Result().Cookies()
+	if len(cookie) != 1 || cookie[0].Name != authCookieName || cookie[0].Value == "" {
+		t.Fatalf("login did not set a session cookie: %v", cookie)
+	}
+	if _, err := configure.GetSession(cookie[0].Value); err != nil {
+		t.Fatalf("login did not persist session: %v", err)
+	}
 }
 
 func TestValidateSessionSkipsFreshSessionWrite(t *testing.T) {
