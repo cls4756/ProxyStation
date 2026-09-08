@@ -42,6 +42,9 @@ var (
 	logQueue              = make(chan queuedLogEntry, 1024)
 	logDroppedCount int
 	logWorkerOnce   sync.Once
+	restartMu       sync.Mutex
+	restartRunning  bool
+	restartPending  string
 )
 
 func init() {
@@ -1565,18 +1568,19 @@ func copyServerToGroup(c *gin.Context) {
 	ref := req.Ref
 	clone := req.Clone == nil || *req.Clone
 	if clone {
-		server := serverRawByServerRef(req.Ref)
-		if server == nil {
+		snapshots := loadServerRefSnapshots(append(append([]configure.ServerRef{}, group.Servers...), req.Ref))
+		server, ok := snapshots[req.Ref]
+		if !ok {
 			c.JSON(http.StatusNotFound, gin.H{"error": "server not found"})
 			return
 		}
 		// 检查目标分组内是否已有配置相同的节点（不比较名称）
-		if groupHasServerRaw(group.Servers, *server) {
+		if groupHasServerRaw(group.Servers, server, snapshots) {
 			c.JSON(http.StatusOK, gin.H{"ok": true, "skipped": true, "groupId": group.ID, "groupServerCount": len(group.Servers)})
 			return
 		}
 		// 每次都创建新的独立副本，不复用已有节点
-		localRef, ok := createLocalServerCopy(*server)
+		localRef, ok := createLocalServerCopy(server)
 		if !ok {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "clone server failed"})
 			return
@@ -1611,18 +1615,20 @@ func batchCopyServersToGroup(c *gin.Context) {
 	manualCount := configure.GetLenServers()
 	clones := make([]*configure.ServerRaw, 0, len(req.Refs))
 	pending := make([]configure.ServerRaw, 0, len(req.Refs))
+	allRefs := append(append([]configure.ServerRef{}, group.Servers...), req.Refs...)
+	snapshots := loadServerRefSnapshots(allRefs)
 	for _, sourceRef := range req.Refs {
 		ref := sourceRef
 		if clone {
-			server := serverRawByServerRef(sourceRef)
-			if server == nil {
+			server, ok := snapshots[sourceRef]
+			if !ok {
 				c.JSON(http.StatusNotFound, gin.H{"error": "server not found"})
 				return
 			}
-			if groupHasServerRaw(group.Servers, *server) || serverListHasConfig(pending, *server) {
+			if groupHasServerRaw(group.Servers, server, snapshots) || serverListHasConfig(pending, server) {
 				continue
 			}
-			copy := localServerCopy(*server)
+			copy := localServerCopy(server)
 			ref = configure.ServerRef{Type: "server", Index: manualCount + len(clones)}
 			clones = append(clones, &copy)
 			pending = append(pending, copy)
@@ -1685,26 +1691,47 @@ func batchMoveServersToGroup(c *gin.Context) {
 	})
 }
 
-func serverRawByServerRef(ref configure.ServerRef) *configure.ServerRaw {
-	switch ref.Type {
-	case "server":
-		return configure.GetServer(ref.Index)
-	case "sub_server":
-		sub := configure.GetSubscription(ref.Sub)
-		if sub == nil || ref.Index < 0 || ref.Index >= len(sub.Servers) {
-			return nil
+func loadServerRefSnapshots(refs []configure.ServerRef) map[configure.ServerRef]configure.ServerRaw {
+	result := make(map[configure.ServerRef]configure.ServerRaw, len(refs))
+	manualIndexes := make([]int, 0)
+	subscriptionIndexes := make([]int, 0)
+	seenManual := make(map[int]struct{})
+	seenSubscription := make(map[int]struct{})
+	for _, ref := range refs {
+		switch ref.Type {
+		case "server":
+			if _, ok := seenManual[ref.Index]; !ok {
+				seenManual[ref.Index] = struct{}{}
+				manualIndexes = append(manualIndexes, ref.Index)
+			}
+		case "sub_server":
+			if _, ok := seenSubscription[ref.Sub]; !ok {
+				seenSubscription[ref.Sub] = struct{}{}
+				subscriptionIndexes = append(subscriptionIndexes, ref.Sub)
+			}
 		}
-		return &sub.Servers[ref.Index]
-	default:
-		return nil
 	}
+	servers := configure.GetServersByIndexes(manualIndexes)
+	subscriptions := configure.GetSubscriptionsByIndexes(subscriptionIndexes)
+	for _, ref := range refs {
+		switch ref.Type {
+		case "server":
+			if server, ok := servers[ref.Index]; ok {
+				result[ref] = server
+			}
+		case "sub_server":
+			if sub, ok := subscriptions[ref.Sub]; ok && ref.Index >= 0 && ref.Index < len(sub.Servers) {
+				result[ref] = sub.Servers[ref.Index]
+			}
+		}
+	}
+	return result
 }
 
 // createLocalServerCopy 创建节点的新副本（不复用已有节点）
 func createLocalServerCopy(server configure.ServerRaw) (configure.ServerRef, bool) {
 	server = localServerCopy(server)
-	servers := configure.GetServers()
-	index := len(servers)
+	index := configure.GetLenServers()
 	if err := configure.AppendServers([]*configure.ServerRaw{&server}); err != nil {
 		return configure.ServerRef{}, false
 	}
@@ -1717,10 +1744,9 @@ func localServerCopy(server configure.ServerRaw) configure.ServerRaw {
 }
 
 // groupHasServerRaw 检查分组内是否已有配置相同的节点（不比较名称）
-func groupHasServerRaw(refs []configure.ServerRef, server configure.ServerRaw) bool {
+func groupHasServerRaw(refs []configure.ServerRef, server configure.ServerRaw, snapshots map[configure.ServerRef]configure.ServerRaw) bool {
 	for _, ref := range refs {
-		existing := serverRawByServerRef(ref)
-		if existing != nil && sameServerConfig(*existing, server) {
+		if existing, ok := snapshots[ref]; ok && sameServerConfig(existing, server) {
 			return true
 		}
 	}
@@ -2533,7 +2559,7 @@ func renameOutbound(c *gin.Context) {
 	observatory.OnOutboundUpdated(newName)
 	// 出站 tag 变了，运行中的配置引用的是旧 tag，必须重建
 	if engine.Manager.IsRunning() {
-		_ = engine.Manager.Restart()
+		restartEngineAsync(fmt.Sprintf("出站重命名（%s -> %s）", oldName, newName))
 	}
 	addLog(fmt.Sprintf("✏️ 出站已重命名：%s -> %s", oldName, newName))
 	c.JSON(http.StatusOK, gin.H{"outbound": configure.GetOutbound(newName)})
@@ -2546,6 +2572,37 @@ func groupContainsNodeRef(refs []configure.ServerRef, target configure.NodeRef) 
 		}
 	}
 	return false
+}
+
+func restartEngineAsync(reason string) {
+	restartMu.Lock()
+	restartPending = strings.TrimSpace(reason)
+	if restartRunning {
+		restartMu.Unlock()
+		return
+	}
+	restartRunning = true
+	restartMu.Unlock()
+	go func() {
+		for {
+			restartMu.Lock()
+			reason := restartPending
+			restartPending = ""
+			restartMu.Unlock()
+			if reason != "" && engine.Manager.IsRunning() {
+				if err := engine.Manager.RestartWithReason(reason); err != nil {
+					addLog(fmt.Sprintf("❌ 代理异步重启失败（原因：%s）：%v", reason, err))
+				}
+			}
+			restartMu.Lock()
+			if restartPending == "" {
+				restartRunning = false
+				restartMu.Unlock()
+				return
+			}
+			restartMu.Unlock()
+		}
+	}()
 }
 
 func connectOutbound(c *gin.Context) {
@@ -2631,7 +2688,7 @@ func connectOutbound(c *gin.Context) {
 	observatory.OnOutboundUpdated(name)
 	// 如果代理正在运行，重新生成配置
 	if engine.Manager.IsRunning() {
-		_ = engine.Manager.Restart()
+		restartEngineAsync(fmt.Sprintf("出站连接配置变更（出站：%s）", name))
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
@@ -2664,13 +2721,13 @@ func setOutboundActiveNode(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"ok": true, "outbound": o})
 		return
 	}
-	_, err := engine.Manager.UpdateAndRestart(func() (bool, error) {
+	_, err := engine.Manager.UpdateAndRestartWithReason(func() (bool, error) {
 		if err := configure.SetOutboundActiveNode(name, &req.Ref); err != nil {
 			return false, err
 		}
 		observatory.MarkManualSwitch(name)
 		return true, nil
-	})
+	}, fmt.Sprintf("手动切换出站活动节点（出站：%s）", name))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -2693,7 +2750,7 @@ func disconnectOutbound(c *gin.Context) {
 	observatory.OnOutboundUpdated(name)
 	// 断开连接后重启代理，使配置生效
 	if engine.Manager.IsRunning() {
-		_ = engine.Manager.Restart()
+		restartEngineAsync(fmt.Sprintf("断开出站（出站：%s）", name))
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
@@ -3222,10 +3279,7 @@ func setSetting(c *gin.Context) {
 	observatory.Reload()
 	// 设置变更后，若内核正在运行则自动重启使配置生效
 	if engine.Manager.IsRunning() {
-		if err := engine.Manager.Restart(); err != nil {
-			c.JSON(http.StatusOK, gin.H{"ok": true, "warning": "设置已保存，但重启内核失败: " + err.Error()})
-			return
-		}
+		restartEngineAsync("全局设置变更")
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
@@ -3626,7 +3680,7 @@ func setRoutingRules(c *gin.Context) {
 	}
 	// 重启代理使规则生效
 	if engine.Manager.IsRunning() {
-		_ = engine.Manager.Restart()
+		restartEngineAsync("路由规则修改")
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
@@ -3676,7 +3730,7 @@ func importRoutingRules(c *gin.Context) {
 
 	// 重启代理使规则生效
 	if engine.Manager.IsRunning() {
-		_ = engine.Manager.Restart()
+		restartEngineAsync("路由规则导入")
 	}
 
 	c.JSON(http.StatusOK, gin.H{"ok": true, "count": len(rules)})
@@ -3794,7 +3848,7 @@ func setCustomInbounds(c *gin.Context) {
 	rebuildInboundProxyServers(inbounds)
 	// 重启代理使入站生效
 	if engine.Manager.IsRunning() {
-		_ = engine.Manager.Restart()
+		restartEngineAsync("自定义入站配置变更")
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }

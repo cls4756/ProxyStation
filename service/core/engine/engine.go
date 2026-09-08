@@ -134,6 +134,7 @@ func (em *EngineManager) start() error {
 	var binPath string
 	var args []string
 	var err error
+	var singboxConfigJSON string
 
 	switch kernel {
 	case KernelSingbox:
@@ -152,13 +153,11 @@ func (em *EngineManager) start() error {
 			_ = configure.SetRunning(false)
 			return fmt.Errorf("build singbox config: %w", e)
 		}
-		// 打印配置到日志
 		if cfgJSON, err := json.MarshalIndent(cfg, "", "  "); err == nil {
-			if LogCallback != nil {
-				LogCallback(fmt.Sprintf("📋 Singbox 配置:\n%s", string(cfgJSON)))
-			}
+			singboxConfigJSON = string(cfgJSON)
 		}
 		if e := writeJSON(cfg, configPath); e != nil {
+			logSingboxConfigOnStartFailure(singboxConfigJSON)
 			em.running = false
 			_ = configure.SetRunning(false)
 			return fmt.Errorf("write singbox config: %w", e)
@@ -260,6 +259,7 @@ func (em *EngineManager) start() error {
 
 	if err := cmd.Start(); err != nil {
 		cancel()
+		logSingboxConfigOnStartFailure(singboxConfigJSON)
 		em.running = false
 		_ = configure.SetRunning(false)
 		return fmt.Errorf("start %v: %w", kernel, explainKernelStartError(binPath, err))
@@ -271,6 +271,7 @@ func (em *EngineManager) start() error {
 	// 等待 socks5 端口就绪（首次启动需要下载 rule-set，给更长时间）
 	addr := fmt.Sprintf("127.0.0.1:%d", setting.Socks5Port)
 	if err := waitPort(addr, 60*time.Second); err != nil {
+		logSingboxConfigOnStartFailure(singboxConfigJSON)
 		// 启动失败，清理进程
 		if em.cancel != nil {
 			em.cancel()
@@ -337,21 +338,28 @@ func (em *EngineManager) stopLocked() {
 }
 
 func (em *EngineManager) Restart() error {
-	em.lifecycleMu.Lock()
-	defer em.lifecycleMu.Unlock()
-	return em.restart()
+	return em.RestartWithReason("未注明原因")
 }
 
-func (em *EngineManager) restart() error {
+func (em *EngineManager) RestartWithReason(reason string) error {
+	em.lifecycleMu.Lock()
+	defer em.lifecycleMu.Unlock()
+	return em.restart(strings.TrimSpace(reason))
+}
+
+func (em *EngineManager) restart(reason string) error {
+	if reason == "" {
+		reason = "未注明原因"
+	}
 	// 检查实际的进程状态而不是数据库状态
 	if !em.IsRunning() {
 		if LogCallback != nil {
-			LogCallback("⚠️ 代理未运行，跳过重启")
+			LogCallback(fmt.Sprintf("⚠️ 代理未运行，跳过重启（原因：%s）", reason))
 		}
 		return nil
 	}
 	if LogCallback != nil {
-		LogCallback("🔄 开始重启代理...")
+		LogCallback(fmt.Sprintf("🔄 开始重启代理（原因：%s）...", reason))
 	}
 	if err := em.start(); err != nil {
 		// 重启失败时，确保状态被设置为未运行
@@ -367,10 +375,20 @@ func (em *EngineManager) restart() error {
 	return nil
 }
 
+func logSingboxConfigOnStartFailure(config string) {
+	if config != "" && LogCallback != nil {
+		LogCallback(fmt.Sprintf("📋 Singbox 配置（启动失败诊断）:\n%s", config))
+	}
+}
+
 // UpdateAndRestart serializes a configuration update with a possible restart.
 // The callback runs after active main-probe users finish and before new users
 // can enter. It returns whether the update requires a restart.
 func (em *EngineManager) UpdateAndRestart(update func() (bool, error)) (bool, error) {
+	return em.UpdateAndRestartWithReason(update, "配置变更")
+}
+
+func (em *EngineManager) UpdateAndRestartWithReason(update func() (bool, error), reason string) (bool, error) {
 	em.lifecycleMu.Lock()
 	defer em.lifecycleMu.Unlock()
 
@@ -378,7 +396,7 @@ func (em *EngineManager) UpdateAndRestart(update func() (bool, error)) (bool, er
 	if err != nil || !changed {
 		return changed, err
 	}
-	return true, em.restart()
+	return true, em.restart(strings.TrimSpace(reason))
 }
 
 // IsRunning 检查实际的进程状态（不依赖数据库）

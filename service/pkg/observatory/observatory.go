@@ -95,6 +95,9 @@ var logCallback func(string)
 var frontFailoverMu sync.Mutex
 var activeNodeProbeMu sync.Mutex
 var scheduledProbeSem = make(chan struct{}, maxScheduledProbeConcurrency)
+var scheduledProbeStateMu sync.Mutex
+var scheduledProbeOwner string
+var scheduledProbeStartedAt time.Time
 
 func SetLogCallback(cb func(string)) {
 	logCallback = cb
@@ -279,13 +282,49 @@ func (obs *Observatory) startTask(name string, o *configure.Outbound) {
 }
 
 func runScheduledProbe(name string) {
+	if !tryAcquireScheduledProbe(name) {
+		addLog(fmt.Sprintf("⏭️ [%s] 后台探测仍在执行（当前：%s），跳过本轮，避免堆积", name, scheduledProbeBusyMessage()))
+		return
+	}
+	defer releaseScheduledProbe()
+	probeAndUpdate(name)
+}
+
+func tryAcquireScheduledProbe(owner string) bool {
 	select {
 	case scheduledProbeSem <- struct{}{}:
-		defer func() { <-scheduledProbeSem }()
-		probeAndUpdate(name)
+		scheduledProbeStateMu.Lock()
+		scheduledProbeOwner = owner
+		scheduledProbeStartedAt = time.Now()
+		scheduledProbeStateMu.Unlock()
+		return true
 	default:
-		addLog(fmt.Sprintf("⏭️ [%s] 后台探测仍在执行，跳过本轮，避免堆积", name))
+		return false
 	}
+}
+
+func releaseScheduledProbe() {
+	scheduledProbeStateMu.Lock()
+	scheduledProbeOwner = ""
+	scheduledProbeStartedAt = time.Time{}
+	scheduledProbeStateMu.Unlock()
+	<-scheduledProbeSem
+}
+
+func scheduledProbeBusyMessage() string {
+	scheduledProbeStateMu.Lock()
+	defer scheduledProbeStateMu.Unlock()
+	if scheduledProbeOwner == "" || scheduledProbeStartedAt.IsZero() {
+		return "未知任务"
+	}
+	return fmt.Sprintf("%s，已执行%s", scheduledProbeOwner, formatElapsed(time.Since(scheduledProbeStartedAt)))
+}
+
+func formatElapsed(elapsed time.Duration) string {
+	if elapsed < time.Second {
+		return "不到 1 秒"
+	}
+	return elapsed.Round(time.Second).String()
 }
 
 // selectBestNodeFromExisting 从已有的测速数据中选择最快的节点
@@ -307,9 +346,10 @@ func selectBestNodeFromExisting(outboundName string, o *configure.Outbound) {
 	var available []probeResult
 
 	probeMode := normalizeProbeMode(o.ProbeMode)
+	latencies := loadLatencySnapshot(group.Servers, probeMode)
 	for _, ref := range group.Servers {
 		nodeRef := configure.NodeRef{Type: ref.Type, Index: ref.Index, Sub: ref.Sub}
-		latency := readLatency(nodeRef, probeMode)
+		latency := latencies[nodeRef]
 		if latency > 0 {
 			available = append(available, probeResult{ref: nodeRef, latency: latency})
 		}
@@ -320,7 +360,9 @@ func selectBestNodeFromExisting(outboundName string, o *configure.Outbound) {
 			return available[i].latency < available[j].latency
 		})
 		best := available[0]
-		_ = setOutboundActiveNodeAndRestart(outboundName, &best.ref)
+		// 这里只同步持久化的活动节点。调用方负责在需要时统一重建主内核，
+		// 避免配置变更接口先被这里重启一次、随后又重启一次。
+		_ = configure.SetOutboundActiveNode(outboundName, &best.ref)
 	}
 }
 
@@ -514,7 +556,7 @@ func probeAndUpdate(outboundName string) {
 
 	current := o.Target.ActiveNodeRef
 	if current == nil {
-		_ = setOutboundActiveNodeAndRestart(outboundName, &best.ref)
+		_ = setOutboundActiveNodeAndRestartWithReason(outboundName, &best.ref, fmt.Sprintf("原出站未选择活动节点，选择本轮测速最优节点（%dms）", best.latency))
 		markSwitched(outboundName)
 		addLog(fmt.Sprintf("🔁 [%s] 切换节点：初次选择为 %s:%d:%d (%dms)", outboundName, best.ref.Type, best.ref.Sub, best.ref.Index, best.latency))
 		return
@@ -526,9 +568,12 @@ func probeAndUpdate(outboundName string) {
 	threshold, cooldown := resolveSwitchSettings(o)
 	ok, reason := shouldSwitchWithSettings(outboundName, o.Target.Mode, *current, available, best, threshold, cooldown)
 	if ok {
-		_ = setOutboundActiveNodeAndRestart(outboundName, &best.ref)
+		if reason == "当前节点无有效延迟，允许切换" {
+			reason = fmt.Sprintf("原活动节点真连接失败或本轮测速无有效延迟，切换到可用最优节点（%dms）", best.latency)
+		}
+		_ = setOutboundActiveNodeAndRestartWithReason(outboundName, &best.ref, reason)
 		markSwitched(outboundName)
-		addLog(fmt.Sprintf("🔁 [%s] 切换节点：%s:%d:%d -> %s:%d:%d", outboundName, current.Type, current.Sub, current.Index, best.ref.Type, best.ref.Sub, best.ref.Index))
+		addLog(fmt.Sprintf("🔁 [%s] 切换节点：%s:%d:%d -> %s:%d:%d（原因：%s）", outboundName, current.Type, current.Sub, current.Index, best.ref.Type, best.ref.Sub, best.ref.Index, reason))
 	} else {
 		addLog(fmt.Sprintf("⏸ [%s] 不切换：%s", outboundName, reason))
 	}
@@ -540,13 +585,11 @@ type activeNodeActivateFunc func(string, string, configure.NodeRef, configure.No
 func probeActiveNodes() {
 	activeNodeProbeMu.Lock()
 	defer activeNodeProbeMu.Unlock()
-	select {
-	case scheduledProbeSem <- struct{}{}:
-		defer func() { <-scheduledProbeSem }()
-	default:
-		addLog("⏭️ 活动节点巡检仍有后台探测执行，跳过本轮，避免抢占用户请求")
+	if !tryAcquireScheduledProbe("活动节点巡检") {
+		addLog(fmt.Sprintf("⏭️ 活动节点巡检仍有后台探测执行（当前：%s），跳过本轮，避免抢占用户请求", scheduledProbeBusyMessage()))
 		return
 	}
+	defer releaseScheduledProbe()
 	probeActiveNodesWith(probeAndSaveActiveNode, activateFailoverNode)
 }
 
@@ -614,10 +657,10 @@ func probeActiveOutboundWithGroup(outboundName, expectedGroupID string, group *c
 	failedRef := *o.Target.ActiveNodeRef
 	latency := probeNode(failedRef)
 	if latency > 0 {
-		addLog(fmt.Sprintf("✅ [%s] 活动节点真连接正常（%dms）", outboundName, latency))
+		addLog(fmt.Sprintf("✅ [%s] 活动节点真连接正常：%s（%dms）", outboundName, formatNodeRef(failedRef), latency))
 		return
 	}
-	addLog(fmt.Sprintf("⚠️ [%s] 活动节点真连接失败，开始逐个验证故障转移候选", outboundName))
+	addLog(fmt.Sprintf("⚠️ [%s] 活动节点真连接失败：%s，开始逐个验证故障转移候选", outboundName, formatNodeRef(failedRef)))
 
 	candidates := activeNodeFailoverCandidates(o, group, failedRef)
 	for _, candidate := range candidates {
@@ -628,19 +671,21 @@ func probeActiveOutboundWithGroup(outboundName, expectedGroupID string, group *c
 			return
 		}
 
+		addLog(fmt.Sprintf("🧪 [%s] 开始测试故障转移候选：%s", outboundName, formatNodeRef(candidate.ref)))
 		candidateLatency := probeNode(candidate.ref)
 		if candidateLatency <= 0 {
+			addLog(fmt.Sprintf("❌ [%s] 候选节点真连接失败：%s", outboundName, formatNodeRef(candidate.ref)))
 			continue
 		}
+		addLog(fmt.Sprintf("✅ [%s] 候选节点真连接成功：%s（%dms）", outboundName, formatNodeRef(candidate.ref), candidateLatency))
 		changed, err := activate(outboundName, o.Target.GroupID, failedRef, candidate.ref)
 		if err != nil {
 			addLog(fmt.Sprintf("❌ [%s] 活动节点故障切换失败: %v", outboundName, err))
 			return
 		}
 		if changed {
-			addLog(fmt.Sprintf("🔁 [%s] 活动节点故障切换成功：%s:%d:%d -> %s:%d:%d（%dms）",
-				outboundName, failedRef.Type, failedRef.Sub, failedRef.Index,
-				candidate.ref.Type, candidate.ref.Sub, candidate.ref.Index, candidateLatency))
+			addLog(fmt.Sprintf("🔁 [%s] 活动节点故障切换成功：%s -> %s（%dms）",
+				outboundName, formatNodeRef(failedRef), formatNodeRef(candidate.ref), candidateLatency))
 			return
 		}
 		addLog(fmt.Sprintf("⏭️ [%s] 活动节点已变化，放弃写入本轮候选", outboundName))
@@ -747,7 +792,7 @@ func probeAndSaveActiveNode(ref configure.NodeRef) int {
 }
 
 func activateFailoverNode(outboundName, groupID string, failedRef, candidateRef configure.NodeRef) (bool, error) {
-	changed, err := engine.Manager.UpdateAndRestart(func() (bool, error) {
+	changed, err := engine.Manager.UpdateAndRestartWithReason(func() (bool, error) {
 		current := configure.GetOutbound(outboundName)
 		if current == nil || current.Target.TargetType != "group" || current.Target.GroupID != groupID ||
 			current.Target.ActiveNodeRef == nil || !nodeRefEqual(current.Target.ActiveNodeRef, &failedRef) {
@@ -762,7 +807,8 @@ func activateFailoverNode(outboundName, groupID string, failedRef, candidateRef 
 		}
 		markSwitched(outboundName)
 		return true, nil
-	})
+	}, fmt.Sprintf("原活动节点真连接失败，故障转移（出站：%s，失败节点：%s，候选节点：%s）",
+		outboundName, formatNodeRef(failedRef), formatNodeRef(candidateRef)))
 	return changed, err
 }
 
@@ -792,7 +838,7 @@ func ApplyGroupProbeResults(groupID string, mode string) []GroupSwitchOutcome {
 
 	mode = normalizeProbeMode(mode)
 	outcomes := make([]GroupSwitchOutcome, 0, 2)
-	_, _ = engine.Manager.UpdateAndRestart(func() (bool, error) {
+	_, _ = engine.Manager.UpdateAndRestartWithReason(func() (bool, error) {
 		switched := false
 		for _, name := range configure.GetOutboundNames() {
 			o := configure.GetOutbound(name)
@@ -818,7 +864,7 @@ func ApplyGroupProbeResults(groupID string, mode string) []GroupSwitchOutcome {
 			})
 		}
 		return switched, nil
-	})
+	}, fmt.Sprintf("手动分组测速切换（分组：%s）", groupID))
 	return outcomes
 }
 
@@ -1200,29 +1246,60 @@ func nodeRefEqual(a, b *configure.NodeRef) bool {
 }
 
 func readLatency(ref configure.NodeRef, mode string) int {
-	mode = normalizeProbeMode(mode)
-	switch ref.Type {
-	case "server":
-		s := configure.GetServer(ref.Index)
-		if s == nil {
-			return -1
-		}
-		if mode == "fast" {
-			return s.FastLatency
-		}
-		return s.Latency
-	case "sub_server":
-		sub := configure.GetSubscription(ref.Sub)
-		if sub == nil || ref.Index >= len(sub.Servers) {
-			return -1
-		}
-		if mode == "fast" {
-			return sub.Servers[ref.Index].FastLatency
-		}
-		return sub.Servers[ref.Index].Latency
-	default:
+	latency, ok := loadLatencySnapshot([]configure.ServerRef{
+		{Type: ref.Type, Index: ref.Index, Sub: ref.Sub},
+	}, mode)[ref]
+	if !ok {
 		return -1
 	}
+	return latency
+}
+
+func loadLatencySnapshot(refs []configure.ServerRef, mode string) map[configure.NodeRef]int {
+	result := make(map[configure.NodeRef]int, len(refs))
+	serverIndexes := make([]int, 0)
+	subscriptionIndexes := make([]int, 0)
+	seenServers := make(map[int]struct{})
+	seenSubscriptions := make(map[int]struct{})
+	for _, ref := range refs {
+		switch ref.Type {
+		case "server":
+			if _, ok := seenServers[ref.Index]; !ok {
+				seenServers[ref.Index] = struct{}{}
+				serverIndexes = append(serverIndexes, ref.Index)
+			}
+		case "sub_server":
+			if _, ok := seenSubscriptions[ref.Sub]; !ok {
+				seenSubscriptions[ref.Sub] = struct{}{}
+				subscriptionIndexes = append(subscriptionIndexes, ref.Sub)
+			}
+		}
+	}
+	servers := configure.GetServersByIndexes(serverIndexes)
+	subscriptions := configure.GetSubscriptionsByIndexes(subscriptionIndexes)
+	mode = normalizeProbeMode(mode)
+	for _, ref := range refs {
+		nodeRef := configure.NodeRef{Type: ref.Type, Index: ref.Index, Sub: ref.Sub}
+		switch ref.Type {
+		case "server":
+			if server, ok := servers[ref.Index]; ok {
+				if mode == "fast" {
+					result[nodeRef] = server.FastLatency
+				} else {
+					result[nodeRef] = server.Latency
+				}
+			}
+		case "sub_server":
+			if sub, ok := subscriptions[ref.Sub]; ok && ref.Index >= 0 && ref.Index < len(sub.Servers) {
+				if mode == "fast" {
+					result[nodeRef] = sub.Servers[ref.Index].FastLatency
+				} else {
+					result[nodeRef] = sub.Servers[ref.Index].Latency
+				}
+			}
+		}
+	}
+	return result
 }
 
 func allocProbePort() int {
@@ -1318,7 +1395,7 @@ func failoverFrontProxy(outboundName string) bool {
 	}
 	failedRef := *failedOutbound.Target.ActiveNodeRef
 
-	changed, err := engine.Manager.UpdateAndRestart(func() (bool, error) {
+	changed, err := engine.Manager.UpdateAndRestartWithReason(func() (bool, error) {
 		current := configure.GetOutbound(outboundName)
 		if current == nil || current.Target.TargetType != "group" || current.Target.ActiveNodeRef == nil {
 			return false, nil
@@ -1327,7 +1404,8 @@ func failoverFrontProxy(outboundName string) bool {
 			return false, nil
 		}
 		return markFrontProxyFailure(outboundName, failedRef), nil
-	})
+	}, fmt.Sprintf("前置出站真连接失败，故障转移（出站：%s，失败节点：%s:%d:%d）",
+		outboundName, failedRef.Type, failedRef.Sub, failedRef.Index))
 	if err != nil {
 		addLog(fmt.Sprintf("❌ [%s] 前置出站故障转移失败: %v", outboundName, err))
 		return false
@@ -1463,6 +1541,26 @@ func serverRawByRef(ref configure.NodeRef) *configure.ServerRaw {
 	}
 }
 
+func formatNodeRef(ref configure.NodeRef) string {
+	label := fmt.Sprintf("%s[index=%d,sub=%d]", ref.Type, ref.Index, ref.Sub)
+	server := serverRawByRef(ref)
+	if server == nil {
+		return label
+	}
+
+	details := make([]string, 0, 2)
+	if name := strings.TrimSpace(server.Name); name != "" {
+		details = append(details, name)
+	}
+	if host := strings.TrimSpace(server.Host); host != "" {
+		details = append(details, net.JoinHostPort(host, strconv.Itoa(server.Port)))
+	}
+	if len(details) == 0 {
+		return label
+	}
+	return fmt.Sprintf("%s（%s）", label, strings.Join(details, "，"))
+}
+
 func fastReachableRef(ref configure.NodeRef) bool {
 	return fastReachableServer(serverRawByRef(ref))
 }
@@ -1581,18 +1679,22 @@ func restartEngineIfRunning(outboundName string) {
 	if !engine.Manager.IsRunning() {
 		return
 	}
-	if err := engine.Manager.Restart(); err != nil {
+	if err := engine.Manager.RestartWithReason(fmt.Sprintf("切换节点后刷新代理（出站：%s）", outboundName)); err != nil {
 		addLog(fmt.Sprintf("❌ [%s] 切换节点后重启代理失败: %v", outboundName, err))
 	}
 }
 
 func setOutboundActiveNodeAndRestart(outboundName string, ref *configure.NodeRef) error {
-	_, err := engine.Manager.UpdateAndRestart(func() (bool, error) {
+	return setOutboundActiveNodeAndRestartWithReason(outboundName, ref, "自动切换活动节点")
+}
+
+func setOutboundActiveNodeAndRestartWithReason(outboundName string, ref *configure.NodeRef, reason string) error {
+	_, err := engine.Manager.UpdateAndRestartWithReason(func() (bool, error) {
 		if err := configure.SetOutboundActiveNode(outboundName, ref); err != nil {
 			return false, err
 		}
 		return true, nil
-	})
+	}, fmt.Sprintf("自动切换活动节点（出站：%s，%s）", outboundName, reason))
 	return err
 }
 

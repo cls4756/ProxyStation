@@ -16,6 +16,7 @@
     <!-- 节点名 -->
     <div class="row-name" @click="onNameClick">
       <span :title="server.name || '未命名'">{{ server.name || '未命名' }}</span>
+      <span class="row-ref" :title="`后端节点引用：${nodeRefText}`">{{ nodeRefText }}</span>
       <span v-if="groupNames.length" class="row-groups" :title="`所在分组：${groupNames.join('、')}`">
         分组：{{ groupNames.join('、') }}
       </span>
@@ -142,6 +143,13 @@ const connectionButtonTitle = computed(() => {
   if (!connected.value) return '连接此节点'
   const outbound = props.outbounds.find(o => o.name === props.currentOutbound)
   return outbound?.target?.targetType === 'group' ? '当前分组节点' : '断开连接'
+})
+
+const nodeRefText = computed(() => {
+  const type = props.refObj?.type || '?'
+  const index = Number.isInteger(props.refObj?.index) ? props.refObj.index : '?'
+  const sub = Number.isInteger(props.refObj?.sub) ? props.refObj.sub : 0
+  return `引用：${type}[index=${index},sub=${sub}]`
 })
 
 const frontProxyTitle = computed(() => {
@@ -353,6 +361,11 @@ const ipGeoTitle = computed(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.row-ref {
+  color: #bfbfbf;
+  font-size: 10px;
+  font-weight: 400;
 }
 .server-row-connected .row-name { color: #389e0d; font-weight: 500; }
 
