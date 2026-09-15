@@ -3500,10 +3500,19 @@ func getLogs(c *gin.Context) {
 }
 
 func resolveInboundFilter(filter string) (string, string) {
+	// "全部入站"用空字符串表示，必须保持"不过滤"。
+	// 不能落入下面的循环：只要存在 Tag 为空的自定义入站（如 cfdo/cfgoodnet），
+	// 空过滤条件就会误匹配到它，导致所有带 [from: ...] 的请求日志被过滤掉。
+	if filter == "" {
+		return "", ""
+	}
 	if filter == "socks-in" || filter == "http-in" {
 		return "", filter
 	}
 	for _, ib := range configure.GetCustomInbounds() {
+		if ib.ID == "" || ib.Tag == "" {
+			continue
+		}
 		if ib.ID == filter {
 			return ib.ID, ib.Tag
 		}
