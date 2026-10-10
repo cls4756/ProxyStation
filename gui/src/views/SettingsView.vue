@@ -98,6 +98,21 @@
           </div>
         </div>
         <div class="field-row">
+          <label class="field-label">远端解析器</label>
+          <input
+            class="input field-input"
+            v-model="form.dnsRemoteServer"
+            placeholder="https://8.8.8.8/dns-query"
+            :disabled="form.dnsMode !== 'compatible'"
+          />
+        </div>
+        <div class="field-row field-row-tip">
+          <label class="field-label"></label>
+          <div class="field-tip">
+            兼容模式下用于解析非 CN 域名的远端解析器，支持 https://（DoH）、tls://（DoT）、udp://（明文、直连）。留空使用默认 https://8.8.8.8/dns-query。远端解析经节点出口发出，连续失败时自动回退到本机直连解析，避免解析整体不可用。
+          </div>
+        </div>
+        <div class="field-row">
           <label class="field-label">透明代理模式</label>
           <select class="input field-input" v-model="form.transparentMode">
             <option value="close">关闭</option>
@@ -283,6 +298,7 @@
                   <label class="copy-section-label">失效判定</label>
                   <select class="input field-input" v-model="rule.mode">
                     <option value="real">快速成功但真连接失败才清理</option>
+                    <option value="realstrict">真连接失败就清理</option>
                     <option value="fast">快速连接失败就清理</option>
                   </select>
                 </div>
@@ -465,6 +481,7 @@ const form = reactive({
   enableSniff: false,
   enableHijackDNS: false,
   dnsMode: 'lightweight',
+  dnsRemoteServer: '',
   subscriptionAutoUpdateMode: 'off',
   subscriptionAutoUpdateIntervalHour: 12,
   subscriptionBestNodeCopyRules: [],
@@ -520,6 +537,7 @@ async function loadSetting() {
       enableSniff: !!s.enableSniff,
       enableHijackDNS: !!s.enableHijackDNS,
       dnsMode: s.dnsMode || 'lightweight',
+      dnsRemoteServer: s.dnsRemoteServer || '',
       subscriptionAutoUpdateMode: s.subscriptionAutoUpdateMode || 'off',
       subscriptionAutoUpdateIntervalHour: s.subscriptionAutoUpdateIntervalHour || 12,
       subscriptionBestNodeCopyRules: normalizeCopyRules(s.subscriptionBestNodeCopyRules),
@@ -587,7 +605,7 @@ function normalizeCleanupRules(setting) {
   if (Array.isArray(setting?.nodeCleanupRules) && setting.nodeCleanupRules.length > 0) {
     return setting.nodeCleanupRules.map(rule => ({
       groupIds: Array.isArray(rule?.groupIds) ? [...new Set(rule.groupIds.filter(Boolean))] : [],
-      mode: rule?.mode === 'fast' ? 'fast' : 'real',
+      mode: (rule?.mode === 'fast' || rule?.mode === 'realstrict') ? rule.mode : 'real',
       intervalHour: Number(rule?.intervalHour) > 0 ? Number(rule.intervalHour) : 24,
       recycleGroupId: rule?.recycleGroupId || '',
     }))
@@ -595,7 +613,7 @@ function normalizeCleanupRules(setting) {
   if (Array.isArray(setting?.nodeCleanupGroupIds) && setting.nodeCleanupGroupIds.length > 0) {
     return [{
       groupIds: [...new Set(setting.nodeCleanupGroupIds.filter(Boolean))],
-      mode: setting.nodeCleanupMode === 'fast' ? 'fast' : 'real',
+      mode: (setting.nodeCleanupMode === 'fast' || setting.nodeCleanupMode === 'realstrict') ? setting.nodeCleanupMode : 'real',
       intervalHour: Number(setting.nodeCleanupIntervalHour) > 0 ? Number(setting.nodeCleanupIntervalHour) : 24,
       recycleGroupId: setting.nodeCleanupRecycleGroupId || '',
     }]
@@ -607,7 +625,7 @@ function sanitizeCleanupRules(rules) {
   return rules
     .map(rule => ({
       groupIds: [...new Set((rule.groupIds || []).filter(Boolean))],
-      mode: rule.mode === 'fast' ? 'fast' : 'real',
+      mode: (rule.mode === 'fast' || rule.mode === 'realstrict') ? rule.mode : 'real',
       intervalHour: Number(rule.intervalHour) > 0 ? Number(rule.intervalHour) : 24,
       recycleGroupId: (rule.recycleGroupId && !(rule.groupIds || []).includes(rule.recycleGroupId)) ? rule.recycleGroupId : '',
     }))
@@ -716,6 +734,7 @@ async function saveSettings() {
       enableSniff: form.enableSniff,
       enableHijackDNS: form.enableHijackDNS,
       dnsMode: form.dnsMode,
+      dnsRemoteServer: form.dnsRemoteServer,
       subscriptionAutoUpdateMode: form.subscriptionAutoUpdateMode,
       subscriptionAutoUpdateIntervalHour: form.subscriptionAutoUpdateIntervalHour,
       subscriptionBestNodeCopyRules: copyRules,
@@ -746,6 +765,7 @@ async function saveSettings() {
       enableSniff: form.enableSniff,
       enableHijackDNS: form.enableHijackDNS,
       dnsMode: form.dnsMode,
+      dnsRemoteServer: form.dnsRemoteServer,
       subscriptionAutoUpdateMode: form.subscriptionAutoUpdateMode,
       subscriptionAutoUpdateIntervalHour: form.subscriptionAutoUpdateIntervalHour,
       subscriptionBestNodeCopyRules: copyRules,

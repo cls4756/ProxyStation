@@ -9,7 +9,7 @@ type CustomInbound struct {
 	ID       string `json:"id"`
 	Tag      string `json:"tag"`      // 入站标签，用于路由规则匹配
 	Name     string `json:"name"`     // 显示名称
-	Protocol string `json:"protocol"` // "socks" | "http" | "dokodemo-door" | "cfdo"
+	Protocol string `json:"protocol"` // "socks" | "http" | "vmess" | "dokodemo-door" | "cfdo"
 	Listen   string `json:"listen"`   // 监听地址，默认 127.0.0.1
 	Port     int    `json:"port"`
 	// socks 入站选项
@@ -24,8 +24,22 @@ type CustomInbound struct {
 	Username  string            `json:"username,omitempty"` // 兼容旧配置：单账号
 	Password  string            `json:"password,omitempty"` // 兼容旧配置：单账号
 	Accounts  []InboundAccount  `json:"accounts,omitempty"`
+	VMess     *VMessInbound     `json:"vmess,omitempty"`
 	CfDO      *CfDOInbound      `json:"cfdo,omitempty"`
 	CfGoodNet *CfGoodNetInbound `json:"cfgoodnet,omitempty"`
+}
+
+type VMessInbound struct {
+	Users     []VMessInboundUser `json:"users,omitempty"`
+	Transport string             `json:"transport,omitempty"` // "tcp" | "ws"
+	Path      string             `json:"path,omitempty"`
+	Host      string             `json:"host,omitempty"`
+}
+
+type VMessInboundUser struct {
+	UUID    string `json:"uuid"`
+	AlterID int    `json:"alterId,omitempty"`
+	Name    string `json:"name,omitempty"`
 }
 
 type InboundAccount struct {
@@ -34,18 +48,18 @@ type InboundAccount struct {
 }
 
 type CfDOInbound struct {
-	WorkerDomain         string   `json:"workerDomain,omitempty"`
-	Secret               string   `json:"secret,omitempty"`
-	Path                 string   `json:"path,omitempty"`
-	Port                 int      `json:"port,omitempty"` // 0 表示自动分配
-	WorkerIP             string   `json:"workerIp,omitempty"`
+	WorkerDomain         string         `json:"workerDomain,omitempty"`
+	Secret               string         `json:"secret,omitempty"`
+	Path                 string         `json:"path,omitempty"`
+	Port                 int            `json:"port,omitempty"` // 0 表示自动分配
+	WorkerIP             string         `json:"workerIp,omitempty"`
 	Listeners            []CfDOListener `json:"listeners,omitempty"` // 多监听端口与独立优选地址
-	UseBareWS            bool     `json:"useBareWs,omitempty"`
-	AlwaysUseDO          bool     `json:"alwaysUseDo,omitempty"`
-	DOPoolSize           int      `json:"doPoolSize,omitempty"` // 0 表示不启用分片复用
-	RejectDomains        []string `json:"rejectDomains,omitempty"`
-	DOFallbackDomains    []string `json:"doFallbackDomains,omitempty"`
-	DOFallbackExtensions []string `json:"doFallbackExtensions,omitempty"`
+	UseBareWS            bool           `json:"useBareWs,omitempty"`
+	AlwaysUseDO          bool           `json:"alwaysUseDo,omitempty"`
+	DOPoolSize           int            `json:"doPoolSize,omitempty"` // 0 表示不启用分片复用
+	RejectDomains        []string       `json:"rejectDomains,omitempty"`
+	DOFallbackDomains    []string       `json:"doFallbackDomains,omitempty"`
+	DOFallbackExtensions []string       `json:"doFallbackExtensions,omitempty"`
 }
 
 type CfDOListener struct {

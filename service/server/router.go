@@ -22,10 +22,12 @@ func NewRouter(guiDir string) *gin.Engine {
 		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization"},
 		AllowCredentials: true,
 	}))
+	r.Use(noCacheDynamicResponse())
 
 	r.POST("/api/auth/login", login)
 	r.POST("/api/auth/logout", logout)
 	r.GET("/api/auth/me", authMe)
+	r.GET("/subscribe/inbounds/:token", getPublicInboundSubscription)
 	r.Use(AuthRequired())
 
 	api := r.Group("/api")
@@ -118,6 +120,10 @@ func NewRouter(guiDir string) *gin.Engine {
 		// 自定义入站
 		api.GET("/custom-inbounds", getCustomInbounds)
 		api.PUT("/custom-inbounds", setCustomInbounds)
+		api.GET("/inbound-subscriptions", getInboundSubscriptions)
+		api.POST("/inbound-subscriptions", createInboundSubscription)
+		api.PUT("/inbound-subscriptions/:index", updateInboundSubscription)
+		api.DELETE("/inbound-subscriptions/:index", deleteInboundSubscription)
 		api.GET("/builtin-proxies/status", getBuiltinProxyStatuses)
 		api.POST("/builtin-proxies/:id/restart", restartBuiltinProxy)
 	}

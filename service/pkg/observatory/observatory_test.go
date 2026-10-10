@@ -288,6 +288,9 @@ func TestCleanupProbeInvalidRules(t *testing.T) {
 		{name: "真连规则仅清理快速成功真连失败", mode: "real", fastLatency: 20, realLatency: -1, want: true},
 		{name: "真连规则保留快速失败", mode: "real", fastLatency: -1, realLatency: -1, want: false},
 		{name: "真连规则保留完整成功", mode: "real", fastLatency: 20, realLatency: 80, want: false},
+		{name: "严格真连规则清理快速成功真连失败", mode: "realstrict", fastLatency: 20, realLatency: -1, want: true},
+		{name: "严格真连规则清理快速失败真连失败", mode: "realstrict", fastLatency: -1, realLatency: -1, want: true},
+		{name: "严格真连规则保留完整成功", mode: "realstrict", fastLatency: 20, realLatency: 80, want: false},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

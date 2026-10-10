@@ -95,6 +95,17 @@ func BuildXrayConfig(setting *configure.Setting) (*coreObj.Config, error) {
 				Network:        ci.Network,
 				FollowRedirect: ci.FollowRedirect,
 			}
+		case "vmess":
+			ib.Settings = &coreObj.InboundSettings{}
+			if ci.VMess != nil {
+				for _, user := range ci.VMess.Users {
+					if strings.TrimSpace(user.UUID) == "" {
+						continue
+					}
+					ib.Settings.Clients = append(ib.Settings.Clients, coreObj.InboundClient{ID: user.UUID, AlterID: user.AlterID, Email: user.Name})
+				}
+				ib.StreamSettings = buildXrayStream(ci.VMess.Transport, "", ci.VMess.Host, ci.VMess.Path, "", "", "", "", "", "", "")
+			}
 		}
 		if ci.SniffEnabled {
 			dest := ci.SniffDest

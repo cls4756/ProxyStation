@@ -29,10 +29,13 @@ type Setting struct {
 	EnableSniff bool `json:"enableSniff"`
 	// 内置 socks/http 入站各自的嗅探开关。指针用于区分"从未设置"（需从 EnableSniff 迁移）
 	// 和"显式关闭"，否则老用户开着的嗅探会在升级后被静默关掉。
-	Socks5SniffEnabled                 *bool  `json:"socks5SniffEnabled,omitempty"`
-	HttpSniffEnabled                   *bool  `json:"httpSniffEnabled,omitempty"`
-	EnableHijackDNS                    bool   `json:"enableHijackDNS"`
-	DNSMode                            string `json:"dnsMode"`
+	Socks5SniffEnabled *bool  `json:"socks5SniffEnabled,omitempty"`
+	HttpSniffEnabled   *bool  `json:"httpSniffEnabled,omitempty"`
+	EnableHijackDNS    bool   `json:"enableHijackDNS"`
+	DNSMode            string `json:"dnsMode"`
+	// DNSRemoteServer 兼容模式远端解析器地址，支持 https://（DoH）、tls://（DoT）、
+	// udp://（明文、直连）。留空表示使用默认解析器。
+	DNSRemoteServer                    string `json:"dnsRemoteServer,omitempty"`
 	SubscriptionAutoUpdateMode         string `json:"subscriptionAutoUpdateMode"`
 	SubscriptionAutoUpdateIntervalHour int    `json:"subscriptionAutoUpdateIntervalHour"`
 	TransparentMode                    string `json:"transparentMode"`
@@ -89,6 +92,8 @@ type Setting struct {
 	// Web 管理端认证
 	WebUsername string `json:"webUsername,omitempty"`
 	WebPassword string `json:"webPassword,omitempty"`
+	// 标记 fixSharedNodes 迁移是否已执行
+	SharedNodesFixed bool `json:"sharedNodesFixed,omitempty"`
 }
 
 type WebAuthConfig struct {
@@ -175,6 +180,21 @@ func (r SubscriptionNodeCopyRule) CopyCount() int {
 		// 含历史数据的空 Mode：保持旧行为，只复制最快的一个
 		return 1
 	}
+}
+
+// DNSRemoteServerDefault 兼容模式远端解析器默认值（与历史写死的 https://8.8.8.8 等价）。
+const DNSRemoteServerDefault = "https://8.8.8.8/dns-query"
+
+// DNSRemoteServerRaw 返回远端解析器配置，未设置时使用默认值。
+func (s *Setting) DNSRemoteServerRaw() string {
+	if s == nil {
+		return DNSRemoteServerDefault
+	}
+	value := strings.TrimSpace(s.DNSRemoteServer)
+	if value == "" {
+		return DNSRemoteServerDefault
+	}
+	return value
 }
 
 func NewSetting() *Setting {

@@ -23,6 +23,10 @@ var authSessionRefreshMu sync.Mutex
 
 func AuthRequired() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if strings.HasPrefix(c.Request.URL.Path, "/subscribe/inbounds/") {
+			c.Next()
+			return
+		}
 		if username, ok := validateSession(c); ok {
 			c.Set("auth_username", username)
 			c.Next()

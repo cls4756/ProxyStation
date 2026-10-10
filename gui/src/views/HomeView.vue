@@ -832,7 +832,9 @@ let pendingPingPatches = []
 let pingFlushFrame = 0
 
 function schedulePingFlush(key, state, refObj, patch) {
-  pendingPingStates[key] = state
+  // state 为 null/undefined 表示本次只补充字段（如真连的 fast 预检结果），
+  // 不改变测速状态。否则会在真连结果返回前清空状态，让界面回退显示旧值。
+  if (state !== null && state !== undefined) pendingPingStates[key] = state
   if (refObj && patch) pendingPingPatches.push({ ref: refObj, patch })
   if (pingFlushFrame) return
   pingFlushFrame = window.requestAnimationFrame(flushPendingPingUpdates)
@@ -1404,6 +1406,14 @@ async function pingRefsWithProgress(refs, mode = 'fast') {
       },
     })
     flushPendingPingUpdates()
+    // 真连接 + trans-proxy 回退时，后端成功后会把前置代理写回节点。
+    // 按引用补载本次测速的节点，让列表里的「前置代理」列同步更新。
+    if (enableTransProxyFallback) {
+      try {
+        const results = await store.fetchNodes(queue)
+        patchSearchResults((results || []).map(item => ({ ref: item.ref, patch: item.server })))
+      } catch {}
+    }
   } catch (e) {
     flushPendingPingUpdates()
     if (e?.name === 'AbortError' || pingAbortController.value?.signal?.aborted) {

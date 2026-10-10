@@ -20,6 +20,11 @@ services:
       - TZ=${TZ}
       - PROXYSTATION_WEB_USERNAME=${PROXYSTATION_WEB_USERNAME}
       - PROXYSTATION_WEB_PASSWORD=${PROXYSTATION_WEB_PASSWORD}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     # 如果需要透明代理，取消注释以下配置
     # cap_add:
     #   - NET_ADMIN

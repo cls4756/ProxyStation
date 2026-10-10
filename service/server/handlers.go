@@ -23,6 +23,7 @@ import (
 	"github.com/ProxyStation/proxystation/core/cfgoodnet"
 	"github.com/ProxyStation/proxystation/core/engine"
 	"github.com/ProxyStation/proxystation/db/configure"
+	"github.com/ProxyStation/proxystation/pkg/dnsupstream"
 	"github.com/ProxyStation/proxystation/pkg/ipinfo"
 	"github.com/ProxyStation/proxystation/pkg/ipscore"
 	"github.com/ProxyStation/proxystation/pkg/observatory"
@@ -2784,6 +2785,7 @@ func pingNodes(c *gin.Context) {
 	c.Writer.Header().Set("Content-Type", "text/event-stream")
 	c.Writer.Header().Set("Cache-Control", "no-cache")
 	c.Writer.Header().Set("Connection", "keep-alive")
+	c.Writer.Header().Set("X-Accel-Buffering", "no")
 	flusher, _ := c.Writer.(http.Flusher)
 
 	ctx := c.Request.Context()
@@ -2856,6 +2858,7 @@ func pingGroup(c *gin.Context) {
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
 	flusher, ok := c.Writer.(http.Flusher)
 	if !ok {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "streaming unsupported"})
@@ -3144,6 +3147,13 @@ func setSetting(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "dnsMode 非法"})
 		return
 	}
+	// 兼容模式远端解析器：空值表示用默认；非法值直接拒绝，避免落库后内核起不来
+	normalizedDNSRemote, err := dnsupstream.Normalize(s.DNSRemoteServer)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "dnsRemoteServer 非法: " + err.Error()})
+		return
+	}
+	s.DNSRemoteServer = normalizedDNSRemote
 	if s.KernelMode == "" {
 		s.KernelMode = "auto"
 	}
@@ -3176,7 +3186,7 @@ func setSetting(c *gin.Context) {
 		switch rule.Mode {
 		case "", "real":
 			rule.Mode = "real"
-		case "fast":
+		case "fast", "realstrict":
 		default:
 			c.JSON(http.StatusBadRequest, gin.H{"error": "node cleanup mode 非法"})
 			return
@@ -3828,8 +3838,42 @@ func setCustomInbounds(c *gin.Context) {
 			inbounds[i].ID = id
 		}
 		proto := strings.ToLower(strings.TrimSpace(inbounds[i].Protocol))
+		switch proto {
+		case "socks", "http", "vmess", "dokodemo-door", "cfdo", "cfgoodnet":
+		default:
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("不支持的入站协议: %s", inbounds[i].Protocol)})
+			return
+		}
 		if inbounds[i].Tag == "" && proto != "cfdo" && proto != "cfgoodnet" {
 			inbounds[i].Tag = "inbound-" + inbounds[i].ID[:8]
+		}
+		if proto == "vmess" {
+			if inbounds[i].VMess == nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "VMess 入站缺少配置"})
+				return
+			}
+			transport := strings.ToLower(strings.TrimSpace(inbounds[i].VMess.Transport))
+			if transport == "" {
+				transport = "tcp"
+			}
+			if transport != "tcp" && transport != "ws" {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "VMess 入站当前仅支持 TCP 或 WebSocket 传输"})
+				return
+			}
+			inbounds[i].VMess.Transport = transport
+			users := inbounds[i].VMess.Users[:0]
+			for _, user := range inbounds[i].VMess.Users {
+				user.UUID = strings.TrimSpace(user.UUID)
+				user.Name = strings.TrimSpace(user.Name)
+				if user.UUID != "" {
+					users = append(users, user)
+				}
+			}
+			if len(users) == 0 {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "VMess 入站至少需要一个 UUID"})
+				return
+			}
+			inbounds[i].VMess.Users = users
 		}
 		if proto == "cfdo" {
 			inbounds[i].Tag = ""

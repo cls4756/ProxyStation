@@ -95,7 +95,13 @@ func main() {
 	// 确保 SERVER 内置分组存在
 	ensureServerGroup()
 	// 修复共享节点问题（一次性数据迁移）
-	fixSharedNodes()
+	if !setting.SharedNodesFixed {
+		fixSharedNodes()
+		setting.SharedNodesFixed = true
+		if err := configure.SetSetting(setting); err != nil {
+			log.Printf("⚠️ 保存共享节点迁移标记失败: %v", err)
+		}
+	}
 	// 启动独立于内核的 cfdo/cfgoodnet 代理
 	server.EnsureIndependentProxyInbounds()
 

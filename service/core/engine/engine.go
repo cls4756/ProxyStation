@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ProxyStation/proxystation/core/cfdo"
@@ -64,13 +65,16 @@ var ProtocolKernelMap = map[string]KernelType{
 var Manager = &EngineManager{}
 
 type EngineManager struct {
-	lifecycleMu         sync.RWMutex
-	mu                  sync.Mutex
-	proc                *os.Process
-	cancel              context.CancelFunc
-	kernel              KernelType
-	dataDir             string
-	running             bool // 添加运行状态标志
+	lifecycleMu sync.RWMutex
+	mu          sync.Mutex
+	proc        *os.Process
+	cancel      context.CancelFunc
+	kernel      KernelType
+	dataDir     string
+	running     bool // 添加运行状态标志
+	// runningFlag 与 running 同步，供不持锁的调用方（如 DNS 回退转发器）查询，
+	// 避免在 stopLocked 持锁期间等待查询方释放锁造成死锁。
+	runningFlag         atomic.Bool
 	loadedNodeOutbounds map[string]string
 }
 
@@ -108,7 +112,7 @@ func (em *EngineManager) start() error {
 
 	// 检查是否有可用的出站配置
 	if !em.hasAnyOutbound() {
-		em.running = false
+		em.setRunning(false)
 		_ = configure.SetRunning(false)
 		return fmt.Errorf("未配置任何出站节点，请先在节点页面选择节点或在出站下拉中配置分组")
 	}
@@ -116,12 +120,12 @@ func (em *EngineManager) start() error {
 	setting := configure.GetSettingNotNil()
 	loadedNodeOutbounds := snapshotLoadedNodeOutbounds()
 	if err := em.ensureCfGoodNetSidecars(); err != nil {
-		em.running = false
+		em.setRunning(false)
 		_ = configure.SetRunning(false)
 		return fmt.Errorf("prepare cfgoodnet sidecars: %w", err)
 	}
 	if err := em.ensureCfDOSidecars(); err != nil {
-		em.running = false
+		em.setRunning(false)
 		_ = configure.SetRunning(false)
 		return fmt.Errorf("prepare cfdo sidecars: %w", err)
 	}
@@ -129,6 +133,10 @@ func (em *EngineManager) start() error {
 	// 确定需要哪个内核
 	kernel := em.selectKernel(setting)
 	em.kernel = kernel
+
+	// 兼容模式的远端解析器由本地回退转发器接管（失败自动回退直连），
+	// 必须在写配置之前确定其可用性，配置里才知道该指向 127.0.0.1 还是直连上游
+	syncDNSFallback(setting, kernel)
 
 	var configPath string
 	var binPath string
@@ -142,14 +150,14 @@ func (em *EngineManager) start() error {
 			"/usr/local/bin/sing-box", "/usr/bin/sing-box",
 		})
 		if err != nil {
-			em.running = false
+			em.setRunning(false)
 			_ = configure.SetRunning(false)
 			return fmt.Errorf("sing-box not found: %w", err)
 		}
 		configPath = filepath.Join(em.dataDir, "singbox.json")
 		cfg, e := BuildSingboxConfig(setting)
 		if e != nil {
-			em.running = false
+			em.setRunning(false)
 			_ = configure.SetRunning(false)
 			return fmt.Errorf("build singbox config: %w", e)
 		}
@@ -158,7 +166,7 @@ func (em *EngineManager) start() error {
 		}
 		if e := writeJSON(cfg, configPath); e != nil {
 			logSingboxConfigOnStartFailure(singboxConfigJSON)
-			em.running = false
+			em.setRunning(false)
 			_ = configure.SetRunning(false)
 			return fmt.Errorf("write singbox config: %w", e)
 		}
@@ -170,7 +178,7 @@ func (em *EngineManager) start() error {
 		})
 		if err != nil {
 			if setting.KernelMode == "xray" {
-				em.running = false
+				em.setRunning(false)
 				_ = configure.SetRunning(false)
 				return fmt.Errorf("xray not found: %w", err)
 			}
@@ -179,7 +187,7 @@ func (em *EngineManager) start() error {
 				"/usr/local/bin/v2ray", "/usr/bin/v2ray",
 			})
 			if err != nil {
-				em.running = false
+				em.setRunning(false)
 				_ = configure.SetRunning(false)
 				return fmt.Errorf("xray/v2ray not found")
 			}
@@ -188,7 +196,7 @@ func (em *EngineManager) start() error {
 		configPath = filepath.Join(em.dataDir, "config.json")
 		cfg, e := BuildXrayConfig(setting)
 		if e != nil {
-			em.running = false
+			em.setRunning(false)
 			_ = configure.SetRunning(false)
 			return fmt.Errorf("build xray config: %w", e)
 		}
@@ -199,12 +207,12 @@ func (em *EngineManager) start() error {
 			}
 		}
 		if e := writeJSON(cfg, configPath); e != nil {
-			em.running = false
+			em.setRunning(false)
 			_ = configure.SetRunning(false)
 			return fmt.Errorf("write xray config: %w", e)
 		}
 		if e := ensureKernelDataFiles(binPath); e != nil {
-			em.running = false
+			em.setRunning(false)
 			_ = configure.SetRunning(false)
 			return fmt.Errorf("prepare xray data files: %w", e)
 		}
@@ -215,14 +223,14 @@ func (em *EngineManager) start() error {
 			"/usr/local/bin/v2ray", "/usr/bin/v2ray",
 		})
 		if err != nil {
-			em.running = false
+			em.setRunning(false)
 			_ = configure.SetRunning(false)
 			return fmt.Errorf("v2ray not found: %w", err)
 		}
 		configPath = filepath.Join(em.dataDir, "config.json")
 		cfg, e := BuildXrayConfig(setting)
 		if e != nil {
-			em.running = false
+			em.setRunning(false)
 			_ = configure.SetRunning(false)
 			return fmt.Errorf("build v2ray config: %w", e)
 		}
@@ -232,19 +240,19 @@ func (em *EngineManager) start() error {
 			}
 		}
 		if e := writeJSON(cfg, configPath); e != nil {
-			em.running = false
+			em.setRunning(false)
 			_ = configure.SetRunning(false)
 			return fmt.Errorf("write v2ray config: %w", e)
 		}
 		if e := ensureKernelDataFiles(binPath); e != nil {
-			em.running = false
+			em.setRunning(false)
 			_ = configure.SetRunning(false)
 			return fmt.Errorf("prepare v2ray data files: %w", e)
 		}
 		args = []string{binPath, "run", "--config=" + configPath}
 
 	default:
-		em.running = false
+		em.setRunning(false)
 		_ = configure.SetRunning(false)
 		return fmt.Errorf("unknown kernel: %v", kernel)
 	}
@@ -260,7 +268,7 @@ func (em *EngineManager) start() error {
 	if err := cmd.Start(); err != nil {
 		cancel()
 		logSingboxConfigOnStartFailure(singboxConfigJSON)
-		em.running = false
+		em.setRunning(false)
 		_ = configure.SetRunning(false)
 		return fmt.Errorf("start %v: %w", kernel, explainKernelStartError(binPath, err))
 	}
@@ -281,13 +289,13 @@ func (em *EngineManager) start() error {
 			_ = em.proc.Kill()
 			em.proc = nil
 		}
-		em.running = false
+		em.setRunning(false)
 		_ = configure.SetRunning(false)
 		return fmt.Errorf("%v did not start in time: %w", kernel, err)
 	}
 
 	// 只有在端口就绪后才设置运行状态
-	em.running = true
+	em.setRunning(true)
 	em.loadedNodeOutbounds = loadedNodeOutbounds
 	_ = configure.SetRunning(true)
 
@@ -303,7 +311,7 @@ func (em *EngineManager) start() error {
 		if em.proc == currentProc {
 			em.proc = nil
 			em.cancel = nil
-			em.running = false
+			em.setRunning(false)
 			em.loadedNodeOutbounds = nil
 			_ = configure.SetRunning(false)
 			if LogCallback != nil {
@@ -321,11 +329,12 @@ func (em *EngineManager) Stop() {
 	em.mu.Lock()
 	defer em.mu.Unlock()
 	em.stopLocked()
-	em.running = false
+	em.setRunning(false)
 	_ = configure.SetRunning(false)
 }
 
 func (em *EngineManager) stopLocked() {
+	stopDNSFallback()
 	if em.cancel != nil {
 		em.cancel()
 		em.cancel = nil
@@ -401,9 +410,13 @@ func (em *EngineManager) UpdateAndRestartWithReason(update func() (bool, error),
 
 // IsRunning 检查实际的进程状态（不依赖数据库）
 func (em *EngineManager) IsRunning() bool {
-	em.mu.Lock()
-	defer em.mu.Unlock()
-	return em.running
+	return em.runningFlag.Load()
+}
+
+// setRunning 同步内存标记与原子标记（必须在持有 em.mu 时调用）。
+func (em *EngineManager) setRunning(running bool) {
+	em.running = running
+	em.runningFlag.Store(running)
 }
 
 func (em *EngineManager) CurrentKernel() KernelType {
@@ -577,6 +590,22 @@ func resolveOutboundServerRaw(name string, o *configure.Outbound) *configure.Ser
 		return nil
 	}
 	return getServerRaw(ref)
+}
+
+// firstBoundOutboundTag 返回第一个已绑定节点的出站名，与 BuildSingboxConfig 里
+// route.final 的取值保持一致（DNS 回退转发器要用它作为主上游出口）。
+func firstBoundOutboundTag() string {
+	for _, name := range configure.GetOutboundNames() {
+		o := configure.GetOutbound(name)
+		if o == nil {
+			continue
+		}
+		if resolveOutboundServerRaw(name, o) == nil {
+			continue
+		}
+		return name
+	}
+	return ""
 }
 
 // collectValidOutboundTags 返回所有已绑定节点的出站名，供前置代理引用校验使用。

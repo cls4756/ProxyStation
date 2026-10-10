@@ -111,6 +111,7 @@
             <span class="inbound-addr">{{ ib.listen || '127.0.0.1' }}:{{ ib.port }}</span>
             <span class="inbound-tag-badge">tag: {{ ib.tag }}</span>
             <span v-if="hasInboundAuth(ib)" class="inbound-auth-badge">🔒 认证</span>
+            <span v-if="ib.sniffEnabled" class="inbound-auth-badge">🔍 嗅探</span>
           </div>
           <div class="rule-ops">
             <button class="icon-btn" @click="editInbound(i)" title="编辑">✏</button>
@@ -149,6 +150,45 @@
         <div v-if="!builtinOutbounds.length" class="empty-hint" style="padding:12px 16px;font-size:12px;color:#bfbfbf;border-top:1px solid #f5f5f5">
           暂无代理出站节点。添加 CFDO 后，可用“⇄”按钮创建分流规则可选择的出站。
         </div>
+      </div>
+
+      <div class="section-header" style="margin-top:10px">
+        <span class="section-title">🔗 入站在线订阅</span>
+        <button class="action-btn action-btn-primary" @click="openInboundSubscription">＋ 添加订阅</button>
+      </div>
+      <div class="inbounds-list">
+        <div v-for="(sub, i) in inboundSubscriptions" :key="sub.id" class="inbound-row">
+          <div class="inbound-info" style="min-width:0;display:flex;flex-wrap:wrap;gap:6px;align-items:center">
+            <span class="inbound-name">{{ sub.name }}</span>
+            <span class="inbound-proto-badge">{{ sub.format }}</span>
+            <span class="inbound-addr" style="max-width:480px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" :title="sub.url">{{ sub.url }}</span>
+          </div>
+          <div class="rule-ops">
+            <button class="icon-btn" @click="copyInboundSubscription(sub.url)" title="复制链接">⧉</button>
+            <button class="icon-btn" @click="editInboundSubscription(i)" title="编辑">✏</button>
+            <button class="icon-btn icon-btn-danger" @click="deleteInboundSubscription(i)" title="删除">✕</button>
+          </div>
+        </div>
+        <div v-if="!inboundSubscriptions.length" class="empty-hint" style="padding:12px 16px;font-size:12px;color:#bfbfbf;border-top:1px solid #f5f5f5">
+          暂无在线订阅。订阅链接不需要管理端登录，可直接填入客户端。
+        </div>
+      </div>
+    </div>
+
+    <div class="modal-overlay" v-if="showInboundSubscriptionModal" @mousedown.self="showInboundSubscriptionModal = false">
+      <div class="modal-box" style="width:520px">
+        <div class="modal-header">
+          <span class="modal-title">{{ editingInboundSubscriptionIdx >= 0 ? '编辑入站在线订阅' : '添加入站在线订阅' }}</span>
+          <span class="modal-close" @click="showInboundSubscriptionModal = false">✕</span>
+        </div>
+        <div class="modal-body">
+          <div class="form-group"><label class="form-label">订阅名称</label><input class="input" v-model="inboundSubscriptionForm.name" placeholder="例如：ProxyStation 入站" /></div>
+          <div class="form-group"><label class="form-label">公开访问域名或 IP</label><input class="input" v-model="inboundSubscriptionForm.host" placeholder="proxy.example.com 或 1.2.3.4" /><div class="form-tip">用于替换 127.0.0.1/0.0.0.0；这里填写客户端实际能访问到的地址，不要带协议和端口。</div></div>
+          <div class="form-group"><label class="form-label">订阅格式</label><select class="input" v-model="inboundSubscriptionForm.format"><option value="singbox">sing-box JSON</option><option value="v2ray">通用 Base64 节点链接</option></select></div>
+          <div class="form-group"><label class="form-label">包含入站</label><div class="subscription-inbound-options"><label v-for="ib in inboundSubscriptionCandidates" :key="ib.id" class="subscription-inbound-option"><input type="checkbox" v-model="inboundSubscriptionForm.inboundIds" :value="ib.id" /> <span>{{ ib.name || ib.tag }}</span><small>{{ ib.protocol }} · {{ ib.port }}</small></label></div><div class="form-tip">支持 HTTP、SOCKS 和 VMess；多账号或多 UUID 入站目前输出第一个有效用户。</div></div>
+          <div class="form-group"><label class="form-label">客户端转发规则 <span class="form-hint">仅 sing-box 格式支持</span></label><textarea class="input textarea" rows="7" v-model="inboundSubscriptionForm.rulesText" placeholder='例如：[\n  {"name":"国内直连","enabled":true,"domains":["geosite:cn"],"action":"direct"},\n  {"name":"广告拦截","enabled":true,"domains":["keyword:ads"],"action":"block"}\n]'></textarea><div class="form-tip">动作支持 proxy、direct、block；proxy 可填写 outboundInboundId 指定订阅中的某个入站。支持 domain:、geosite:、regexp:、keyword:、geoip: 和 CIDR。</div></div>
+        </div>
+        <div class="modal-footer"><button class="btn btn-light" @click="showInboundSubscriptionModal = false">取消</button><button class="btn btn-primary" @click="saveInboundSubscription">保存</button></div>
       </div>
     </div>
 
@@ -318,6 +358,7 @@
               <select class="input" v-model="inboundForm.protocol">
                 <option v-if="editorMode === 'inbound'" value="socks">SOCKS5</option>
                 <option v-if="editorMode === 'inbound'" value="http">HTTP</option>
+                <option v-if="editorMode === 'inbound'" value="vmess">VMess</option>
                 <option v-if="editorMode === 'inbound'" value="dokodemo-door">透明代理</option>
                 <option v-if="editorMode === 'builtin'" value="cfdo">CFDO</option>
                 <option v-if="editorMode === 'builtin'" value="cfgoodnet">CFGoodNet</option>
@@ -361,6 +402,40 @@
                 <input type="checkbox" v-model="inboundForm.udpEnabled" />
                 启用 UDP
               </label>
+            </div>
+          </template>
+          <template v-if="inboundForm.protocol === 'vmess'">
+            <div class="form-group">
+              <label class="form-label">
+                VMess 用户
+                <span class="form-hint">至少配置一个 UUID；Alter ID 建议保持 0</span>
+              </label>
+              <div class="auth-accounts-wrap">
+                <div v-for="(user, idx) in inboundForm.vmess.users" :key="idx" class="auth-account-row vmess-user-row">
+                  <input class="input" v-model="user.name" placeholder="名称（可选）" />
+                  <input class="input" v-model="user.uuid" placeholder="UUID" />
+                  <input class="input vmess-alter-id" type="number" min="0" v-model.number="user.alterId" placeholder="Alter ID" />
+                  <button class="icon-btn icon-btn-danger" @click="removeVMessUser(idx)" title="删除">✕</button>
+                </div>
+                <button class="btn btn-light btn-sm" @click="addVMessUser">＋ 添加用户</button>
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="form-group" style="width:150px">
+                <label class="form-label">传输</label>
+                <select class="input" v-model="inboundForm.vmess.transport">
+                  <option value="tcp">TCP</option>
+                  <option value="ws">WebSocket</option>
+                </select>
+              </div>
+              <div v-if="inboundForm.vmess.transport === 'ws'" class="form-group" style="flex:1">
+                <label class="form-label">WebSocket 路径</label>
+                <input class="input" v-model="inboundForm.vmess.path" placeholder="/vmess" />
+              </div>
+            </div>
+            <div v-if="inboundForm.vmess.transport === 'ws'" class="form-group">
+              <label class="form-label">Host（可选）</label>
+              <input class="input" v-model="inboundForm.vmess.host" placeholder="example.com" />
             </div>
           </template>
           <template v-if="inboundForm.protocol === 'dokodemo-door'">
@@ -616,6 +691,15 @@ const builtinEditType = ref('socks')
 const builtinForm = reactive({ port: 20260, accounts: [], sniffEnabled: false })
 const builtinStatusMap = reactive({})
 const builtinRestarting = reactive({})
+const inboundSubscriptions = ref([])
+const showInboundSubscriptionModal = ref(false)
+const editingInboundSubscriptionIdx = ref(-1)
+const inboundSubscriptionForm = ref({ name: '', host: '', format: 'singbox', inboundIds: [], rulesText: '[]' })
+const inboundSubscriptionCandidates = computed(() => [
+  { id: 'builtin:socks', name: '默认 SOCKS5', protocol: 'socks', port: builtinSocks.port, accounts: builtinSocks.accounts },
+  { id: 'builtin:http', name: '默认 HTTP', protocol: 'http', port: builtinHttp.port, accounts: builtinHttp.accounts },
+  ...pureInbounds.value.filter(ib => ['socks', 'http', 'vmess'].includes(String(ib.protocol || '').toLowerCase())),
+])
 
 const dataFiles = ref([
   { type: 'geoip', label: 'geoip.dat', desc: 'IP 地理位置数据（geoip:cn 等）', exists: false },
@@ -685,6 +769,7 @@ const defaultInboundForm = () => ({
   id: '', name: '', tag: '', protocol: 'socks', listen: '127.0.0.1', port: 1080,
   udpEnabled: true, network: 'tcp,udp', followRedirect: false, sniffEnabled: true, sniffDest: [],
   username: '', password: '', accounts: [],
+  vmess: { users: [], transport: 'tcp', path: '/', host: '' },
   cfdo: { workerDomain: '', secret: '', workerIp: '', path: '/api/tcp', port: 0, listeners: [], doPoolSize: 32, alwaysUseDo: false, rejectDomainsText: '', doFallbackDomainsText: '', doFallbackExtensionsText: '' },
   cfgoodnet: { listenHost: '127.0.0.1', listenPort: 0, cfProxy: '', cfGoodIp: '', enableXff: false, rulesText: '' },
 })
@@ -708,7 +793,7 @@ const inboundModalTitle = computed(() => {
 })
 
 onMounted(async () => {
-  const requests = [loadInbounds(), store.fetchOutbounds(), loadBuiltinSettings()]
+  const requests = [loadInbounds(), store.fetchOutbounds(), loadBuiltinSettings(), loadInboundSubscriptions()]
   if (props.mode !== 'inbounds') {
     requests.push(
       loadRules(),
@@ -735,6 +820,51 @@ async function loadBuiltinSettings() {
     builtinHttp.password = builtinHttp.accounts[0]?.password || ''
     builtinHttp.sniffEnabled = s.httpSniffEnabled ?? !!s.enableSniff
   } catch {}
+}
+
+async function loadInboundSubscriptions() {
+  try {
+    const { data } = await api.getInboundSubscriptions()
+    inboundSubscriptions.value = data.subscriptions || []
+  } catch (e) { alert('加载入站订阅失败: ' + (e?.response?.data?.error || e.message)) }
+}
+
+function openInboundSubscription() {
+  editingInboundSubscriptionIdx.value = -1
+  inboundSubscriptionForm.value = { name: '', host: '', format: 'singbox', inboundIds: [], rulesText: '[]' }
+  showInboundSubscriptionModal.value = true
+}
+
+function editInboundSubscription(index) {
+  const sub = inboundSubscriptions.value[index]
+  editingInboundSubscriptionIdx.value = index
+  inboundSubscriptionForm.value = { name: sub.name, host: sub.host, format: sub.format, inboundIds: [...(sub.inboundIds || [])], rulesText: JSON.stringify(sub.rules || [], null, 2) }
+  showInboundSubscriptionModal.value = true
+}
+
+async function saveInboundSubscription() {
+  let rules
+  try {
+    rules = JSON.parse(inboundSubscriptionForm.value.rulesText || '[]')
+    if (!Array.isArray(rules)) throw new Error('规则必须是 JSON 数组')
+  } catch (e) { alert('转发规则 JSON 格式错误：' + e.message); return }
+  const payload = { ...inboundSubscriptionForm.value, rules, inboundIds: [...new Set(inboundSubscriptionForm.value.inboundIds || [])] }
+  try {
+    if (!payload.name.trim() || !payload.host.trim() || !payload.inboundIds.length) { alert('请填写名称、公开地址并至少选择一个入站'); return }
+    if (editingInboundSubscriptionIdx.value >= 0) await api.updateInboundSubscription(editingInboundSubscriptionIdx.value, payload)
+    else await api.createInboundSubscription(payload)
+    showInboundSubscriptionModal.value = false
+    await loadInboundSubscriptions()
+  } catch (e) { alert('保存失败: ' + (e?.response?.data?.error || e.message)) }
+}
+
+async function deleteInboundSubscription(index) {
+  if (!confirm('确定删除这个在线订阅吗？已有客户端链接将立即失效。')) return
+  try { await api.deleteInboundSubscription(index); await loadInboundSubscriptions() } catch (e) { alert('删除失败: ' + (e?.response?.data?.error || e.message)) }
+}
+
+async function copyInboundSubscription(value) {
+  try { await navigator.clipboard.writeText(value); alert('订阅链接已复制') } catch { prompt('请复制订阅链接', value) }
 }
 
 async function loadRules() {
@@ -959,6 +1089,7 @@ function openAddInbound() {
   editingInboundIdx.value = -1
   inboundForm.value = defaultInboundForm()
   addInboundAccount()
+  addVMessUser()
   showInboundModal.value = true
 }
 
@@ -979,6 +1110,7 @@ function editInbound(i) {
   editingInboundIdx.value = idx
   inboundForm.value = normalizeInbound({ ...inbounds.value[idx] })
   if (!inboundForm.value.accounts.length) addInboundAccount()
+  if (!inboundForm.value.vmess.users.length) addVMessUser()
   showInboundModal.value = true
 }
 
@@ -1006,6 +1138,28 @@ async function saveInbound() {
   } else {
     ib.username = ''
     ib.password = ''
+  }
+  if (String(ib.protocol || '').toLowerCase() === 'vmess') {
+    const users = (ib.vmess?.users || [])
+      .map(user => ({
+        uuid: String(user?.uuid || '').trim(),
+        alterId: Math.max(0, Number(user?.alterId || 0)),
+        name: String(user?.name || '').trim(),
+      }))
+      .filter(user => user.uuid)
+    if (!users.length) {
+      alert('VMess 入站至少需要一个 UUID')
+      return
+    }
+    ib.accounts = []
+    ib.username = ''
+    ib.password = ''
+    ib.vmess = {
+      users,
+      transport: ib.vmess?.transport === 'ws' ? 'ws' : 'tcp',
+      path: ib.vmess?.path || '/',
+      host: String(ib.vmess?.host || '').trim(),
+    }
   }
   if (String(ib.protocol || '').toLowerCase() === 'cfdo') {
     if (!String(ib.cfdo?.workerDomain || '').trim() || !String(ib.cfdo?.secret || '').trim()) {
@@ -1192,6 +1346,16 @@ function normalizeInbound(ib) {
   return {
     ...defaultInboundForm(),
     ...ib,
+    vmess: {
+      users: Array.isArray(ib.vmess?.users) ? ib.vmess.users.map(user => ({
+        uuid: String(user?.uuid || ''),
+        alterId: Math.max(0, Number(user?.alterId || 0)),
+        name: String(user?.name || ''),
+      })) : [],
+      transport: ib.vmess?.transport === 'ws' ? 'ws' : 'tcp',
+      path: ib.vmess?.path || '/',
+      host: ib.vmess?.host || '',
+    },
     cfdo: {
       workerDomain: ib.cfdo?.workerDomain || '',
       secret: ib.cfdo?.secret || '',
@@ -1219,7 +1383,7 @@ function normalizeInbound(ib) {
 
 function hasInboundAuth(ib) {
   const n = normalizeInbound(ib)
-  return n.accounts.length > 0
+  return n.accounts.length > 0 || n.vmess.users.some(user => user.uuid)
 }
 
 function addInboundAccount() {
@@ -1229,6 +1393,17 @@ function addInboundAccount() {
 
 function removeInboundAccount(idx) {
   inboundForm.value.accounts.splice(idx, 1)
+}
+
+function addVMessUser() {
+  if (!Array.isArray(inboundForm.value.vmess?.users)) {
+    inboundForm.value.vmess = { users: [], transport: 'tcp', path: '/', host: '' }
+  }
+  inboundForm.value.vmess.users.push({ uuid: '', alterId: 0, name: '' })
+}
+
+function removeVMessUser(idx) {
+  inboundForm.value.vmess.users.splice(idx, 1)
 }
 
 function addCfdoListener() {
@@ -1476,6 +1651,9 @@ async function importCfgoodnetCA() {
   display: flex; align-items: center; justify-content: space-between;
   padding: 10px 14px; border-bottom: 1px solid #f5f5f5;
 }
+.subscription-inbound-options { display:flex; flex-direction:column; gap:8px; padding:8px 0; max-height:180px; overflow:auto; }
+.subscription-inbound-option { display:flex; align-items:center; gap:7px; }
+.subscription-inbound-option small { color:#999; margin-left:auto; }
 .inbound-row:last-child { border-bottom: none; }
 .inbound-builtin { background: #fafafa; }
 .inbound-auth-badge {
@@ -1527,6 +1705,10 @@ async function importCfgoodnetCA() {
   gap: 8px;
   align-items: center;
 }
+.vmess-user-row {
+  grid-template-columns: .8fr 1.6fr 90px auto;
+}
+.vmess-alter-id { min-width: 0; }
 
 .data-file-row {
   display: flex; align-items: center; justify-content: space-between;
@@ -1649,6 +1831,9 @@ async function importCfgoodnetCA() {
     gap: 0;
   }
   .auth-account-row {
+    grid-template-columns: 1fr;
+  }
+  .vmess-user-row {
     grid-template-columns: 1fr;
   }
   .cfdo-listener-row {

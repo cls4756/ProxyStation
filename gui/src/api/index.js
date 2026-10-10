@@ -153,7 +153,19 @@ export const api = {
     })
     if (!resp.ok) {
       if (resp.status === 401) unauthorizedHandler?.({ response: resp })
-      throw new Error(`ping 失败: ${resp.status}`)
+      let detail = ''
+      try {
+        const text = (await resp.text()).trim()
+        if (text) {
+          try {
+            detail = JSON.parse(text)?.error || text
+          } catch {
+            detail = text
+          }
+        }
+      } catch {}
+      if (detail.length > 200) detail = `${detail.slice(0, 200)}…`
+      throw new Error(`ping 失败: ${resp.status}${detail ? ` - ${detail}` : ''}`)
     }
     const reader = resp.body.getReader()
     const decoder = new TextDecoder()
@@ -211,6 +223,10 @@ export const api = {
   // 自定义入站
   getCustomInbounds: () => http.get('/custom-inbounds'),
   setCustomInbounds: (inbounds) => http.put('/custom-inbounds', inbounds),
+  getInboundSubscriptions: () => http.get('/inbound-subscriptions'),
+  createInboundSubscription: (data) => http.post('/inbound-subscriptions', data),
+  updateInboundSubscription: (index, data) => http.put(`/inbound-subscriptions/${index}`, data),
+  deleteInboundSubscription: (index) => http.delete(`/inbound-subscriptions/${index}`),
   getBuiltinProxyStatuses: () => http.get('/builtin-proxies/status'),
   restartBuiltinProxy: (id) => http.post(`/builtin-proxies/${id}/restart`),
 

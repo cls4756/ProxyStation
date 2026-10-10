@@ -422,6 +422,7 @@ func ProbeNodesWithProgressFast(refs []configure.NodeRef, mode string, options P
 // ProbeInvalidNodes applies the cleanup rule in the same order as refs.
 // fast: fast connection failure is invalid.
 // real: only fast success followed by real connection failure is invalid.
+// realstrict: real connection failure is invalid regardless of fast result.
 func ProbeInvalidNodes(refs []configure.NodeRef, mode string) []bool {
 	invalid := make([]bool, len(refs))
 	if mode == "fast" {
@@ -445,8 +446,11 @@ func ProbeInvalidNodes(refs []configure.NodeRef, mode string) []bool {
 }
 
 func cleanupProbeInvalid(mode string, fastLatency, realLatency int) bool {
-	if mode == "fast" {
+	switch mode {
+	case "fast":
 		return fastLatency <= 0
+	case "realstrict":
+		return realLatency <= 0
 	}
 	return fastLatency > 0 && realLatency <= 0
 }

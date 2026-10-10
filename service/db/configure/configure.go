@@ -6,11 +6,12 @@ import (
 
 // Configure 全局配置快照，用于导入导出
 type Configure struct {
-	Servers       []*ServerRaw       `json:"servers"`
-	Subscriptions []*SubscriptionRaw `json:"subscriptions"`
-	Groups        []*Group           `json:"groups"`
-	Setting       *Setting           `json:"setting"`
-	Accounts      map[string]string  `json:"accounts"`
+	Servers              []*ServerRaw           `json:"servers"`
+	Subscriptions        []*SubscriptionRaw     `json:"subscriptions"`
+	Groups               []*Group               `json:"groups"`
+	InboundSubscriptions []*InboundSubscription `json:"inboundSubscriptions,omitempty"`
+	Setting              *Setting               `json:"setting"`
+	Accounts             map[string]string      `json:"accounts"`
 }
 
 func IsConfigureNotExists() bool {

@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/ProxyStation/proxystation/db/configure"
+	"github.com/ProxyStation/proxystation/pkg/dnsupstream"
 )
 
 // SingboxConfig sing-box 完整配置结构
@@ -49,6 +50,8 @@ type SingboxDNSServer struct {
 	Type           string `json:"type"`
 	Tag            string `json:"tag,omitempty"`
 	Server         string `json:"server,omitempty"`
+	ServerPort     uint16 `json:"server_port,omitempty"`
+	Path           string `json:"path,omitempty"`
 	DomainResolver string `json:"domain_resolver,omitempty"`
 	Detour         string `json:"detour,omitempty"`
 }
@@ -60,8 +63,11 @@ type SingboxDNSRule struct {
 }
 
 type SingboxInboundUser struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
+	Username string `json:"username,omitempty"`
+	Password string `json:"password,omitempty"`
+	UUID     string `json:"uuid,omitempty"`
+	AlterID  int    `json:"alter_id,omitempty"`
+	Name     string `json:"name,omitempty"`
 }
 
 type SingboxInbound struct {
@@ -70,7 +76,8 @@ type SingboxInbound struct {
 	Listen     string `json:"listen"`
 	ListenPort int    `json:"listen_port"`
 	// 认证（socks 和 http 用 users 数组）
-	Users []SingboxInboundUser `json:"users,omitempty"`
+	Users     []SingboxInboundUser `json:"users,omitempty"`
+	Transport *SingboxTransport    `json:"transport,omitempty"`
 }
 
 type SingboxOutbound struct {
@@ -184,6 +191,24 @@ type SingboxRouteRule struct {
 	Outbound string `json:"outbound,omitempty"`
 }
 
+// isLocalDNSFallbackServer 判断 DNS 服务器是否是本地回退转发器。
+func isLocalDNSFallbackServer(server SingboxDNSServer) bool {
+	return server.Type == "udp" && server.Server == dnsFallbackListenHost
+}
+
+// singboxBootstrapDNSAddr 兼容模式的 bootstrap/local 解析器地址。
+// 远端解析器不可用时回退到它（见 dns_fallback.go），两边必须保持一致。
+const singboxBootstrapDNSAddr = "223.5.5.5"
+
+// singboxDNSMode 归一化 DNS 模式，与历史默认值保持一致。
+func singboxDNSMode(setting *configure.Setting) string {
+	mode := strings.ToLower(strings.TrimSpace(setting.DNSMode))
+	if mode == "" {
+		mode = "lightweight"
+	}
+	return mode
+}
+
 // BuildSingboxConfig 生成 sing-box config.json
 func BuildSingboxConfig(setting *configure.Setting) (*SingboxConfig, error) {
 	if setting == nil {
@@ -237,6 +262,18 @@ func BuildSingboxConfig(setting *configure.Setting) (*SingboxConfig, error) {
 			ib.Type = "http"
 		case "dokodemo-door":
 			ib.Type = "tproxy"
+		case "vmess":
+			ib.Type = "vmess"
+			ib.Users = nil
+			if ci.VMess != nil {
+				for _, user := range ci.VMess.Users {
+					if strings.TrimSpace(user.UUID) == "" {
+						continue
+					}
+					ib.Users = append(ib.Users, SingboxInboundUser{UUID: user.UUID, AlterID: user.AlterID, Name: user.Name})
+				}
+				ib.Transport = sbTransport(ci.VMess.Transport, ci.VMess.Path, ci.VMess.Host, "")
+			}
 		default:
 			ib.Type = ci.Protocol
 		}
@@ -252,7 +289,6 @@ func BuildSingboxConfig(setting *configure.Setting) (*SingboxConfig, error) {
 	// 先收集所有有效出站 tag（已绑定节点的），供前置代理引用校验
 	validOutboundTags := collectValidOutboundTags()
 
-	var firstProxyOutbound string
 	var mainProbeRules []SingboxRouteRule
 	for _, name := range configure.GetOutboundNames() {
 		o := configure.GetOutbound(name)
@@ -286,21 +322,24 @@ func BuildSingboxConfig(setting *configure.Setting) (*SingboxConfig, error) {
 		mainProbeRules = append(mainProbeRules, SingboxRouteRule{
 			InboundTag: []string{MainProbeInboundTag}, AuthUser: []string{credential.Username}, Outbound: name,
 		})
-		if firstProxyOutbound == "" {
-			firstProxyOutbound = name
-		}
 	}
 	cfg.Route.Rules = append(mainProbeRules, cfg.Route.Rules...)
+
+	// 与 DNS 回退转发器共用同一个"第一个可用出站"，避免两处判断漂移
+	firstProxyOutbound := firstBoundOutboundTag()
 
 	// 更新路由的 Final 出站和 DNS remote 的 Detour：优先使用第一个代理出站，否则使用 direct
 	if firstProxyOutbound != "" {
 		cfg.Route.Final = firstProxyOutbound
-		// 更新 DNS remote 服务器的 Detour
+		// 更新 DNS remote 服务器的 Detour：本地回退转发器监听在本机、明文 udp:// 按直连语义处理，
+		// 两者都不能再套 detour，否则查询会被送进节点（本机回环地址在节点侧不可达）
+		plainDirect := resolveDNSRemoteSpec(setting).Kind == dnsupstream.KindUDP
 		for i := range cfg.DNS.Servers {
-			if cfg.DNS.Servers[i].Tag == "remote" {
-				cfg.DNS.Servers[i].Detour = firstProxyOutbound
-				break
+			if cfg.DNS.Servers[i].Tag != "remote" || isLocalDNSFallbackServer(cfg.DNS.Servers[i]) || plainDirect {
+				continue
 			}
+			cfg.DNS.Servers[i].Detour = firstProxyOutbound
+			break
 		}
 	} else {
 		cfg.Route.Final = "direct"
@@ -1016,11 +1055,30 @@ func singboxLogLevel(level string) string {
 	}
 }
 
-func buildSingboxDefaults(setting *configure.Setting) ([]SingboxDNSServer, []SingboxDNSRule, []SingboxRouteRule, []SingboxRouteRule, bool, string) {
-	dnsMode := strings.ToLower(setting.DNSMode)
-	if dnsMode == "" {
-		dnsMode = "lightweight"
+// buildSingboxRemoteDNSServer 生成兼容模式的 remote 解析器。
+//
+// 本地回退转发器可用时指向它（转发器内部按"远端加密解析 -> 直连 bootstrap"顺序查询，
+// 规避 sing-box 本身没有 DNS 服务器回退的问题）；否则按历史行为直接下发远端解析器。
+func buildSingboxRemoteDNSServer(setting *configure.Setting) SingboxDNSServer {
+	if port := dnsFallbackActivePort(); port > 0 {
+		return SingboxDNSServer{Type: "udp", Tag: "remote", Server: dnsFallbackListenHost, ServerPort: uint16(port)}
 	}
+	spec := resolveDNSRemoteSpec(setting)
+	server := SingboxDNSServer{Type: string(spec.Kind), Tag: "remote", Server: spec.Host}
+	if !spec.IsDefaultPort() {
+		server.ServerPort = spec.Port
+	}
+	if spec.Kind == dnsupstream.KindHTTPS {
+		server.Path = spec.Path
+	}
+	if spec.IsDomain() {
+		server.DomainResolver = "bootstrap"
+	}
+	return server
+}
+
+func buildSingboxDefaults(setting *configure.Setting) ([]SingboxDNSServer, []SingboxDNSRule, []SingboxRouteRule, []SingboxRouteRule, bool, string) {
+	dnsMode := singboxDNSMode(setting)
 
 	var dnsServers []SingboxDNSServer
 	var defaultDomainResolver string
@@ -1029,15 +1087,15 @@ func buildSingboxDefaults(setting *configure.Setting) ([]SingboxDNSServer, []Sin
 	switch dnsMode {
 	case "compatible":
 		dnsServers = []SingboxDNSServer{
-			{Type: "udp", Tag: "bootstrap", Server: "223.5.5.5"},
-			{Type: "https", Tag: "local", Server: "223.5.5.5", DomainResolver: "bootstrap"},
-			{Type: "https", Tag: "remote", Server: "8.8.8.8", DomainResolver: "bootstrap"},
+			{Type: "udp", Tag: "bootstrap", Server: singboxBootstrapDNSAddr},
+			{Type: "https", Tag: "local", Server: singboxBootstrapDNSAddr, DomainResolver: "bootstrap"},
+			buildSingboxRemoteDNSServer(setting),
 		}
 		defaultDomainResolver = "bootstrap"
 		autoDetectInterface = true
 	default:
 		dnsServers = []SingboxDNSServer{
-			{Type: "udp", Tag: "local", Server: "223.5.5.5"},
+			{Type: "udp", Tag: "local", Server: singboxBootstrapDNSAddr},
 			{Type: "udp", Tag: "remote", Server: "1.1.1.1"},
 		}
 		defaultDomainResolver = "local"

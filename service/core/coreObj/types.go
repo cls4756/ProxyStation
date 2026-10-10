@@ -17,6 +17,7 @@ type Inbound struct {
 	Protocol string           `json:"protocol"`
 	Settings *InboundSettings `json:"settings,omitempty"`
 	Sniffing Sniffing         `json:"sniffing,omitempty"`
+	StreamSettings *StreamSettings `json:"streamSettings,omitempty"`
 }
 
 type InboundSettings struct {
@@ -28,11 +29,18 @@ type InboundSettings struct {
 	FollowRedirect bool `json:"followRedirect,omitempty"`
 	// 认证用户列表（socks 和 http）
 	Accounts []InboundAccount `json:"accounts,omitempty"`
+	Clients  []InboundClient  `json:"clients,omitempty"`
 }
 
 type InboundAccount struct {
 	User string `json:"user"`
 	Pass string `json:"pass"`
+}
+
+type InboundClient struct {
+	ID      string `json:"id"`
+	AlterID int    `json:"alterId,omitempty"`
+	Email   string `json:"email,omitempty"`
 }
 
 type Sniffing struct {
