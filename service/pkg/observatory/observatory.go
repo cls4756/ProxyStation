@@ -499,14 +499,17 @@ func probeNodesWithProgress(refs []configure.NodeRef, mode string, options Probe
 		}()
 	}
 	wg.Wait()
-	if mode == "real" {
-		saveLatencyBatch(refs, "fast", fastLatencies)
-	}
 	realLatencies := make([]int, len(results))
 	for i, result := range results {
 		realLatencies[i] = result.latency
 	}
-	saveLatencyBatch(refs, mode, realLatencies)
+	if mode == "real" {
+		// 真连接模式同时产生快速预检与真连接两组结果，合并成一次写库，
+		// 避免对全量节点集合重复重写两次。
+		saveLatencyBatchMerged(refs, fastLatencies, realLatencies)
+	} else {
+		saveLatencyBatchMerged(refs, realLatencies, nil)
+	}
 	return results
 }
 
@@ -1757,34 +1760,52 @@ func probeHTTPSWithDialContext(host string, timeout time.Duration, dialContext p
 
 // saveLatency 按测速方式分别写回快速检测与真连接结果。
 func saveLatency(ref configure.NodeRef, mode string, latency int) {
-	saveLatencyBatch([]configure.NodeRef{ref}, mode, []int{latency})
+	if normalizeProbeMode(mode) == "fast" {
+		saveLatencyBatchMerged([]configure.NodeRef{ref}, []int{latency}, nil)
+		return
+	}
+	saveLatencyBatchMerged([]configure.NodeRef{ref}, nil, []int{latency})
 }
 
 func saveLatencyBatch(refs []configure.NodeRef, mode string, latencies []int) {
-	mode = normalizeProbeMode(mode)
-	now := time.Now().Unix()
-	apply := func(server *configure.ServerRaw) {
-		if mode == "fast" {
-			server.FastLatency = 0
-			server.LastFastProbeTime = now
-			return
-		}
-		server.Latency = 0
-		server.LastProbeTime = now
+	if normalizeProbeMode(mode) == "fast" {
+		saveLatencyBatchMerged(refs, latencies, nil)
+		return
 	}
+	saveLatencyBatchMerged(refs, nil, latencies)
+}
+
+// saveLatencyBatchMerged 在一次事务里写回快速检测与真连接两组结果。
+// fastLatencies/realLatencies 为 nil 表示本次不更新对应方式；真连接模式
+// 同时产出两组结果，合并写库可避免对全量节点集合重复重写两次。
+func saveLatencyBatchMerged(refs []configure.NodeRef, fastLatencies, realLatencies []int) {
+	if len(refs) == 0 {
+		return
+	}
+	now := time.Now().Unix()
 	serverUpdates := make(map[int]func(*configure.ServerRaw))
 	subscriptionUpdates := make(map[int]map[int]func(*configure.ServerRaw))
 	for i, ref := range refs {
-		if i >= len(latencies) {
-			break
+		hasFast := fastLatencies != nil && i < len(fastLatencies)
+		hasReal := realLatencies != nil && i < len(realLatencies)
+		if !hasFast && !hasReal {
+			continue
 		}
-		latency := latencies[i]
+		var fastLatency, realLatency int
+		if hasFast {
+			fastLatency = fastLatencies[i]
+		}
+		if hasReal {
+			realLatency = realLatencies[i]
+		}
 		update := func(server *configure.ServerRaw) {
-			apply(server)
-			if mode == "fast" {
-				server.FastLatency = latency
-			} else {
-				server.Latency = latency
+			if hasFast {
+				server.FastLatency = fastLatency
+				server.LastFastProbeTime = now
+			}
+			if hasReal {
+				server.Latency = realLatency
+				server.LastProbeTime = now
 			}
 		}
 		switch ref.Type {

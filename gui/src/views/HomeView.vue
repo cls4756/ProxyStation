@@ -1376,51 +1376,67 @@ async function pingRefsWithProgress(refs, mode = 'fast') {
   }
   pingStates.value = stateMap
 
-  try {
-    await api.pingNodes(queue, mode, {
-      signal: pingAbortController.value.signal,
-      enableTransProxyFallback,
-      onEvent: (evt, payload) => {
-        const ref = payload?.ref
-        if (!ref) return
-        const key = refKey({ type: ref.type, index: ref.index, sub: ref.sub || 0 })
-        if (evt === 'running') {
-          schedulePingFlush(key, { status: 'running', mode })
-        } else if (evt === 'fast') {
-          const latency = typeof payload.latency === 'number' ? payload.latency : -1
-          const probeTime = Math.floor(Date.now() / 1000)
-          schedulePingFlush(key, null, ref, {
-            fastLatency: latency,
-            lastFastProbeTime: probeTime,
-          })
-        } else if (evt === 'done') {
-          const lat = payload.latency
-          const latency = typeof lat === 'number' ? lat : -1
-          const probeTime = Math.floor(Date.now() / 1000)
-          const patch = mode === 'fast'
-            ? { fastLatency: latency, lastFastProbeTime: probeTime }
-            : { latency, lastProbeTime: probeTime }
-          schedulePingFlush(key, { status: 'done', mode, latency }, ref, patch)
-          pingProgress.value.done += 1
+  // 后端发完所有 done 事件后还要落库才发送 end。前端只要收到全部 done 就
+  // 视为测速结束，不再等待 end／流关闭，避免中止按钮长时间停留在「测速中」。
+  let settleProbeFinished
+  const probeFinished = new Promise(resolve => { settleProbeFinished = resolve })
+  let allNodesDone = false
+  let streamError = null
+
+  const streamTask = api.pingNodes(queue, mode, {
+    signal: pingAbortController.value.signal,
+    enableTransProxyFallback,
+    onEvent: (evt, payload) => {
+      const ref = payload?.ref
+      if (!ref) return
+      const key = refKey({ type: ref.type, index: ref.index, sub: ref.sub || 0 })
+      if (evt === 'running') {
+        schedulePingFlush(key, { status: 'running', mode })
+      } else if (evt === 'fast') {
+        const latency = typeof payload.latency === 'number' ? payload.latency : -1
+        const probeTime = Math.floor(Date.now() / 1000)
+        schedulePingFlush(key, null, ref, {
+          fastLatency: latency,
+          lastFastProbeTime: probeTime,
+        })
+      } else if (evt === 'done') {
+        const lat = payload.latency
+        const latency = typeof lat === 'number' ? lat : -1
+        const probeTime = Math.floor(Date.now() / 1000)
+        const patch = mode === 'fast'
+          ? { fastLatency: latency, lastFastProbeTime: probeTime }
+          : { latency, lastProbeTime: probeTime }
+        schedulePingFlush(key, { status: 'done', mode, latency }, ref, patch)
+        pingProgress.value.done += 1
+        if (pingProgress.value.done >= pingProgress.value.total) {
+          allNodesDone = true
+          settleProbeFinished()
         }
-      },
-    })
-    flushPendingPingUpdates()
-    // 真连接 + trans-proxy 回退时，后端成功后会把前置代理写回节点。
-    // 按引用补载本次测速的节点，让列表里的「前置代理」列同步更新。
-    if (enableTransProxyFallback) {
+      }
+    },
+  }).catch(e => {
+    streamError = e
+  })
+  void streamTask.then(settleProbeFinished)
+
+  await probeFinished
+  flushPendingPingUpdates()
+  if (!allNodesDone) {
+    if (pingAbortController.value?.signal?.aborted || streamError?.name === 'AbortError') {
+      pingAborted.value = true
+      return
+    }
+    if (streamError) throw streamError
+  }
+  // 真连接 + trans-proxy 回退时，后端成功后会把前置代理写回节点。落库发生在
+  // done 之后，所以等流真正关闭再按引用补载节点，让「前置代理」列同步更新。
+  if (enableTransProxyFallback) {
+    void streamTask.then(async () => {
       try {
         const results = await store.fetchNodes(queue)
         patchSearchResults((results || []).map(item => ({ ref: item.ref, patch: item.server })))
       } catch {}
-    }
-  } catch (e) {
-    flushPendingPingUpdates()
-    if (e?.name === 'AbortError' || pingAbortController.value?.signal?.aborted) {
-      pingAborted.value = true
-      return
-    }
-    throw e
+    })
   }
 }
 
