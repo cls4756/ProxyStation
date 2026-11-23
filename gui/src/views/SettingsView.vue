@@ -287,7 +287,7 @@
                 <div class="copy-rule-row">
                   <label class="copy-section-label">来源分组</label>
                   <div class="cleanup-groups">
-                    <label v-for="g in groups" :key="g.id" class="cleanup-group-item">
+                    <label v-for="g in localGroups" :key="g.id" class="cleanup-group-item">
                       <input type="checkbox" :value="g.id" v-model="rule.groupIds" />
                       <span>{{ g.name }}</span>
                     </label>
@@ -300,8 +300,17 @@
                     <option value="real">快速成功但真连接失败才清理</option>
                     <option value="realstrict">真连接失败就清理</option>
                     <option value="fast">快速连接失败就清理</option>
+                    <option value="transit">中转失败才清理</option>
                   </select>
                 </div>
+                <template v-if="rule.mode === 'transit'">
+                  <div class="copy-rule-row">
+                    <label class="copy-section-label">中转评分阈值</label>
+                    <input type="number" class="input field-input" v-model.number="rule.transitScoreThreshold" min="0" max="100" step="1" />
+                    <span class="field-inline-suffix">分（评分高于此值才重试中转）</span>
+                  </div>
+                  <div class="field-tip">先快速检测；失败且评分高于阈值时，保存默认前置代理 trans-proxy 后重试。未评分或评分不高于阈值时不重试中转。最终快速检测失败或真连接检测失败均会清理，否则保留。</div>
+                </template>
                 <div class="copy-rule-row">
                   <label class="copy-section-label">运行周期</label>
                   <input type="number" class="input field-input" v-model.number="rule.intervalHour" min="1" />
@@ -336,7 +345,7 @@
         <div class="field-row field-row-tip">
           <label class="field-label"></label>
           <div class="field-tip">
-            默认关闭。开启后在节点列表点「IP 评分」，会把<strong>节点的服务器地址</strong>发送给下方选择的第三方服务查询评分（不含密码等节点凭据）。
+            默认关闭。开启后在节点列表点「IP 评分」，会把<strong>节点解析后的 IP 地址</strong>发送给下方选择的第三方服务查询评分（不含密码等节点凭据）。
             这些服务都没有面向第三方调用的正式授权，接口随时可能变更或失效，请自行斟酌后启用。
           </div>
         </div>
@@ -344,15 +353,16 @@
           <div class="field-row">
             <label class="field-label">评分服务商</label>
             <select class="input field-input" v-model="form.ipScoreProvider">
-              <option value="cleanip">CleanIP.io（内置，评分口径公开）</option>
+              <option value="netcoffee">Net.Coffee（内置，含信任评分）</option>
               <option value="custom">自定义接口</option>
             </select>
           </div>
-          <div class="field-row field-row-tip" v-if="form.ipScoreProvider === 'cleanip'">
+          <div class="field-row field-row-tip" v-if="form.ipScoreProvider === 'netcoffee'">
             <label class="field-label"></label>
             <div class="field-tip">
-              6 个维度加权（身份可信 20% / 匿名规避 25% / 滥用历史 20% / 黑名单 15% / 攻击行为 10% / 本地信誉 10%），
-              再按 IP 用途乘子修正，返回 0–100 分值与等级。
+              综合滥用历史、代理/VPN/机房判定给出 0–100 的信任评分，并附带国家/地区信息。
+              接口只接受 IP，程序会先解析节点域名再查询。<br />
+              该站 <code>robots.txt</code> 声明了 <code>Disallow: /api/</code>，且为免费公共资源、可能较慢或限流，是否使用请自行判断。
             </div>
           </div>
           <template v-if="form.ipScoreProvider === 'custom'">
@@ -371,8 +381,7 @@
                 用 <code>{ip}</code> 标记待查 IP 的位置（如放在路径上）；不写占位符则自动追加 <code>?ip=</code> 参数。
                 响应需为 JSON，会自动查找评分字段（<code>trust_score</code> / <code>purity_score</code> / <code>score</code> 等，支持嵌套），
                 并顺带读取 <code>grade</code>、<code>risk_level</code> 等可选字段。<br />
-                例：Net.Coffee 填 <code>https://ip.net.coffee/api/ip/lookup/{ip}</code>
-                （该站 robots.txt 声明了 <code>Disallow: /api/</code>，是否使用请自行判断）。
+                例：<code>https://example.com/ip/lookup/{ip}</code>。
               </div>
             </div>
           </template>
@@ -496,8 +505,8 @@ const form = reactive({
   groupActiveNodeProbeIntervalSec: 180,
   nodeCleanupRules: [],
   ipScoreEnabled: false,
-  ipScoreProvider: 'cleanip',
-  // 自定义地址单独存一份，切到 cleanip 再切回来时不会丢
+  ipScoreProvider: 'netcoffee',
+  // 自定义地址单独存一份，切到内置服务商再切回来时不会丢
   ipScoreCustomEndpoint: '',
   ipScoreMinIntervalMs: 1500,
   socks5Port: 20260,
@@ -552,7 +561,7 @@ async function loadSetting() {
       groupActiveNodeProbeIntervalSec: s.groupActiveNodeProbeIntervalSec || 180,
       nodeCleanupRules: normalizeCleanupRules(s),
       ipScoreEnabled: !!s.ipScoreEnabled,
-      ipScoreProvider: s.ipScoreProvider || 'cleanip',
+      ipScoreProvider: s.ipScoreProvider || 'netcoffee',
       ipScoreCustomEndpoint: s.ipScoreEndpoint || '',
       ipScoreMinIntervalMs: s.ipScoreMinIntervalMs || 1500,
       socks5Port: s.socks5Port || 20260,
@@ -605,9 +614,10 @@ function normalizeCleanupRules(setting) {
   if (Array.isArray(setting?.nodeCleanupRules) && setting.nodeCleanupRules.length > 0) {
     return setting.nodeCleanupRules.map(rule => ({
       groupIds: Array.isArray(rule?.groupIds) ? [...new Set(rule.groupIds.filter(Boolean))] : [],
-      mode: (rule?.mode === 'fast' || rule?.mode === 'realstrict') ? rule.mode : 'real',
+      mode: ['fast', 'realstrict', 'transit'].includes(rule?.mode) ? rule.mode : 'real',
       intervalHour: Number(rule?.intervalHour) > 0 ? Number(rule.intervalHour) : 24,
       recycleGroupId: rule?.recycleGroupId || '',
+      transitScoreThreshold: rule?.transitScoreThreshold ?? 85,
     }))
   }
   if (Array.isArray(setting?.nodeCleanupGroupIds) && setting.nodeCleanupGroupIds.length > 0) {
@@ -616,27 +626,32 @@ function normalizeCleanupRules(setting) {
       mode: (setting.nodeCleanupMode === 'fast' || setting.nodeCleanupMode === 'realstrict') ? setting.nodeCleanupMode : 'real',
       intervalHour: Number(setting.nodeCleanupIntervalHour) > 0 ? Number(setting.nodeCleanupIntervalHour) : 24,
       recycleGroupId: setting.nodeCleanupRecycleGroupId || '',
+      transitScoreThreshold: 85,
     }]
   }
   return []
 }
 
 function sanitizeCleanupRules(rules) {
+  const localGroupIds = new Set(localGroups.value.map(group => group.id))
   return rules
     .map(rule => ({
-      groupIds: [...new Set((rule.groupIds || []).filter(Boolean))],
-      mode: (rule.mode === 'fast' || rule.mode === 'realstrict') ? rule.mode : 'real',
+      groupIds: [...new Set((rule.groupIds || []).filter(id => localGroupIds.has(id)))],
+      mode: ['fast', 'realstrict', 'transit'].includes(rule.mode) ? rule.mode : 'real',
       intervalHour: Number(rule.intervalHour) > 0 ? Number(rule.intervalHour) : 24,
       recycleGroupId: (rule.recycleGroupId && !(rule.groupIds || []).includes(rule.recycleGroupId)) ? rule.recycleGroupId : '',
+      ...(rule.mode === 'transit' ? { transitScoreThreshold: rule.transitScoreThreshold ?? 85 } : {}),
     }))
     .filter(rule => rule.groupIds.length > 0)
 }
 
 function addCleanupRule() {
-  form.nodeCleanupRules.push({ groupIds: [], mode: 'real', intervalHour: 24, recycleGroupId: '' })
+  form.nodeCleanupRules.push({ groupIds: [], mode: 'real', intervalHour: 24, recycleGroupId: '', transitScoreThreshold: 85 })
 }
 
 function removeCleanupRule(index) {
+  if (!form.nodeCleanupRules[index]) return
+  if (!confirm(`确定删除第 ${index + 1} 条节点清理规则吗？\n删除将在保存设置后生效，不会删除节点。`)) return
   form.nodeCleanupRules.splice(index, 1)
 }
 
@@ -645,6 +660,8 @@ function addCopyRule() {
 }
 
 function removeCopyRule(index) {
+  if (!form.subscriptionBestNodeCopyRules[index]) return
+  if (!confirm(`确定删除第 ${index + 1} 条节点自动复制规则吗？\n删除将在保存设置后生效，已复制的节点不受影响。`)) return
   form.subscriptionBestNodeCopyRules.splice(index, 1)
 }
 
@@ -715,13 +732,21 @@ function kernelActionClass(k) {
   return k.installed ? 'btn-light' : 'btn-primary'
 }
 
-// 自定义地址始终随设置保存，这样切到 cleanip 再切回来还在。
+// 自定义地址始终随设置保存，这样切到内置服务商再切回来还在。
 // 后端只在服务商为 custom 时使用它，内置服务商固定用自己的地址。
 function ipScoreEndpointToSave() {
   return (form.ipScoreCustomEndpoint || '').trim()
 }
 
 async function saveSettings() {
+  const invalidThreshold = form.nodeCleanupRules.some(rule => {
+    if (rule.mode !== 'transit' || !rule.groupIds?.length) return false
+    return !Number.isInteger(rule.transitScoreThreshold) || rule.transitScoreThreshold < 0 || rule.transitScoreThreshold > 100
+  })
+  if (invalidThreshold) {
+    saveMsg.value = { error: true, text: '中转检测评分阈值必须是 0 到 100 的整数' }
+    return
+  }
   saving.value = true
   saveMsg.value = null
   const copyRules = sanitizeCopyRules(form.subscriptionBestNodeCopyRules)

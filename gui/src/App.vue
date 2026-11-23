@@ -80,7 +80,7 @@
               <span
                 v-if="o.name !== 'proxy'"
                 class="dd-del-btn"
-                @click.stop="deleteOutbound(o.name); showOutboundMenu = false"
+                @click.stop="deleteOutbound(o.name)"
                 title="删除"
               >✕</span>
             </div>
@@ -944,8 +944,11 @@ async function createOutbound() {
 }
 
 async function deleteOutbound(name) {
+  if (!name || name === 'proxy') return
+  if (!confirm(`确定删除出站「${name}」吗？\n使用此出站的路由规则或连接可能受影响，节点和分组不会被删除。`)) return
   await api.deleteOutbound(name)
   if (currentOutbound.value === name) currentOutbound.value = 'proxy'
+  showOutboundMenu.value = false
   await store.fetchOutbounds()
 }
 
@@ -976,6 +979,7 @@ async function submitOutboundRename() {
     await api.renameOutbound(oldName, newName)
     if (currentOutbound.value === oldName) currentOutbound.value = newName
     store.invalidateNodeDetails()
+    window.dispatchEvent(new CustomEvent('proxystation-data-mutated'))
     closeOutboundRename()
     await Promise.all([
       store.fetchOutbounds(),

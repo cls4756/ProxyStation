@@ -3,8 +3,6 @@ package configure
 import (
 	"fmt"
 	"strings"
-
-	"github.com/ProxyStation/proxystation/db"
 )
 
 // SelectionMode 出站节点选择模式
@@ -95,27 +93,33 @@ func GetOutbound(name string) *Outbound {
 	if name == "" {
 		name = "proxy"
 	}
-	var o Outbound
-	if err := db.Get(fmt.Sprintf("outbound.%v", name), "config", &o); err != nil {
-		return nil
-	}
-	return &o
+	return getOutboundStore(name)
 }
 
 func SetOutbound(name string, o *Outbound) error {
 	if name == "" {
 		name = "proxy"
 	}
-	return db.Set(fmt.Sprintf("outbound.%v", name), "config", o)
+	if o == nil {
+		return fmt.Errorf("outbound is nil")
+	}
+	o.Name = name
+	return setOutboundStore(o)
 }
 
 func GetOutboundNames() []string {
-	names, _ := db.GetBucketKeys("outbounds")
+	names := outboundNamesStore()
 	result := []string{"proxy"}
 	for _, n := range names {
-		if n != "proxy" {
-			result = append(result, n)
+		if n == "proxy" {
+			continue
 		}
+		// 内核保留 tag（direct/block/__probe__）不作为用户出站暴露；它们的配置即使
+		// 落库也不应出现在出站列表里，与旧版“只列存在标记”的语义保持一致。
+		if reservedOutboundNames[strings.ToLower(n)] {
+			continue
+		}
+		result = append(result, n)
 	}
 	return result
 }
@@ -152,7 +156,7 @@ func AddOutbound(name string) error {
 	if err := ValidateOutboundName(name); err != nil {
 		return err
 	}
-	return db.Set("outbounds", strings.TrimSpace(name), true)
+	return setOutboundStore(&Outbound{Name: strings.TrimSpace(name)})
 }
 
 // RenameOutbound 给出站改名，并把所有引用旧名字的配置一起迁移过去。
@@ -173,10 +177,10 @@ func RenameOutbound(oldName, newName string) error {
 	if oldName == newName {
 		return nil
 	}
-	if !db.Exists("outbounds", oldName) {
+	if !outboundExists(oldName) {
 		return fmt.Errorf("出站 %v 不存在", oldName)
 	}
-	if db.Exists("outbounds", newName) {
+	if outboundExists(newName) {
 		return fmt.Errorf("出站 %v 已存在", newName)
 	}
 
@@ -185,16 +189,10 @@ func RenameOutbound(oldName, newName string) error {
 		o = &Outbound{Name: newName}
 	}
 	o.Name = newName
-	if err := db.Set("outbounds", newName, true); err != nil {
+	if err := setOutboundStore(o); err != nil {
 		return err
 	}
-	if err := SetOutbound(newName, o); err != nil {
-		return err
-	}
-	if err := db.BucketClear(fmt.Sprintf("outbound.%v", oldName)); err != nil {
-		return err
-	}
-	if err := db.Set("outbounds", oldName, nil); err != nil {
+	if err := deleteOutboundStore(oldName); err != nil {
 		return err
 	}
 	RetargetOutboundReferences(oldName, newName)
@@ -206,15 +204,12 @@ func RenameOutbound(oldName, newName string) error {
 // 而忽略，路由规则匹配不到出站）。
 func RetargetOutboundReferences(oldName, newName string) {
 	servers := GetServers()
-	serversChanged := false
 	for i := range servers {
 		if servers[i].FrontProxy == oldName {
-			servers[i].FrontProxy = newName
-			serversChanged = true
+			_ = UpdateServer(i, func(server *ServerRaw) {
+				server.FrontProxy = newName
+			})
 		}
-	}
-	if serversChanged {
-		_ = SetServers(servers)
 	}
 
 	for i := 0; i < GetLenSubscriptions(); i++ {
@@ -222,19 +217,20 @@ func RetargetOutboundReferences(oldName, newName string) {
 		if sub == nil {
 			continue
 		}
-		changed := false
 		if sub.ProxyOutbound == oldName {
 			sub.ProxyOutbound = newName
-			changed = true
+			_ = UpdateSubscriptionMeta(i, sub)
 		}
+		updates := make(map[int]func(*ServerRaw))
 		for j := range sub.Servers {
 			if sub.Servers[j].FrontProxy == oldName {
-				sub.Servers[j].FrontProxy = newName
-				changed = true
+				updates[j] = func(server *ServerRaw) {
+					server.FrontProxy = newName
+				}
 			}
 		}
-		if changed {
-			_ = SetSubscription(i, sub)
+		if len(updates) > 0 {
+			_ = UpdateSubscriptionServers(i, updates)
 		}
 	}
 
@@ -252,10 +248,7 @@ func RetargetOutboundReferences(oldName, newName string) {
 }
 
 func RemoveOutbound(name string) error {
-	if err := db.BucketClear(fmt.Sprintf("outbound.%v", name)); err != nil {
-		return err
-	}
-	return db.Set("outbounds", name, nil)
+	return deleteOutboundStore(name)
 }
 
 // SetOutboundActiveNode 由 observatory 调用，更新当前活跃节点

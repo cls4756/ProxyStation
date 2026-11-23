@@ -240,13 +240,16 @@ func TestSearchServersReturnsGroupNames(t *testing.T) {
 
 	var payload struct {
 		Results []struct {
-			GroupNames []string `json:"groupNames"`
+			GroupNames []string            `json:"groupNames"`
+			Ref        configure.ServerRef `json:"ref"`
 		} `json:"results"`
 	}
 	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if len(payload.Results) != 1 || !reflect.DeepEqual(payload.Results[0].GroupNames, []string{"分组一", "分组二"}) {
+	if len(payload.Results) != 2 || payload.Results[0].Ref == payload.Results[1].Ref ||
+		!reflect.DeepEqual(payload.Results[0].GroupNames, []string{"分组一"}) ||
+		!reflect.DeepEqual(payload.Results[1].GroupNames, []string{"分组二"}) {
 		t.Fatalf("unexpected search groups: %s", recorder.Body.String())
 	}
 }
@@ -849,7 +852,7 @@ func TestSaveIPScoreStoresGeoAndKeepsItWhenProviderOmitsGeo(t *testing.T) {
 	}
 	ref := configure.NodeRef{Type: "server", Index: 0}
 	if err := saveIPScore(ref, ipscore.Result{
-		Score: 82, Provider: ipscore.ProviderCleanIP,
+		Score: 82, Provider: ipscore.ProviderNetCoffee,
 		Country: "澳大利亚", CountryCode: "AU", Region: "昆士兰州", City: "布里斯班",
 	}); err != nil {
 		t.Fatalf("save score with geo: %v", err)

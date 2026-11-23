@@ -39,55 +39,59 @@ func Bytes2Group(b []byte) (*Group, error) {
 }
 
 func GetGroups() []Group {
-	result := make([]Group, 0)
-	raw, err := db.ListGetAll("touch", "groups")
+	result, err := loadGroups()
 	if err != nil {
-		return result
-	}
-	for _, b := range raw {
-		g, err := Bytes2Group(b)
-		if err != nil {
-			continue
-		}
-		result = append(result, *g)
+		return []Group{}
 	}
 	return result
 }
 
 func GetGroup(index int) *Group {
-	b, err := db.ListGet("touch", "groups", index)
+	row, err := groupDAO.get(index)
 	if err != nil {
 		return nil
 	}
-	g, _ := Bytes2Group(b)
-	return g
+	g := row.toGroup(groupServersGet(row.id))
+	return &g
 }
 
 func GetGroupByID(id string) (int, *Group) {
-	groups := GetGroups()
-	for i, g := range groups {
-		if g.ID == id {
-			return i, &groups[i]
-		}
+	var index int
+	if err := db.ReadDB().QueryRow(`SELECT idx FROM groups WHERE id = ?`, id).Scan(&index); err != nil {
+		return -1, nil
 	}
-	return -1, nil
+	row, err := groupDAO.get(index)
+	if err != nil {
+		return -1, nil
+	}
+	g := row.toGroup(groupServersGet(row.id))
+	return index, &g
+}
+
+func GetGroupMetadataByID(id string) *Group {
+	row, err := groupDAO.scan(db.ReadDB().QueryRow(
+		`SELECT id, name, from_sub, sub_id, created_at FROM groups WHERE id = ?`, id).Scan)
+	if err != nil {
+		return nil
+	}
+	group := row.toGroup(nil)
+	return &group
 }
 
 func AppendGroup(group *Group) error {
-	return db.ListAppend("touch", "groups", []*Group{group})
+	return appendGroup(group)
 }
 
 func SetGroup(index int, group *Group) error {
-	return db.ListSet("touch", "groups", index, group)
+	return setGroup(index, group)
 }
 
 func RemoveGroups(indexes []int) error {
-	return db.ListRemove("touch", "groups", indexes)
+	return removeGroups(indexes)
 }
 
 func GetLenGroups() int {
-	l, _ := db.ListLen("touch", "groups")
-	return l
+	return groupDAO.count()
 }
 
 // AddServerToGroup 将节点引用加入分组
@@ -97,24 +101,7 @@ func AddServerToGroup(groupIndex int, ref ServerRef) error {
 
 // AddServersToGroup 将多个节点引用一次性加入分组。
 func AddServersToGroup(groupIndex int, refs []ServerRef) error {
-	return db.ListUpdate("touch", "groups", groupIndex, func(raw []byte) ([]byte, error) {
-		group, err := Bytes2Group(raw)
-		if err != nil {
-			return nil, err
-		}
-		existing := make(map[ServerRef]struct{}, len(group.Servers)+len(refs))
-		for _, ref := range group.Servers {
-			existing[ref] = struct{}{}
-		}
-		for _, ref := range refs {
-			if _, ok := existing[ref]; ok {
-				continue
-			}
-			group.Servers = append(group.Servers, ref)
-			existing[ref] = struct{}{}
-		}
-		return json.Marshal(group)
-	})
+	return addServersToGroup(groupIndex, refs)
 }
 
 // RemoveServerFromGroup 从分组中移除节点引用
@@ -124,22 +111,5 @@ func RemoveServerFromGroup(groupIndex int, ref ServerRef) error {
 
 // RemoveServersFromGroup 将多个节点引用一次性移出分组。
 func RemoveServersFromGroup(groupIndex int, refs []ServerRef) error {
-	remove := make(map[ServerRef]struct{}, len(refs))
-	for _, ref := range refs {
-		remove[ref] = struct{}{}
-	}
-	return db.ListUpdate("touch", "groups", groupIndex, func(raw []byte) ([]byte, error) {
-		group, err := Bytes2Group(raw)
-		if err != nil {
-			return nil, err
-		}
-		servers := make([]ServerRef, 0, len(group.Servers))
-		for _, ref := range group.Servers {
-			if _, ok := remove[ref]; !ok {
-				servers = append(servers, ref)
-			}
-		}
-		group.Servers = servers
-		return json.Marshal(group)
-	})
+	return removeServersFromGroup(groupIndex, refs)
 }

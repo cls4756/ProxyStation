@@ -231,12 +231,7 @@ func getServerRaw(ref *configure.NodeRef) *configure.ServerRaw {
 	case "server":
 		return configure.GetServer(ref.Index)
 	case "sub_server":
-		sub := configure.GetSubscription(ref.Sub)
-		if sub == nil || ref.Index >= len(sub.Servers) {
-			return nil
-		}
-		s := sub.Servers[ref.Index]
-		return &s
+		return configure.GetSubscriptionServer(ref.Sub, ref.Index)
 	}
 	return nil
 }

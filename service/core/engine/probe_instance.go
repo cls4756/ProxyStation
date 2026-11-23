@@ -49,19 +49,22 @@ func probeKernelBin(kernel KernelType) (string, error) {
 // 节点配置前置代理且主内核探测入口可用时，目标节点经主内核对应出站建链。
 // 调用方必须在测速结束后调用 Close 回收进程与临时文件。
 func StartProbeInstance(s *configure.ServerRaw, socksPort int) (*ProbeInstance, error) {
-	options := probeInstanceOptions{}
-	if s != nil && s.FrontProxy != "" && MainProbeAvailable(300*time.Millisecond) {
-		options.mainFrontOutbound = s.FrontProxy
-	}
-	return startProbeInstance(s, socksPort, options)
+	return StartProbeInstanceWithKernelMode(s, socksPort, configure.GetProbeConfig().KernelMode)
 }
 
-func startProbeInstance(s *configure.ServerRaw, socksPort int, options probeInstanceOptions) (*ProbeInstance, error) {
+func StartProbeInstanceWithKernelMode(server *configure.ServerRaw, socksPort int, kernelMode string) (*ProbeInstance, error) {
+	options := probeInstanceOptions{}
+	if server != nil && server.FrontProxy != "" && MainProbeAvailable(300*time.Millisecond) {
+		options.mainFrontOutbound = server.FrontProxy
+	}
+	return startProbeInstance(server, socksPort, options, kernelMode)
+}
+
+func startProbeInstance(s *configure.ServerRaw, socksPort int, options probeInstanceOptions, kernelMode string) (*ProbeInstance, error) {
 	if s == nil {
 		return nil, fmt.Errorf("nil server")
 	}
-	probeConfig := configure.GetProbeConfig()
-	kernel := probeInstanceKernel(s, probeConfig.KernelMode)
+	kernel := probeInstanceKernel(s, kernelMode)
 
 	binPath, err := probeKernelBin(kernel)
 	if err != nil {
@@ -160,29 +163,19 @@ func (pi *ProbeInstance) Close() {
 	})
 }
 
-// probeInstanceKernel 按节点协议决定使用哪个内核，比全局 selectKernel 更精准：
-// 只要该节点协议要求 sing-box 就用 sing-box，否则回退到用户设置的内核倾向。
+// probeInstanceKernel 为单个节点选择探测内核，解析顺序与主内核 selectKernel 完全一致：
+// 显式设置优先，其次协议强制要求 sing-box，最后走统一的默认值。这样"直连探测"和
+// "绑定出站后复用主内核探测"不会因为选中不同内核而给出不一致的测速结果。
 func probeInstanceKernel(s *configure.ServerRaw, kernelMode string) KernelType {
+	if k, ok := explicitKernelMode(kernelMode); ok {
+		return k
+	}
 	if s != nil {
 		if k, ok := ProtocolKernelMap[s.Type]; ok && k == KernelSingbox {
 			return KernelSingbox
 		}
 	}
-	switch kernelMode {
-	case "singbox":
-		return KernelSingbox
-	case "xray":
-		return KernelXray
-	case "v2ray":
-		return KernelV2ray
-	}
-	if _, err := findBin([]string{"xray", "xray.exe"}, []string{"/usr/local/bin/xray", "/usr/bin/xray"}); err == nil {
-		return KernelXray
-	}
-	if _, err := findBin([]string{"v2ray", "v2ray.exe"}, []string{"/usr/local/bin/v2ray", "/usr/bin/v2ray"}); err == nil {
-		return KernelV2ray
-	}
-	return KernelSingbox
+	return defaultKernel()
 }
 
 // frontProxyChainRefs 沿前置代理链上溯，返回链上每一跳的节点（从直接前置到最外层）。

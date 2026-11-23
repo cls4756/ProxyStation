@@ -859,7 +859,9 @@ async function saveInboundSubscription() {
 }
 
 async function deleteInboundSubscription(index) {
-  if (!confirm('确定删除这个在线订阅吗？已有客户端链接将立即失效。')) return
+  const subscription = inboundSubscriptions.value[index]
+  if (!subscription) return
+  if (!confirm(`确定删除在线订阅「${subscription.name || '未命名订阅'}」吗？\n该订阅链接将立即失效，客户端将无法再通过它更新配置。`)) return
   try { await api.deleteInboundSubscription(index); await loadInboundSubscriptions() } catch (e) { alert('删除失败: ' + (e?.response?.data?.error || e.message)) }
 }
 
@@ -967,9 +969,13 @@ async function saveRule() {
   await loadRules()
 }
 
-async function deleteRule(i) {
-  rules.value.splice(i, 1)
-  await api.setRoutingRules(rules.value)
+async function deleteRule(ruleIndex) {
+  const rule = rules.value[ruleIndex]
+  if (!rule) return
+  if (!confirm(`确定删除路由规则「${rule.name || '未命名规则'}」吗？\n删除后该规则不再参与流量分流，相关流量将按其他规则处理。`)) return
+  const remainingRules = rules.value.filter(candidate => candidate.id !== rule.id)
+  await api.setRoutingRules(remainingRules)
+  rules.value = remainingRules
 }
 
 async function toggleRule(i) {
@@ -991,6 +997,10 @@ function triggerImportRules() {
 async function importRules(event) {
   const file = event.target.files?.[0]
   if (!file) return
+  if (!confirm(`确定从文件「${file.name}」导入路由规则吗？\n现有路由规则将全部被替换（不是追加导入），相关流量分流会改变。建议先导出备份。`)) {
+    event.target.value = ''
+    return
+  }
   
   const formData = new FormData()
   formData.append('file', file)
@@ -1231,21 +1241,25 @@ async function saveInbound() {
   await Promise.all([store.fetchOutbounds(), store.fetchCustomInbounds()])
 }
 
-async function deleteInbound(i) {
-  const target = pureInbounds.value[i]
-  const idx = inbounds.value.findIndex(x => x.id === target.id)
-  if (idx >= 0) inbounds.value.splice(idx, 1)
-  await api.setCustomInbounds(inbounds.value)
+async function deleteInbound(inboundIndex) {
+  const target = pureInbounds.value[inboundIndex]
+  if (!target) return
+  if (!confirm(`确定删除入站「${target.name || target.tag || '未命名入站'}」吗？\n该入站将停止监听，相关连接和使用它的在线订阅可能受影响。`)) return
+  const remainingInbounds = inbounds.value.filter(candidate => candidate.id !== target.id)
+  await api.setCustomInbounds(remainingInbounds)
+  inbounds.value = remainingInbounds
   await loadInbounds()
   store.invalidateNodeDetails()
   await Promise.all([store.fetchOutbounds(), store.fetchCustomInbounds()])
 }
 
-async function deleteBuiltinProxy(i) {
-  const target = builtinOutbounds.value[i]
-  const idx = inbounds.value.findIndex(x => x.id === target.id)
-  if (idx >= 0) inbounds.value.splice(idx, 1)
-  await api.setCustomInbounds(inbounds.value)
+async function deleteBuiltinProxy(proxyIndex) {
+  const target = builtinOutbounds.value[proxyIndex]
+  if (!target) return
+  if (!confirm(`确定删除内置代理节点「${target.name || '未命名代理'}」吗？\n该代理将停止运行，自动生成的节点会被移除，相关连接可能中断。`)) return
+  const remainingInbounds = inbounds.value.filter(candidate => candidate.id !== target.id)
+  await api.setCustomInbounds(remainingInbounds)
+  inbounds.value = remainingInbounds
   await loadInbounds()
   store.invalidateNodeDetails()
   await Promise.all([store.fetchOutbounds(), store.fetchCustomInbounds()])

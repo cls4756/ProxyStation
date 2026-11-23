@@ -1,9 +1,5 @@
 package configure
 
-import (
-	"github.com/ProxyStation/proxystation/db"
-)
-
 // CustomInbound 用户自定义入站
 type CustomInbound struct {
 	ID       string `json:"id"`
@@ -95,14 +91,9 @@ func (c CustomInbound) AuthAccounts() []InboundAccount {
 }
 
 func GetCustomInbounds() []CustomInbound {
-	var inbounds []CustomInbound
-	_ = db.Get("system", "custom_inbounds", &inbounds)
-	if inbounds == nil {
-		inbounds = []CustomInbound{}
-	}
-	return inbounds
+	return loadCustomInbounds()
 }
 
 func SetCustomInbounds(inbounds []CustomInbound) error {
-	return db.Set("system", "custom_inbounds", inbounds)
+	return replaceCustomInbounds(inbounds)
 }

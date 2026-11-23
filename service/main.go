@@ -67,6 +67,33 @@ func main() {
 	}
 	defer db.Close()
 
+	// 把旧布局里内嵌在订阅文档中的节点迁移成按行存储
+	if err := configure.MigrateSubscriptionStorage(); err != nil {
+		log.Fatalf("failed to migrate subscription storage: %v", err)
+	}
+	// 把按整行 JSON 存储的节点迁移到列式 nodes 表
+	if err := configure.MigrateNodeStorage(); err != nil {
+		log.Fatalf("failed to migrate node storage: %v", err)
+	}
+
+	// 把其余按 JSON 存储的集合/配置迁移到各自的列式表（幂等，已迁移则跳过）。
+	for _, m := range []struct {
+		name string
+		fn   func() error
+	}{
+		{"groups", configure.MigrateGroupStorage},
+		{"routing rules", configure.MigrateRoutingRuleStorage},
+		{"custom inbounds", configure.MigrateCustomInboundStorage},
+		{"inbound subscriptions", configure.MigrateInboundSubscriptionStorage},
+		{"outbounds", configure.MigrateOutboundStorage},
+		{"setting", configure.MigrateSettingStorage},
+		{"sessions", configure.MigrateSessionStorage},
+	} {
+		if err := m.fn(); err != nil {
+			log.Fatalf("failed to migrate %s storage: %v", m.name, err)
+		}
+	}
+
 	// 初始化引擎管理器
 	engine.Init(*dataDir)
 	// 提前绑定引擎日志回调，确保启动阶段日志可见

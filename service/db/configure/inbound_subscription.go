@@ -4,8 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"time"
-
-	"github.com/ProxyStation/proxystation/db"
 )
 
 // InboundSubscription 将一个或多个 HTTP/SOCKS/VMess 入站发布为客户端订阅。
@@ -43,33 +41,20 @@ func Bytes2InboundSubscription(b []byte) (*InboundSubscription, error) {
 }
 
 func GetInboundSubscriptions() []InboundSubscription {
-	result := make([]InboundSubscription, 0)
-	raw, err := db.ListGetAll("touch", "inbound_subscriptions")
-	if err != nil {
-		return result
-	}
-	for _, item := range raw {
-		value, err := Bytes2InboundSubscription(item)
-		if err == nil {
-			result = append(result, *value)
-		}
-	}
-	return result
+	return loadInboundSubscriptions()
 }
 
 func AppendInboundSubscription(value *InboundSubscription) error {
-	return db.ListAppend("touch", "inbound_subscriptions", value)
+	return appendInboundSubscription(value)
 }
 
 func SetInboundSubscription(index int, value *InboundSubscription) error {
-	return db.ListSet("touch", "inbound_subscriptions", index, value)
+	return setInboundSubscription(index, value)
 }
 
 func DeleteInboundSubscription(index int) error {
-	items := GetInboundSubscriptions()
-	if index < 0 || index >= len(items) {
+	if index < 0 || index >= len(loadInboundSubscriptions()) {
 		return fmt.Errorf("index %d out of range", index)
 	}
-	items = append(items[:index], items[index+1:]...)
-	return db.Set("touch", "inbound_subscriptions", items)
+	return deleteInboundSubscription(index)
 }

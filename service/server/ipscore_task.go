@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -88,6 +89,8 @@ func startIPScoreTaskSerialized(refs []configure.NodeRef) error {
 	// Client 常驻，让多轮任务之间也共享限速节奏，避免“停一下再点”绕过间隔
 	if ipScoreTask.client == nil {
 		ipScoreTask.client = ipscore.NewClient(ipTypeHTTPClient())
+		// 走代理的请求遇到链路抖动时，换直连再试一次，明显减少“部分节点失败”
+		ipScoreTask.client.FallbackHTTPClient = directHTTPClient(20 * time.Second)
 	}
 	client := ipScoreTask.client
 	ipScoreTask.state = ipScoreTaskState{
@@ -136,7 +139,7 @@ func runIPScoreTask(client *ipscore.Client, refs []configure.NodeRef, opt ipscor
 	addLog(fmt.Sprintf("🧮 开始查询 %d 个节点的 IP 评分（%s，每 %v 一个）",
 		len(refs), opt.Provider, opt.MinInterval))
 
-	// 同一地址只查一次：同一个落地 IP 的多个节点没必要重复消耗外部额度
+	// 同一 IP 只查一次：同一个落地 IP 的多个节点（即便域名不同）没必要重复消耗外部额度
 	cache := map[string]ipscore.Result{}
 	pendingScores := make([]ipScoreUpdate, 0, len(refs))
 	failed := 0
@@ -156,18 +159,20 @@ func runIPScoreTask(client *ipscore.Client, refs []configure.NodeRef, opt ipscor
 		if s == nil {
 			continue
 		}
-		host := strings.TrimSpace(s.Host)
-		if host == "" {
+		// 评分服务普遍只接受 IP：传节点域名会被判非法（如 Net.Coffee 直接 400）。
+		// 因此先解析出真实落地 IP，再拿它做查询和去重键。
+		target, err := scoreTargetIP(s)
+		if err != nil {
 			failed++
-			bumpIPScoreProgress("", failed, "节点地址为空")
+			bumpIPScoreProgress("", failed, err.Error())
 			continue
 		}
 
-		res, cached := cache[host]
+		res, cached := cache[target]
 		if !cached {
-			setIPScoreCurrent(host)
-			res = client.Lookup(host, opt)
-			cache[host] = res
+			setIPScoreCurrent(target)
+			res = client.Lookup(target, opt)
+			cache[target] = res
 		}
 		errMsg := ""
 		if res.Err != nil {
@@ -176,7 +181,7 @@ func runIPScoreTask(client *ipscore.Client, refs []configure.NodeRef, opt ipscor
 		} else {
 			pendingScores = append(pendingScores, ipScoreUpdate{ref: ref, result: res})
 		}
-		bumpIPScoreProgress(host, failed, errMsg)
+		bumpIPScoreProgress(target, failed, errMsg)
 	}
 	if err := saveIPScores(pendingScores); err != nil {
 		addLog(fmt.Sprintf("⚠️ 批量保存 IP 评分失败：%v", err))
@@ -255,6 +260,63 @@ func bumpIPScoreProgress(host string, failed int, errMsg string) {
 		ipScoreTask.state.LastError = errMsg
 	}
 	ipScoreTask.mu.Unlock()
+}
+
+// scoreTargetIP 返回节点用于评分的目标 IP。评分服务普遍只接受 IP，传节点域名会
+// 被判非法；而且同一个落地 IP 可能对应多个域名，按 IP 查询还能顺带去重。
+// 优先复用 IP 类型检测已解析出的落地 IP，没有时再自己解析域名。
+func scoreTargetIP(s *configure.ServerRaw) (string, error) {
+	if ip := publicScoreIP(strings.TrimSpace(s.IPTypeAddr)); ip != "" {
+		return ip, nil
+	}
+	host := strings.Trim(strings.TrimSpace(s.Host), "[]")
+	if host == "" {
+		return "", fmt.Errorf("节点地址为空")
+	}
+	if ip := publicScoreIP(host); ip != "" {
+		return ip, nil
+	}
+	addrs, err := net.LookupIP(host)
+	if err != nil {
+		return "", fmt.Errorf("域名解析失败：%w", err)
+	}
+	var fallback string
+	for _, addr := range addrs {
+		ip := addr.String()
+		if isPrivateScoreIP(ip) {
+			continue
+		}
+		if addr.To4() != nil {
+			return ip, nil
+		}
+		if fallback == "" {
+			fallback = ip
+		}
+	}
+	if fallback != "" {
+		return fallback, nil
+	}
+	return "", fmt.Errorf("未解析到可用的公网 IP")
+}
+
+// publicScoreIP 归一化并返回可用于评分的公网 IP，非 IP 或本地/保留地址返回空串。
+func publicScoreIP(raw string) string {
+	raw = strings.TrimSpace(raw)
+	ip := net.ParseIP(raw)
+	if ip == nil || isPrivateScoreIP(raw) {
+		return ""
+	}
+	return ip.String()
+}
+
+// isPrivateScoreIP 判断是否为不该发给第三方评分的本地/保留地址。
+func isPrivateScoreIP(raw string) bool {
+	ip := net.ParseIP(raw)
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast()
 }
 
 // saveIPScore 把评分写回节点。失败结果不落库，保留上一次的有效评分。

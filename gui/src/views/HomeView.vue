@@ -164,14 +164,23 @@
           <div v-if="searchLoading" class="empty-hint">
             <p class="empty-sub">正在筛选节点…</p>
           </div>
+          <div v-else-if="isSearching && searchError" class="empty-hint">
+            <p class="empty-sub">筛选失败：{{ searchError }}</p>
+          </div>
           <div v-else-if="isSearching && !sortedSearchResults.length" class="empty-hint">
             <p class="empty-sub">无匹配节点</p>
           </div>
-          <div v-else-if="!isSearching && !sub.serversLoaded" class="empty-hint">
+          <div v-else-if="!isSearching && nodePageError" class="empty-hint">
+            <p class="empty-sub">加载失败：{{ nodePageError }}</p>
+          </div>
+          <div v-else-if="!isSearching && (nodePageLoading || !sub.serversLoaded)" class="empty-hint">
             <p class="empty-sub">正在加载订阅节点…</p>
           </div>
-          <div v-else-if="!isSearching && !sub.servers.length" class="empty-hint">
+          <div v-else-if="!isSearching && Number(sub.serverCount || 0) === 0" class="empty-hint">
             <p class="empty-sub">订阅为空，点击「更新节点」拉取</p>
+          </div>
+          <div v-else-if="!isSearching && !getDisplayedSubEntries(sub, si).length" class="empty-hint">
+            <p class="empty-sub">当前页暂无节点</p>
           </div>
           <div class="table-scroll" v-if="getDisplayedSubEntries(sub, si).length">
             <ServerListHead
@@ -273,14 +282,23 @@
           <div v-if="searchLoading" class="empty-hint">
             <p class="empty-sub">正在筛选节点…</p>
           </div>
+          <div v-else-if="isSearching && searchError" class="empty-hint">
+            <p class="empty-sub">筛选失败：{{ searchError }}</p>
+          </div>
           <div v-else-if="isSearching && !sortedSearchResults.length" class="empty-hint">
             <p class="empty-sub">无匹配节点</p>
+          </div>
+          <div v-else-if="!isSearching && nodePageError" class="empty-hint">
+            <p class="empty-sub">加载失败：{{ nodePageError }}</p>
+          </div>
+          <div v-else-if="!isSearching && nodePageLoading" class="empty-hint">
+            <p class="empty-sub">正在加载分组节点…</p>
           </div>
           <div v-else-if="!isSearching && groupServerCount(group) === 0" class="empty-hint">
             <p class="empty-sub">分组为空，点击「添加节点」</p>
           </div>
           <div v-else-if="!isSearching && !getSortedGroupEntries(group).length" class="empty-hint">
-            <p class="empty-sub">正在加载分组节点…</p>
+            <p class="empty-sub">{{ group.serversLoaded ? '当前页暂无节点' : '正在加载分组节点…' }}</p>
           </div>
           <div class="table-scroll" v-if="getDisplayedGroupEntries(group).length">
             <ServerListHead
@@ -594,6 +612,7 @@ const searchResults = ref([])
 const searchTotal = ref(0)
 const isSearching = ref(false)
 const searchLoading = ref(false)
+const searchError = ref('')
 const showSearchFilters = ref(false)
 function emptySearchFilters() {
   return {
@@ -624,6 +643,9 @@ const NODE_PAGE_SIZE_OPTIONS = [
 ]
 const nodePageSize = ref(100)
 const nodePage = ref(1)
+const nodePageLoading = ref(false)
+const nodePageError = ref('')
+let nodePageLoadVersion = 0
 
 // ---- 列宽 ----
 // 操作列也是一列：6 个按钮实际要 220px 左右，之前固定 180px 且右对齐 + 裁剪，
@@ -844,14 +866,31 @@ function patchSearchResults(items) {
   if (!searchResults.value.length) return
   const patches = new Map()
   for (const item of items || []) {
-    if (!item?.ref || !item?.patch) continue
-    patches.set(refKey(item.ref), item.patch)
+    const patch = item?.server || item?.patch
+    if (!item?.ref || !patch) continue
+    patches.set(refKey(item.ref), patch)
   }
   if (!patches.size) return
   searchResults.value = searchResults.value.map(item => {
     const patch = patches.get(refKey(item.ref))
     return patch ? { ...item, server: { ...item.server, ...patch } } : item
   })
+}
+
+async function refreshNodeResults(refs, affectedFilters = []) {
+  const version = searchVersion
+  const results = await store.fetchNodes(refs, true)
+  if (version === searchVersion) {
+    patchSearchResults(results)
+    await refreshSearchForChangedFields(affectedFilters, version)
+  }
+  return results
+}
+
+async function refreshSearchForChangedFields(fields, version = searchVersion) {
+  if (version !== searchVersion || !isSearching.value) return
+  if (!fields.some(field => String(appliedSearchFilters.value[field] ?? '').trim())) return
+  await refreshSearchResultsAfterMutation()
 }
 
 function flushPendingPingUpdates() {
@@ -900,15 +939,7 @@ async function refreshPanel() {
       await onSearch(false)
       return
     }
-    // 根据当前 tab 只刷新表格数据
-    if (activeTab.value.startsWith('sub-')) {
-      const si = parseInt(activeTab.value.replace('sub-', ''))
-      await store.fetchSubscriptionServers(si, true, nodePage.value, nodePageSize.value)
-    } else if (activeTab.value.startsWith('group-')) {
-      const gi = parseInt(activeTab.value.replace('group-', ''))
-      const group = manualGroups.value[gi]
-      if (group) await store.fetchGroupServers(realGroupIndex(group), true, nodePage.value, nodePageSize.value)
-    }
+    await ensureActiveTabNodes(true)
   } catch (e) {
     showNotice('刷新失败：' + (e?.response?.data?.error || e?.message || '未知错误'), true)
   } finally {
@@ -917,6 +948,8 @@ async function refreshPanel() {
 }
 const ipScoringRefs = ref({})
 let ipScorePollTimer = null
+let ipScorePollVersion = 0
+let ipScoreStatusLoad = null
 
 // 订阅编辑状态
 const editSubIdx = ref(-1)
@@ -1049,8 +1082,9 @@ onMounted(async () => {
   ensureActiveTabNodes()
 })
 
-function onDataMutated() {
-  if (isSearching.value) refreshSearchResultsAfterMutation()
+async function onDataMutated() {
+  if (isSearching.value) await refreshSearchResultsAfterMutation()
+  else await ensureActiveTabNodes()
 }
 
 onBeforeUnmount(() => {
@@ -1065,7 +1099,9 @@ onBeforeUnmount(() => {
   window.removeEventListener('pointercancel', endDragSelect)
   window.removeEventListener('blur', endDragSelect)
   stopIPScorePoll()
+  nodePageLoadVersion += 1
   clearTimeout(addSearchTimer)
+  searchVersion += 1
   searchAbortController?.abort()
   addSearchAbortController?.abort()
   cancelPingFlush()
@@ -1073,8 +1109,10 @@ onBeforeUnmount(() => {
 })
 
 async function resumeIPScoreIfRunning() {
+  const version = ipScorePollVersion
   try {
     const { data } = await api.getIPScoreStatus()
+    if (version !== ipScorePollVersion) return
     const state = data.state || data
     ipScoreTask.value = state
     if (state?.running) startIPScorePoll()
@@ -1253,24 +1291,36 @@ watch(activeTab, async () => {
   scrollActiveTabIntoView()
 })
 
-async function ensureActiveTabNodes() {
-  if (isSearching.value) return
-  if (activeTab.value.startsWith('sub-')) {
-    const si = parseInt(activeTab.value.replace('sub-', ''))
-    await store.fetchSubscriptionServers(si, false, nodePage.value, nodePageSize.value)
+async function ensureActiveTabNodes(force = false) {
+  const version = ++nodePageLoadVersion
+  if (isSearching.value) {
+    nodePageLoading.value = false
     return
   }
-  if (activeTab.value.startsWith('group-')) {
-    const gi = parseInt(activeTab.value.replace('group-', ''))
-    const group = manualGroups.value[gi]
-    if (group) await store.fetchGroupServers(realGroupIndex(group), false, nodePage.value, nodePageSize.value)
+  nodePageLoading.value = true
+  nodePageError.value = ''
+  try {
+    if (activeTab.value.startsWith('sub-')) {
+      const si = parseInt(activeTab.value.replace('sub-', ''))
+      await store.fetchSubscriptionServers(si, force, nodePage.value, nodePageSize.value)
+    } else if (activeTab.value.startsWith('group-')) {
+      const gi = parseInt(activeTab.value.replace('group-', ''))
+      const group = manualGroups.value[gi]
+      if (group) await store.fetchGroupServers(realGroupIndex(group), force, nodePage.value, nodePageSize.value)
+    }
+  } catch (error) {
+    if (version === nodePageLoadVersion) {
+      nodePageError.value = error?.response?.data?.error || error?.message || '未知错误'
+    }
+  } finally {
+    if (version === nodePageLoadVersion) nodePageLoading.value = false
   }
 }
 
 watch(
   () => [
-    store.groups.map(group => `${group.id}:${group.serverCount || 0}`).join('|'),
-    store.subscriptions.map(sub => `${sub.id}:${sub.serverCount || 0}`).join('|'),
+    store.groups.map(group => `${group.id}:${group.serverCount || 0}:${group.cacheVersion || 0}`).join('|'),
+    store.subscriptions.map(sub => `${sub.id}:${sub.serverCount || 0}:${sub.cacheVersion || 0}`).join('|'),
   ],
   async () => {
     if (activeTab.value.startsWith('group-')) {
@@ -1366,7 +1416,8 @@ async function pingRefsWithProgress(refs, mode = 'fast') {
 
   pingProgress.value = { total: validRefs.length, done: 0, current: '' }
   pingAborted.value = false
-  pingAbortController.value = new AbortController()
+  const controller = new AbortController()
+  pingAbortController.value = controller
 
   const queue = validRefs.map(ref => ({ type: ref.type, index: ref.index, sub: ref.sub || 0 }))
   const enableTransProxyFallback = mode === 'real' && transProxyFallbackEnabled.value
@@ -1384,7 +1435,7 @@ async function pingRefsWithProgress(refs, mode = 'fast') {
   let streamError = null
 
   const streamTask = api.pingNodes(queue, mode, {
-    signal: pingAbortController.value.signal,
+    signal: controller.signal,
     enableTransProxyFallback,
     onEvent: (evt, payload) => {
       const ref = payload?.ref
@@ -1428,16 +1479,14 @@ async function pingRefsWithProgress(refs, mode = 'fast') {
     }
     if (streamError) throw streamError
   }
-  // 真连接 + trans-proxy 回退时，后端成功后会把前置代理写回节点。落库发生在
-  // done 之后，所以等流真正关闭再按引用补载节点，让「前置代理」列同步更新。
-  if (enableTransProxyFallback) {
-    void streamTask.then(async () => {
-      try {
-        const results = await store.fetchNodes(queue)
-        patchSearchResults((results || []).map(item => ({ ref: item.ref, patch: item.server })))
-      } catch {}
-    })
-  }
+  void streamTask.then(async () => {
+    if (streamError || controller.signal.aborted) return
+    const filters = mode === 'fast' ? ['fastProbe'] : ['fastProbe', 'probe', 'maxLatency']
+    try {
+      if (enableTransProxyFallback) await refreshNodeResults(queue, filters)
+      else await refreshSearchForChangedFields(filters)
+    } catch {}
+  })
 }
 
 function abortPing() {
@@ -1504,26 +1553,16 @@ async function mapWithConcurrency(items, worker, concurrency) {
 }
 
 async function removeSelected() {
-  if (!selectedRefs.value.length) return
-  if (!confirm(`确认删除选中的 ${selectedRefs.value.length} 个节点？`)) return
-  if (activeTab.value.startsWith('group-')) {
-    const gi = parseInt(activeTab.value.replace('group-', ''))
-    const group = manualGroups.value[gi]
-    const groupIndex = realGroupIndex(group)
-    const refs = [...selectedRefs.value]
-    const removeKeys = new Set(refs.map(refKey))
-    store.patchGroup({ ...group, servers: (group.servers || []).filter(ref => !removeKeys.has(refKey(ref))) })
-    try {
-      const { data } = await api.removeServersFromGroup(groupIndex, refs)
-      store.patchGroup(data.group)
-      if (isSearching.value) {
-        await refreshSearchResultsAfterMutation()
-      }
-    } catch (error) {
-      store.patchGroup(group)
-      throw error
-    }
-  }
+  if (!selectedRefs.value.length || !activeTab.value.startsWith('group-')) return
+  const groupIndex = parseInt(activeTab.value.replace('group-', ''))
+  const group = manualGroups.value[groupIndex]
+  if (!group) return
+  const refs = [...selectedRefs.value]
+  if (!confirm(`确定从分组「${group.name}」移除选中的 ${refs.length} 个节点吗？\n其他分组中的独立副本不受影响。`)) return
+  const { data } = await api.removeServersFromGroup(realGroupIndex(group), refs)
+  store.patchGroupCount(data.groupId, data.groupServerCount)
+  if (isSearching.value) await refreshSearchResultsAfterMutation()
+  else await ensureActiveTabNodes()
   selectedRefs.value = []
 }
 
@@ -1544,6 +1583,7 @@ function handleNodeUpdated(refObj, server) {
 }
 
 let searchAbortController = null
+let searchVersion = 0
 const activeSearchFilterCount = computed(() => Object.values(searchFilters.value).filter(value => String(value).trim()).length)
 const searchConditionCount = computed(() => activeSearchFilterCount.value + (searchQuery.value.trim() ? 1 : 0))
 
@@ -1570,9 +1610,11 @@ function searchRequestParams() {
 }
 
 function closeSearch() {
+  searchVersion += 1
   searchAbortController?.abort()
   searchAbortController = null
   searchLoading.value = false
+  searchError.value = ''
   searchQuery.value = ''
   appliedSearchQuery.value = ''
   searchFilters.value = emptySearchFilters()
@@ -1597,6 +1639,8 @@ function submitSearch() {
 }
 
 async function onSearch(resetPage = true) {
+  const version = ++searchVersion
+  searchError.value = ''
   if (resetPage) nodePage.value = 1
   const hasCriteria = Boolean(appliedSearchQuery.value.trim()) || Object.values(appliedSearchFilters.value).some(value => String(value).trim())
   if (!hasCriteria) {
@@ -1618,13 +1662,14 @@ async function onSearch(resetPage = true) {
   searchLoading.value = true
   try {
     const { data } = await api.searchServers(params, controller.signal)
-    if (JSON.stringify(searchRequestParams()) !== requestKey) return
+    if (version !== searchVersion || JSON.stringify(searchRequestParams()) !== requestKey) return
     searchResults.value = data.results || []
     searchTotal.value = Number(data.total || 0)
+    const visibleKeys = new Set(searchResults.value.map(item => refKey(item.ref)))
+    selectedRefs.value = selectedRefs.value.filter(refObj => visibleKeys.has(refKey(refObj)))
   } catch (error) {
-    if (error?.code === 'ERR_CANCELED') return
-    searchResults.value = []
-    searchTotal.value = 0
+    if (version !== searchVersion || error?.code === 'ERR_CANCELED') return
+    searchError.value = error?.response?.data?.error || error?.message || '未知错误'
   } finally {
     if (searchAbortController === controller) {
       searchAbortController = null
@@ -1635,8 +1680,10 @@ async function onSearch(resetPage = true) {
 
 async function refreshSearchResultsAfterMutation() {
   if (!isSearching.value) return
+  const version = searchVersion + 1
   await onSearch(false)
-  if (nodePage.value > 1 && searchTotal.value > 0 && !searchResults.value.length) {
+  if (version !== searchVersion) return
+  if (!searchError.value && nodePage.value > 1 && searchTotal.value > 0 && !searchResults.value.length) {
     await onSearch(true)
   }
 }
@@ -1871,7 +1918,9 @@ async function pingCurrentTab(mode = 'fast') {
   try {
     let refs = []
     let group = null
-    if (activeTab.value.startsWith('sub-')) {
+    if (isSearching.value) {
+      refs = getVisibleRefs()
+    } else if (activeTab.value.startsWith('sub-')) {
       const si = parseInt(activeTab.value.replace('sub-', ''))
       const sub = store.subscriptions[si]
       refs = getSubscriptionRefs(si)
@@ -1912,7 +1961,9 @@ async function applyGroupSwitchAfterPing(group, mode) {
 // 检测当前 tab 全部节点的 IP 类型
 async function detectIPTypeForCurrentTab() {
   let refs = []
-  if (activeTab.value.startsWith('sub-')) {
+  if (isSearching.value) {
+    refs = getVisibleRefs()
+  } else if (activeTab.value.startsWith('sub-')) {
     const si = parseInt(activeTab.value.replace('sub-', ''))
     refs = getSubscriptionRefs(si)
   } else if (activeTab.value.startsWith('group-')) {
@@ -1932,7 +1983,7 @@ async function detectIPTypeForRefs(refs) {
   ipTypeStates.value = states
   try {
     await api.detectServerIPType(queue)
-    await store.fetchNodes(queue)
+    await refreshNodeResults(queue, ['ipType', 'geo'])
   } catch (e) {
     console.error('IP 类型检测失败', e)
   } finally {
@@ -1944,28 +1995,36 @@ async function detectIPTypeForRefs(refs) {
 // 查询当前 tab 全部节点的 IP 评分
 async function scoreIPForCurrentTab() {
   let refs = []
-  if (activeTab.value.startsWith('sub-')) {
+  if (isSearching.value) {
+    refs = getVisibleRefs()
+  } else if (activeTab.value.startsWith('sub-')) {
     const si = parseInt(activeTab.value.replace('sub-', ''))
     refs = getSubscriptionRefs(si)
   } else if (activeTab.value.startsWith('group-')) {
     const gi = parseInt(activeTab.value.replace('group-', ''))
     const group = manualGroups.value[gi]
-    refs = (group?.servers || []).map(r => ({ type: r.type, index: r.index, sub: r.sub || 0 }))
+    refs = getGroupPageRefs(group).map(r => ({ type: r.type, index: r.index, sub: r.sub || 0 }))
   }
   await scoreIPForRefs(refs)
 }
 
 async function scoreIPForRefs(refs) {
   if (ipScoreTask.value.running || !refs?.length) return
+  stopIPScorePoll()
+  const version = ipScorePollVersion
+  ipScoreTask.value = { ...ipScoreTask.value, running: true }
   const queue = refs.map(r => ({ type: r.type, index: r.index, sub: r.sub || 0 }))
   const marks = {}
   for (const ref of queue) marks[refKey(ref)] = true
   ipScoringRefs.value = marks
   try {
     await api.scoreServerIP(queue)
+    if (version !== ipScorePollVersion) return
     showNotice(`已在后台开始查询 ${queue.length} 个节点的 IP 评分，按限速逐个进行，请稍后在「评分」列查看结果。`)
     startIPScorePoll()
   } catch (e) {
+    if (version !== ipScorePollVersion) return
+    ipScoreTask.value = { ...ipScoreTask.value, running: false }
     ipScoringRefs.value = {}
     showNotice(e?.response?.data?.error || 'IP 评分启动失败', true)
   }
@@ -1978,32 +2037,44 @@ function startIPScorePoll() {
   pollIPScore()
 }
 
-function stopIPScorePoll() {
+function stopIPScorePoll(invalidate = true) {
   if (ipScorePollTimer) {
     clearInterval(ipScorePollTimer)
     ipScorePollTimer = null
   }
+  if (invalidate) {
+    ipScorePollVersion += 1
+    ipScoreStatusLoad = null
+  }
 }
 
-async function pollIPScore() {
-  try {
-    const { data } = await api.getIPScoreStatus()
+function pollIPScore() {
+  if (ipScoreStatusLoad) return ipScoreStatusLoad
+  const version = ipScorePollVersion
+  const request = Promise.resolve().then(() => api.getIPScoreStatus()).then(async ({ data }) => {
+    if (version !== ipScorePollVersion) return
     const state = data.state || data
     const wasRunning = ipScoreTask.value.running
     ipScoreTask.value = state
     if (!state.running) {
-      stopIPScorePoll()
+      stopIPScorePoll(false)
+      await refreshNodeResults(state.refs || [], ['minScore', 'geo', 'ipType'])
+      if (version !== ipScorePollVersion) return
       ipScoringRefs.value = {}
-      await store.fetchNodes(state.refs || [])
       if (wasRunning) {
         const failed = state.failed ? `，${state.failed} 个失败` : ''
         showNotice(`IP 评分完成：成功 ${Math.max(state.done - state.failed, 0)}/${state.total}${failed}。`)
       }
     }
-  } catch (e) {
-    stopIPScorePoll()
+  }).catch(() => {
+    if (version !== ipScorePollVersion) return
+    stopIPScorePoll(false)
     ipScoringRefs.value = {}
-  }
+  }).finally(() => {
+    if (ipScoreStatusLoad === request) ipScoreStatusLoad = null
+  })
+  ipScoreStatusLoad = request
+  return request
 }
 
 async function abortIPScore() {
@@ -2015,16 +2086,23 @@ async function abortIPScore() {
 }
 
 async function removeManualServer(ref) {
+  if (!ref || ref.type !== 'server') return
+  if (!confirm(`确定删除节点「${getNodeNameByRef(ref)}」吗？\n该节点的分组成员关系和出站绑定将被移除，其他分组中的独立副本不受影响。`)) return
   await api.deleteServers([ref.index])
   store.invalidateNodeDetails()
   await store.fetchGroups()
-  await ensureActiveTabNodes()
+  if (isSearching.value) await refreshSearchResultsAfterMutation()
+  else await ensureActiveTabNodes()
 }
 
 async function removeFromGroup(groupIndex, ref) {
-  await api.removeServerFromGroup(groupIndex, ref)
-  // 只刷新分组数据
-  await store.fetchGroups()
+  const group = store.groups[groupIndex]
+  if (!group || !ref) return
+  if (!confirm(`确定从分组「${group.name}」移除节点「${getNodeNameByRef(ref)}」吗？\n其他分组中的独立副本不受影响。`)) return
+  const { data } = await api.removeServerFromGroup(groupIndex, ref)
+  store.patchGroupCount(data.groupId, data.groupServerCount)
+  if (isSearching.value) await refreshSearchResultsAfterMutation()
+  else await ensureActiveTabNodes()
 }
 
 async function refreshSub(si) {
@@ -2059,17 +2137,23 @@ async function saveEditSub() {
 }
 
 async function deleteSub(si) {
+  const subscription = store.subscriptions[si]
+  if (!subscription) return
+  const nodeCount = subscription.serverCount ?? subscription.servers?.length ?? 0
+  if (!confirm(`确定删除订阅「${subscription.name || subscription.host || '未命名订阅'}」吗？\n将同时删除该订阅的 ${nodeCount} 个源节点及其自动创建的分组，相关连接可能中断。\n其他分组中的独立副本不受影响，此操作不可撤销。`)) return
   await api.deleteSubscription(si)
   activeTab.value = 'group-0'
   store.invalidateSubscriptions()
   store.invalidateNodeDetails()
   // 删除订阅需要刷新订阅和分组数据
-  await Promise.all([store.fetchSubscriptions(false, true), store.fetchGroups()])
+  await Promise.all([store.fetchSubscriptions(false, true), store.fetchGroups(), store.fetchOutbounds()])
   if (isSearching.value) await refreshSearchResultsAfterMutation()
 }
 
 async function deleteGroup(gi) {
   const group = manualGroups.value[gi]
+  if (!group || group.name === 'SERVER') return
+  if (!confirm(`确定删除分组「${group.name}」及其中的 ${groupServerCount(group)} 个节点吗？\n使用该分组的出站可能受影响，其他分组中的独立副本不受影响。此操作不可撤销。`)) return
   await api.deleteGroup(realGroupIndex(group))
   activeTab.value = 'group-0'
   store.invalidateNodeDetails()
@@ -2131,6 +2215,8 @@ async function confirmBulkCopy() {
     bulkCopyGroupId.value = ''
     selectedRefs.value = []
     if (isSearching.value) await refreshSearchResultsAfterMutation()
+    else await ensureActiveTabNodes()
+    if (data.skippedCount) showNotice(`复制 ${data.copied} 个节点，跳过 ${data.skippedCount} 个相同配置节点。`)
   } catch (error) {
     showNotice('复制失败：' + (error?.response?.data?.error || error?.message || '未知错误'), true)
   } finally {
@@ -2155,6 +2241,7 @@ async function confirmBulkMove() {
     selectedRefs.value = []
     if (isSearching.value) await refreshSearchResultsAfterMutation()
     else await store.fetchGroupServers(realGroupIndex(group), true, nodePage.value, nodePageSize.value)
+    if (data.skippedCount) showNotice(`移动 ${data.moved} 个节点，跳过 ${data.skippedCount} 个相同配置节点，跳过的节点保留在源分组。`)
   } catch (error) {
     showNotice('移动失败：' + (error?.response?.data?.error || error?.message || '未知错误'), true)
   } finally {
@@ -2183,6 +2270,9 @@ async function confirmSingleCopy() {
     showSingleCopyModal.value = false
     singleCopyRef.value = null
     singleTargetGroupId.value = ''
+    if (isSearching.value) await refreshSearchResultsAfterMutation()
+    else await ensureActiveTabNodes()
+    if (data.skippedCount) showNotice('目标分组已存在相同配置节点，已跳过复制。')
   } catch (error) {
     showNotice('复制失败：' + (error?.response?.data?.error || error?.message || '未知错误'), true)
   } finally {
@@ -2206,6 +2296,7 @@ async function confirmSingleMove() {
     singleTargetGroupId.value = ''
     if (isSearching.value) await refreshSearchResultsAfterMutation()
     else await store.fetchGroupServers(realGroupIndex(group), true, nodePage.value, nodePageSize.value)
+    if (data.skippedCount) showNotice('目标分组已存在相同配置节点，已跳过移动并保留源节点。')
   } catch (error) {
     showNotice('移动失败：' + (error?.response?.data?.error || error?.message || '未知错误'), true)
   } finally {

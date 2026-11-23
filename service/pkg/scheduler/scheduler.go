@@ -105,7 +105,11 @@ func (s *Scheduler) checkAndCleanupNodes() {
 func nodeCleanupRuleKey(rule configure.NodeCleanupRule) string {
 	groupIDs := append([]string(nil), rule.GroupIDs...)
 	sort.Strings(groupIDs)
-	return fmt.Sprintf("%s|%d|%s|%s", rule.Mode, rule.IntervalHour, rule.RecycleGroupID, strings.Join(groupIDs, ","))
+	key := fmt.Sprintf("%s|%d|%s|%s", rule.Mode, rule.IntervalHour, rule.RecycleGroupID, strings.Join(groupIDs, ","))
+	if rule.Mode == "transit" {
+		key = fmt.Sprintf("%s|%d", key, rule.TransitThreshold())
+	}
+	return key
 }
 
 func cleanupInvalidNodes(rule configure.NodeCleanupRule) {
@@ -117,8 +121,12 @@ func cleanupInvalidNodes(rule configure.NodeCleanupRule) {
 	uniqueRefs := make([]configure.NodeRef, 0)
 	refIndexes := make(map[configure.NodeRef]int)
 	for _, groupID := range rule.GroupIDs {
+		metadata := configure.GetGroupMetadataByID(groupID)
+		if metadata == nil || metadata.FromSub || metadata.ID == rule.RecycleGroupID {
+			continue
+		}
 		_, group := configure.GetGroupByID(groupID)
-		if group == nil || len(group.Servers) == 0 || group.ID == rule.RecycleGroupID {
+		if group == nil || group.FromSub || len(group.Servers) == 0 || group.ID == rule.RecycleGroupID {
 			continue
 		}
 		groups = append(groups, cleanupGroup{id: group.ID, refs: append([]configure.ServerRef(nil), group.Servers...)})
@@ -131,7 +139,7 @@ func cleanupInvalidNodes(rule configure.NodeCleanupRule) {
 			uniqueRefs = append(uniqueRefs, nodeRef)
 		}
 	}
-	invalidResults := observatory.ProbeInvalidNodes(uniqueRefs, rule.Mode)
+	invalidResults := observatory.ProbeInvalidNodes(uniqueRefs, rule)
 	for _, selectedGroup := range groups {
 		invalid := make([]configure.ServerRef, 0)
 		for _, ref := range selectedGroup.refs {
@@ -144,7 +152,7 @@ func cleanupInvalidNodes(rule configure.NodeCleanupRule) {
 			continue
 		}
 		sourceIndex, sourceGroup := configure.GetGroupByID(selectedGroup.id)
-		if sourceIndex < 0 || sourceGroup == nil {
+		if sourceIndex < 0 || sourceGroup == nil || sourceGroup.FromSub {
 			continue
 		}
 		recycleIndex := -1
@@ -245,22 +253,15 @@ func updateSub(index int, sub *configure.SubscriptionRaw) {
 	for i := range servers {
 		servers[i].Source = sub.ID
 	}
-	servers = configure.PreserveActiveSubscriptionServers(index, sub.Servers, servers)
 	sub.Servers = servers
 	sub.UpdatedAt = time.Now()
-	_ = configure.SetSubscription(index, sub)
+	if err := configure.RefreshSubscriptionData(index, sub); err != nil {
+		log.Warn("auto update sub %s was not committed: %v", sub.Name, err)
+		return
+	}
 
 	// 同步更新对应 Group
 	if sub.GroupID != "" {
-		groupIndex, group := configure.GetGroupByID(sub.GroupID)
-		if group != nil {
-			refs := make([]configure.ServerRef, len(servers))
-			for i := range servers {
-				refs[i] = configure.ServerRef{Type: "sub_server", Index: i, Sub: index}
-			}
-			group.Servers = refs
-			_ = configure.SetGroup(groupIndex, group)
-		}
 		observatory.OnGroupUpdated(sub.GroupID)
 	}
 }

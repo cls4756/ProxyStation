@@ -13,34 +13,37 @@ func newTestClient(handler http.HandlerFunc) (*Client, *httptest.Server) {
 	srv := httptest.NewServer(handler)
 	c := NewClient(srv.Client())
 	// 内置服务商的地址是写死的，测试从这里注入而不是走用户配置的 Endpoint
-	c.cleanIPEndpoint = srv.URL
+	c.builtinEndpoints = map[Provider]string{ProviderNetCoffee: srv.URL + "/api/ip/lookup/{ip}"}
 	return c, srv
 }
 
-const cleanIPBody = `{"ok":true,"geo":{"country":"澳大利亚","country_code":"AU","region":"昆士兰州","city":"布里斯班"},"purity":{"score":82,"grade":"B"},
-	"risk":{"risk_label":"Clean","risk_level":"Clean"}}`
+// netCoffeeBody 是 Net.Coffee 响应结构的精简版：评分、地理信息、滥用等级都是平铺字段。
+const netCoffeeBody = `{"trust_score":82,"country":"澳大利亚","countryCode":"au","region":"昆士兰州","city":"布里斯班","intelligence":{"abuser_level":"low"}}`
 
-func TestLookupCleanIPParsesScore(t *testing.T) {
-	var gotQuery string
+func TestLookupNetCoffeeParsesScore(t *testing.T) {
+	var gotPath string
 	c, srv := newTestClient(func(w http.ResponseWriter, r *http.Request) {
-		gotQuery = r.URL.RawQuery
-		fmt.Fprint(w, cleanIPBody)
+		gotPath = r.URL.Path
+		fmt.Fprint(w, netCoffeeBody)
 	})
 	defer srv.Close()
 
-	res := c.Lookup("8.8.8.8", Options{Provider: ProviderCleanIP, MinInterval: time.Millisecond})
+	res := c.Lookup("8.8.8.8", Options{Provider: ProviderNetCoffee, MinInterval: time.Millisecond})
 	if res.Err != nil {
 		t.Fatalf("查询失败：%v", res.Err)
 	}
-	if res.Score != 82 || res.Grade != "B" || res.RiskLevel != "Clean" {
+	if res.Score != 82 || res.RiskLevel != "low" {
 		t.Errorf("解析结果不符：%+v", res)
 	}
 	if res.Country != "澳大利亚" || res.CountryCode != "AU" || res.Region != "昆士兰州" || res.City != "布里斯班" {
 		t.Errorf("地理信息解析不符：%+v", res)
 	}
-	// json=1 是 CleanIP 返回结构化数据的开关，漏了会拿到终端着色的文本
-	if gotQuery != "ip=8.8.8.8&json=1" {
-		t.Errorf("请求参数不符：%q", gotQuery)
+	// 内置接口把 IP 放在路径上：Net.Coffee 传域名会被判非法
+	if gotPath != "/api/ip/lookup/8.8.8.8" {
+		t.Errorf("请求路径不符：%q", gotPath)
+	}
+	if res.Provider != ProviderNetCoffee {
+		t.Errorf("应标记产出服务商为 netcoffee，实际 %q", res.Provider)
 	}
 }
 
@@ -134,7 +137,7 @@ func TestLookupCustomMissingScoreIsError(t *testing.T) {
 	}
 }
 
-// 自定义服务商没填地址时直接失败，不能默默去打 cleanip 的接口。
+// 自定义服务商没填地址时直接失败，不能默默去打内置服务商的接口。
 func TestLookupCustomWithoutEndpointFails(t *testing.T) {
 	c := NewClient(nil)
 	res := c.Lookup("1.1.1.1", Options{Provider: ProviderCustom, MinInterval: time.Millisecond})
@@ -144,21 +147,21 @@ func TestLookupCustomWithoutEndpointFails(t *testing.T) {
 }
 
 // 用户填的自定义地址只属于自定义服务商。若内置服务商也拿它当接口地址，
-// 界面上"切到 cleanip 再切回来还记得自定义地址"就会变成拿自定义地址去打 cleanip。
-func TestLookupCleanIPIgnoresUserEndpoint(t *testing.T) {
+// 界面上"切到内置服务商再切回来还记得自定义地址"就会变成拿自定义地址去打内置接口。
+func TestLookupNetCoffeeIgnoresUserEndpoint(t *testing.T) {
 	var hit bool
 	rogue := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hit = true
-		fmt.Fprint(w, cleanIPBody)
+		fmt.Fprint(w, netCoffeeBody)
 	}))
 	defer rogue.Close()
 
 	c, srv := newTestClient(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, cleanIPBody)
+		fmt.Fprint(w, netCoffeeBody)
 	})
 	defer srv.Close()
 
-	res := c.Lookup("8.8.8.8", Options{Provider: ProviderCleanIP, Endpoint: rogue.URL, MinInterval: time.Millisecond})
+	res := c.Lookup("8.8.8.8", Options{Provider: ProviderNetCoffee, Endpoint: rogue.URL, MinInterval: time.Millisecond})
 	if res.Err != nil {
 		t.Fatalf("查询失败：%v", res.Err)
 	}
@@ -172,14 +175,14 @@ func TestLookupRespectsMinInterval(t *testing.T) {
 	var hits int32
 	c, srv := newTestClient(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&hits, 1)
-		fmt.Fprint(w, cleanIPBody)
+		fmt.Fprint(w, netCoffeeBody)
 	})
 	defer srv.Close()
 
 	const interval = 120 * time.Millisecond
 	start := time.Now()
 	for i := 0; i < 3; i++ {
-		c.Lookup(fmt.Sprintf("9.9.9.%d", i), Options{Provider: ProviderCleanIP, MinInterval: interval})
+		c.Lookup(fmt.Sprintf("9.9.9.%d", i), Options{Provider: ProviderNetCoffee, MinInterval: interval})
 	}
 	elapsed := time.Since(start)
 
@@ -195,7 +198,7 @@ func TestLookupRespectsMinInterval(t *testing.T) {
 // 并发调用同一个 Client 时限速依然要成立，否则"全选检测"会瞬间打满。
 func TestLookupSerializesConcurrentCallers(t *testing.T) {
 	c, srv := newTestClient(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, cleanIPBody)
+		fmt.Fprint(w, netCoffeeBody)
 	})
 	defer srv.Close()
 
@@ -204,7 +207,7 @@ func TestLookupSerializesConcurrentCallers(t *testing.T) {
 	done := make(chan struct{}, 4)
 	for i := 0; i < 4; i++ {
 		go func(i int) {
-			c.Lookup(fmt.Sprintf("7.7.7.%d", i), Options{Provider: ProviderCleanIP, MinInterval: interval})
+			c.Lookup(fmt.Sprintf("7.7.7.%d", i), Options{Provider: ProviderNetCoffee, MinInterval: interval})
 			done <- struct{}{}
 		}(i)
 	}
@@ -222,7 +225,7 @@ func TestLookupSurfacesRateLimit(t *testing.T) {
 	})
 	defer srv.Close()
 
-	res := c.Lookup("8.8.8.8", Options{Provider: ProviderCleanIP, MinInterval: time.Millisecond})
+	res := c.Lookup("8.8.8.8", Options{Provider: ProviderNetCoffee, MinInterval: time.Millisecond})
 	if res.Err == nil {
 		t.Fatal("HTTP 429 应报错")
 	}
@@ -242,7 +245,7 @@ func TestLookupRejectsUnknownProvider(t *testing.T) {
 
 func TestValidateProviderNormalizes(t *testing.T) {
 	for _, tc := range []struct{ in, want string }{
-		{"", "cleanip"}, {"CleanIP", "cleanip"}, {" custom ", "custom"},
+		{"", "netcoffee"}, {"NetCoffee", "netcoffee"}, {" custom ", "custom"},
 	} {
 		got, err := ValidateProvider(tc.in)
 		if err != nil {
@@ -256,9 +259,9 @@ func TestValidateProviderNormalizes(t *testing.T) {
 	if _, err := ValidateProvider("nope"); err == nil {
 		t.Error("非法服务商应报错")
 	}
-	// net.coffee 已从内置列表移除，只能通过自定义地址使用
-	if _, err := ValidateProvider("netcoffee"); err == nil {
-		t.Error("netcoffee 不应再是内置服务商")
+	// cleanip 的公开接口已不支持查询任意 IP，不再是合法内置服务商
+	if _, err := ValidateProvider("cleanip"); err == nil {
+		t.Error("cleanip 不应再是内置服务商")
 	}
 }
 
@@ -285,7 +288,7 @@ func TestValidateEndpoint(t *testing.T) {
 	if _, err := ValidateEndpoint("notaurl"); err == nil {
 		t.Error("缺少域名应报错")
 	}
-	if got, err := ValidateEndpoint("https://cleanip.io/cli"); err != nil || got != "https://cleanip.io/cli" {
+	if got, err := ValidateEndpoint("https://ip.net.coffee/api/ip/lookup/{ip}"); err != nil || got != "https://ip.net.coffee/api/ip/lookup/{ip}" {
 		t.Errorf("合法地址应原样保留，实际 %q / %v", got, err)
 	}
 }
@@ -306,4 +309,44 @@ func contains(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+type failingTransport struct{}
+
+func (failingTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, fmt.Errorf("dial tcp 127.0.0.1:443: connect: connection refused")
+}
+
+// 主出口传输层失败（代理抖动）时应自动换兜底出口重试一次。
+func TestLookupFallsBackOnTransportError(t *testing.T) {
+	c, srv := newTestClient(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"trust_score":88}`)
+	})
+	defer srv.Close()
+	c.HTTPClient = &http.Client{Transport: failingTransport{}}
+	c.FallbackHTTPClient = srv.Client()
+
+	res := c.Lookup("1.1.1.1", Options{Provider: ProviderNetCoffee, MinInterval: time.Millisecond})
+	if res.Err != nil || res.Score != 88 {
+		t.Fatalf("主出口失败后应回退到兜底出口，实际 %+v", res)
+	}
+}
+
+// HTTP 层错误（如限流）不触发兜底重试，避免对免费服务重复施压。
+func TestLookupDoesNotFallBackOnHTTPError(t *testing.T) {
+	var hits int32
+	c, srv := newTestClient(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(http.StatusTooManyRequests)
+	})
+	defer srv.Close()
+	c.FallbackHTTPClient = srv.Client()
+
+	res := c.Lookup("1.1.1.1", Options{Provider: ProviderNetCoffee, MinInterval: time.Millisecond})
+	if res.Err == nil {
+		t.Fatal("限流应报错")
+	}
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Fatalf("HTTP 层错误不应重试，期望 1 次请求，实际 %d", got)
+	}
 }

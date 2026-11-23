@@ -1,7 +1,17 @@
+.git/
+data/
+memory/
 service/data/
 service/dist/
+service/.gocache/
+service/.gomodcache/
+service/.tmp/
+service/*.db
+service/*.db-*
+service/proxystation
 service/*.exe
 service/*.exe~
+service/*.log
 gui/node_modules/
 gui/dist/
 **/.git/

@@ -1,9 +1,5 @@
 package configure
 
-import (
-	"github.com/ProxyStation/proxystation/db"
-)
-
 // RuleAction 规则动作
 type RuleAction string
 
@@ -30,14 +26,9 @@ type RoutingRule struct {
 }
 
 func GetRoutingRules() []RoutingRule {
-	var rules []RoutingRule
-	_ = db.Get("system", "routing_rules", &rules)
-	if rules == nil {
-		rules = []RoutingRule{}
-	}
-	return rules
+	return loadRoutingRules()
 }
 
 func SetRoutingRules(rules []RoutingRule) error {
-	return db.Set("system", "routing_rules", rules)
+	return replaceRoutingRules(rules)
 }

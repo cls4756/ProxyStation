@@ -448,21 +448,44 @@ func (em *EngineManager) hasAnyOutbound() bool {
 	return false
 }
 
-// 如果有任何节点需要 sing-box，就用 sing-box（它也支持 vmess/vless/ss/trojan）
-// 如果 sing-box 已安装，优先使用它（协议支持更广）；否则用 xray
-func (em *EngineManager) selectKernel(setting *configure.Setting) KernelType {
-	switch setting.KernelMode {
+// explicitKernelMode 解析用户在设置里显式选择的内核（"singbox"/"xray"/"v2ray"）。
+// "auto" 或未知值返回 false，交由 defaultKernel 决定。
+func explicitKernelMode(kernelMode string) (KernelType, bool) {
+	switch strings.ToLower(strings.TrimSpace(kernelMode)) {
 	case "singbox":
-		return KernelSingbox
+		return KernelSingbox, true
 	case "xray":
-		return KernelXray
+		return KernelXray, true
 	case "v2ray":
+		return KernelV2ray, true
+	}
+	return "", false
+}
+
+// defaultKernel 在设置未显式指定内核（auto）时给出统一默认值：优先 sing-box
+// （协议支持更广），其次 xray、v2ray。主内核与探测内核必须共用同一默认值，
+// 否则会出现"直连探测"和"出站探测"选到不同内核、结果对不上的情况。
+func defaultKernel() KernelType {
+	if _, err := probeKernelBin(KernelSingbox); err == nil {
+		return KernelSingbox
+	}
+	if _, err := probeKernelBin(KernelXray); err == nil {
+		return KernelXray
+	}
+	if _, err := probeKernelBin(KernelV2ray); err == nil {
 		return KernelV2ray
 	}
+	return KernelXray
+}
 
-	outboundNames := configure.GetOutboundNames()
-	needSingbox := false
-	for _, name := range outboundNames {
+// 主内核选择：显式设置优先；auto 时若任一节点协议只能由 sing-box 承载则用 sing-box，
+// 否则走统一默认值。探测内核 probeInstanceKernel 复用同一套解析逻辑，保证两者一致。
+func (em *EngineManager) selectKernel(setting *configure.Setting) KernelType {
+	if k, ok := explicitKernelMode(setting.KernelMode); ok {
+		return k
+	}
+
+	for _, name := range configure.GetOutboundNames() {
 		o := configure.GetOutbound(name)
 		if o == nil {
 			continue
@@ -471,23 +494,11 @@ func (em *EngineManager) selectKernel(setting *configure.Setting) KernelType {
 		if s == nil {
 			continue
 		}
-		k, ok := ProtocolKernelMap[s.Type]
-		if ok && k == KernelSingbox {
-			needSingbox = true
-			break
+		if k, ok := ProtocolKernelMap[s.Type]; ok && k == KernelSingbox {
+			return KernelSingbox
 		}
 	}
-	if needSingbox {
-		return KernelSingbox
-	}
-	// 优先用 sing-box（如果已安装），它支持更多协议
-	_, errSingbox := findBin([]string{"sing-box", "sing-box.exe"}, []string{
-		"/usr/local/bin/sing-box", "/usr/bin/sing-box",
-	})
-	if errSingbox == nil {
-		return KernelSingbox
-	}
-	return KernelXray
+	return defaultKernel()
 }
 
 func resolveActiveNode(o *configure.Outbound) *configure.NodeRef {
@@ -536,12 +547,7 @@ func getServerRaw(ref *configure.NodeRef) *configure.ServerRaw {
 	case "server":
 		return configure.GetServer(ref.Index)
 	case "sub_server":
-		sub := configure.GetSubscription(ref.Sub)
-		if sub == nil || ref.Index >= len(sub.Servers) {
-			return nil
-		}
-		s := sub.Servers[ref.Index]
-		return &s
+		return configure.GetSubscriptionServer(ref.Sub, ref.Index)
 	}
 	return nil
 }

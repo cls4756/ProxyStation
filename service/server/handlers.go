@@ -2,8 +2,10 @@ package server
 
 import (
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -654,38 +656,10 @@ func serverCatalogResults(results []serverQueryResult) []serverCatalogResult {
 
 func queryServerRefs(refs []configure.NodeRef) []serverQueryResult {
 	results := make([]serverQueryResult, 0, len(refs))
-	manualIndexes := make([]int, 0)
-	subscriptionIndexes := make([]int, 0)
-	seenSubscriptions := make(map[int]struct{})
+	nodes := configure.GetNodesByRefs(refs)
 	for _, ref := range refs {
-		switch ref.Type {
-		case "server":
-			manualIndexes = append(manualIndexes, ref.Index)
-		case "sub_server":
-			if _, exists := seenSubscriptions[ref.Sub]; !exists {
-				seenSubscriptions[ref.Sub] = struct{}{}
-				subscriptionIndexes = append(subscriptionIndexes, ref.Sub)
-			}
-		}
-	}
-	manualServers := configure.GetServersByIndexes(manualIndexes)
-	subscriptions := configure.GetSubscriptionsByIndexes(subscriptionIndexes)
-	for _, ref := range refs {
-		var server configure.ServerRaw
-		found := false
-		switch ref.Type {
-		case "server":
-			if item, ok := manualServers[ref.Index]; ok {
-				server = item
-				found = true
-			}
-		case "sub_server":
-			if sub, ok := subscriptions[ref.Sub]; ok && ref.Index >= 0 && ref.Index < len(sub.Servers) {
-				server = sub.Servers[ref.Index]
-				found = true
-			}
-		}
-		if !found {
+		server, ok := nodes[ref]
+		if !ok {
 			continue
 		}
 		results = append(results, serverQueryResult{Ref: ref, Server: newServerListItem(server)})
@@ -705,18 +679,6 @@ func queryServers(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"results": results})
 }
 
-type serverSearchFilters struct {
-	Query      string
-	Type       string
-	Geo        string
-	Source     string
-	IPType     string
-	Probe      string
-	FastProbe  string
-	MaxLatency *int
-	MinScore   *int
-}
-
 func optionalIntQuery(c *gin.Context, key string) (*int, error) {
 	raw := strings.TrimSpace(c.Query(key))
 	if raw == "" {
@@ -729,68 +691,8 @@ func optionalIntQuery(c *gin.Context, key string) (*int, error) {
 	return &value, nil
 }
 
-func serverMatchesFilters(server configure.ServerRaw, filters serverSearchFilters) bool {
-	if filters.Query != "" && !matchServer(server, filters.Query) {
-		return false
-	}
-	if filters.Type != "" && strings.ToLower(strings.TrimSpace(server.Type)) != filters.Type {
-		return false
-	}
-	if filters.Geo != "" {
-		geo := strings.ToLower(strings.Join([]string{
-			server.IPGeoCountry, server.IPGeoCountryCode, server.IPGeoRegion, server.IPGeoCity,
-		}, " "))
-		if !strings.Contains(geo, filters.Geo) {
-			return false
-		}
-	}
-	if filters.IPType == "unchecked" {
-		if strings.TrimSpace(server.IPType) != "" {
-			return false
-		}
-	} else if filters.IPType != "" && strings.ToLower(strings.TrimSpace(server.IPType)) != filters.IPType {
-		return false
-	}
-	switch filters.Probe {
-	case "unchecked":
-		if server.LastProbeTime > 0 {
-			return false
-		}
-	case "reachable":
-		if server.LastProbeTime <= 0 || server.Latency <= 0 {
-			return false
-		}
-	case "failed":
-		if server.LastProbeTime <= 0 || server.Latency > 0 {
-			return false
-		}
-	}
-	switch filters.FastProbe {
-	case "unchecked":
-		if server.LastFastProbeTime > 0 {
-			return false
-		}
-	case "reachable":
-		if server.LastFastProbeTime <= 0 || server.FastLatency <= 0 {
-			return false
-		}
-	case "failed":
-		if server.LastFastProbeTime <= 0 || server.FastLatency > 0 {
-			return false
-		}
-	}
-	if filters.MaxLatency != nil {
-		if server.LastProbeTime <= 0 || server.Latency <= 0 || server.Latency > *filters.MaxLatency {
-			return false
-		}
-	}
-	if filters.MinScore != nil && (server.IPScore == nil || *server.IPScore < *filters.MinScore) {
-		return false
-	}
-	return true
-}
-
-// searchServers 搜索节点（跨手动节点和所有订阅）
+// searchServers 搜索节点（跨手动节点和所有订阅）。
+// 筛选与分页都下推到数据库执行，只加载命中的这一页和独立总数。
 func searchServers(c *gin.Context) {
 	maxLatency, err := optionalIntQuery(c, "maxLatency")
 	if err != nil {
@@ -802,53 +704,28 @@ func searchServers(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	filters := serverSearchFilters{
+	filter := configure.ServerFilter{
 		Query:      strings.ToLower(strings.TrimSpace(c.Query("q"))),
 		Type:       strings.ToLower(strings.TrimSpace(c.Query("type"))),
 		Geo:        strings.ToLower(strings.TrimSpace(c.Query("geo"))),
-		Source:     strings.ToLower(strings.TrimSpace(c.Query("source"))),
 		IPType:     strings.ToLower(strings.TrimSpace(c.Query("ipType"))),
 		Probe:      strings.ToLower(strings.TrimSpace(c.Query("probe"))),
 		FastProbe:  strings.ToLower(strings.TrimSpace(c.Query("fastProbe"))),
 		MaxLatency: maxLatency,
 		MinScore:   minScore,
 	}
-	if filters.Query == "" && filters.Type == "" && filters.Geo == "" && filters.Source == "" &&
-		filters.IPType == "" && filters.Probe == "" && filters.FastProbe == "" && filters.MaxLatency == nil && filters.MinScore == nil {
+	source := strings.ToLower(strings.TrimSpace(c.Query("source")))
+	if source != "manual" && source != "subscription" {
+		source = ""
+	}
+	if filter.Query == "" && filter.Type == "" && filter.Geo == "" && filter.IPType == "" &&
+		filter.Probe == "" && filter.FastProbe == "" && filter.MaxLatency == nil && filter.MinScore == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "at least one search filter is required"})
 		return
 	}
-	type result struct {
-		Server     serverListItem    `json:"server"`
-		Ref        configure.NodeRef `json:"ref"`
-		GroupNames []string          `json:"groupNames"`
-	}
-	var results []result
-	total := 0
+
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "100"))
-	if limit < 1 {
-		limit = 100
-	} else if limit > 1000 {
-		limit = 1000
-	}
 	offset, _ := strconv.Atoi(c.DefaultQuery("offset", "0"))
-	if offset < 0 {
-		offset = 0
-	}
-	appendMatch := func(server configure.ServerRaw, ref configure.NodeRef) {
-		if !serverMatchesFilters(server, filters) {
-			return
-		}
-		total++
-		if total > offset && len(results) < limit {
-			results = append(results, result{Server: newServerListItem(server), Ref: ref})
-		}
-	}
-	sourceAllows := func(refType string) bool {
-		return filters.Source == "" ||
-			(filters.Source == "manual" && refType == "server") ||
-			(filters.Source == "subscription" && refType == "sub_server")
-	}
 
 	groupParam := strings.TrimSpace(c.Query("groupId"))
 	subscriptionParam := strings.TrimSpace(c.Query("subscription"))
@@ -857,89 +734,102 @@ func searchServers(c *gin.Context) {
 		return
 	}
 
+	type result struct {
+		Server     serverListItem    `json:"server"`
+		Ref        configure.NodeRef `json:"ref"`
+		GroupNames []string          `json:"groupNames"`
+	}
+
+	sourceAllows := func(refType string) bool {
+		return source == "" ||
+			(source == "manual" && refType == "server") ||
+			(source == "subscription" && refType == "sub_server")
+	}
+
+	var (
+		nodes []configure.ServerNode
+		total int
+	)
 	switch {
 	case groupParam != "":
+		// 分组是用户选定的有界集合：按引用精确读取该分组的节点，再在内存里筛选。
 		group := resolveGroupParam(groupParam)
 		if group == nil {
 			c.JSON(http.StatusNotFound, gin.H{"error": "group not found"})
 			return
 		}
-		manualIndexes := make([]int, 0, len(group.Servers))
-		subscriptionIndexes := make([]int, 0)
-		seenSubscriptions := make(map[int]struct{})
+		refs := make([]configure.NodeRef, 0, len(group.Servers))
 		for _, ref := range group.Servers {
 			if !sourceAllows(ref.Type) {
 				continue
 			}
-			if ref.Type == "server" {
-				manualIndexes = append(manualIndexes, ref.Index)
-			} else if ref.Type == "sub_server" {
-				if _, exists := seenSubscriptions[ref.Sub]; !exists {
-					seenSubscriptions[ref.Sub] = struct{}{}
-					subscriptionIndexes = append(subscriptionIndexes, ref.Sub)
-				}
-			}
+			refs = append(refs, configure.NodeRef{Type: ref.Type, Index: ref.Index, Sub: ref.Sub})
 		}
-		manualServers := configure.GetServersByIndexes(manualIndexes)
-		subscriptions := configure.GetSubscriptionsByIndexes(subscriptionIndexes)
-		for _, ref := range group.Servers {
-			if !sourceAllows(ref.Type) {
+		snapshots := configure.GetNodesByRefs(refs)
+		matched := make([]configure.ServerNode, 0, len(refs))
+		for _, ref := range refs {
+			server, ok := snapshots[ref]
+			if !ok || !configure.MatchServerFilter(server, filter) {
 				continue
 			}
-			switch ref.Type {
-			case "server":
-				if server, ok := manualServers[ref.Index]; ok {
-					appendMatch(server, configure.NodeRef{Type: ref.Type, Index: ref.Index, Sub: ref.Sub})
-				}
-			case "sub_server":
-				sub, ok := subscriptions[ref.Sub]
-				if ok && ref.Index >= 0 && ref.Index < len(sub.Servers) {
-					appendMatch(sub.Servers[ref.Index], configure.NodeRef{Type: ref.Type, Index: ref.Index, Sub: ref.Sub})
-				}
-			}
+			matched = append(matched, configure.ServerNode{Ref: ref, Server: server})
 		}
+		total = len(matched)
+		nodes = paginateServerNodes(matched, limit, offset)
 	case subscriptionParam != "":
 		subscriptionIndex, parseErr := strconv.Atoi(subscriptionParam)
 		if parseErr != nil || subscriptionIndex < 0 {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "subscription must be a non-negative integer"})
 			return
 		}
-		sub := configure.GetSubscription(subscriptionIndex)
-		if sub == nil {
+		if !sourceAllows("sub_server") {
+			break
+		}
+		matched, count, err := configure.SearchSubscriptionServers(subscriptionIndex, filter, limit, offset)
+		if err != nil {
 			c.JSON(http.StatusNotFound, gin.H{"error": "subscription not found"})
 			return
 		}
-		if sourceAllows("sub_server") {
-			for i, server := range sub.Servers {
-				appendMatch(server, configure.NodeRef{Type: "sub_server", Index: i, Sub: subscriptionIndex})
-			}
-		}
+		nodes, total = matched, count
 	default:
-		if sourceAllows("server") {
-			for i, server := range configure.GetServers() {
-				appendMatch(server, configure.NodeRef{Type: "server", Index: i})
-			}
+		matched, count, err := configure.SearchServers(filter, source, limit, offset)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
 		}
-		if sourceAllows("sub_server") {
-			for subscriptionIndex, sub := range configure.GetSubscriptions() {
-				for i, server := range sub.Servers {
-					appendMatch(server, configure.NodeRef{Type: "sub_server", Index: i, Sub: subscriptionIndex})
-				}
-			}
-		}
+		nodes, total = matched, count
 	}
-	resultIndexes := make(map[configure.ServerRef]int, len(results))
-	for i, item := range results {
-		resultIndexes[configure.ServerRef{Type: item.Ref.Type, Index: item.Ref.Index, Sub: item.Ref.Sub}] = i
+
+	results := make([]result, len(nodes))
+	refs := make([]configure.ServerRef, len(nodes))
+	for i, node := range nodes {
+		results[i] = result{Server: newServerListItem(node.Server), Ref: node.Ref}
+		refs[i] = configure.ServerRef{Type: node.Ref.Type, Index: node.Ref.Index, Sub: node.Ref.Sub}
 	}
-	for _, group := range configure.GetGroups() {
-		for _, ref := range group.Servers {
-			if index, ok := resultIndexes[ref]; ok {
-				results[index].GroupNames = append(results[index].GroupNames, group.Name)
-			}
-		}
+	groupNames := configure.GetGroupNamesForRefs(refs)
+	for i, ref := range refs {
+		results[i].GroupNames = groupNames[ref]
 	}
 	c.JSON(http.StatusOK, gin.H{"results": results, "total": total})
+}
+
+func paginateServerNodes(nodes []configure.ServerNode, limit, offset int) []configure.ServerNode {
+	if limit <= 0 {
+		limit = 100
+	} else if limit > 1000 {
+		limit = 1000
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if offset >= len(nodes) {
+		return []configure.ServerNode{}
+	}
+	end := offset + limit
+	if end > len(nodes) {
+		end = len(nodes)
+	}
+	return nodes[offset:end]
 }
 
 func getServerBySource(c *gin.Context) {
@@ -957,12 +847,6 @@ func getServerBySource(c *gin.Context) {
 		}
 	}
 	c.JSON(http.StatusNotFound, gin.H{"error": "server not found"})
-}
-
-func matchServer(s configure.ServerRaw, q string) bool {
-	return strings.Contains(strings.ToLower(s.Name), q) ||
-		strings.Contains(strings.ToLower(s.Host), q) ||
-		strings.Contains(strings.ToLower(s.Type), q)
 }
 
 func matchServerItem(item serverListItem, q string) bool {
@@ -1049,16 +933,25 @@ type editNodeRequest struct {
 	FrontProxy *string           `json:"frontProxy"`
 }
 
-func applyNodeEdit(server *configure.ServerRaw, req editNodeRequest) error {
-	if req.Name != "" {
-		server.Name = req.Name
-	}
+func validateNodeEdit(req editNodeRequest) error {
 	if req.FrontProxy != nil {
 		frontProxy := strings.TrimSpace(*req.FrontProxy)
 		if frontProxy != "" && configure.GetOutbound(frontProxy) == nil {
 			return fmt.Errorf("前置代理出站 %s 不存在", frontProxy)
 		}
-		server.FrontProxy = frontProxy
+	}
+	return nil
+}
+
+func applyNodeEdit(server *configure.ServerRaw, req editNodeRequest) error {
+	if err := validateNodeEdit(req); err != nil {
+		return err
+	}
+	if req.Name != "" {
+		server.Name = req.Name
+	}
+	if req.FrontProxy != nil {
+		server.FrontProxy = strings.TrimSpace(*req.FrontProxy)
 	}
 	if req.Link != "" {
 		server.Link = req.Link
@@ -1087,18 +980,18 @@ func saveNodeEdit(ref configure.NodeRef, req editNodeRequest) (*configure.Server
 		}
 		return server, nil
 	case "sub_server":
-		sub := configure.GetSubscription(ref.Sub)
-		if sub == nil || ref.Index < 0 || ref.Index >= len(sub.Servers) {
+		if err := validateNodeEdit(req); err != nil {
+			return nil, err
+		}
+		var updated configure.ServerRaw
+		err := configure.UpdateSubscriptionServer(ref.Sub, ref.Index, func(server *configure.ServerRaw) {
+			_ = applyNodeEdit(server, req)
+			updated = *server
+		})
+		if err != nil {
 			return nil, nil
 		}
-		if err := applyNodeEdit(&sub.Servers[ref.Index], req); err != nil {
-			return nil, err
-		}
-		if err := configure.SetSubscription(ref.Sub, sub); err != nil {
-			return nil, err
-		}
-		server := sub.Servers[ref.Index]
-		return &server, nil
+		return &updated, nil
 	default:
 		return nil, fmt.Errorf("unsupported node type %q", ref.Type)
 	}
@@ -1156,13 +1049,7 @@ func getServerLink(c *gin.Context) {
 
 	var s *configure.ServerRaw
 	if sType == "sub_server" {
-		subRaw := configure.GetSubscription(sub)
-		if subRaw == nil || index >= len(subRaw.Servers) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
-			return
-		}
-		srv := subRaw.Servers[index]
-		s = &srv
+		s = configure.GetSubscriptionServer(sub, index)
 	} else {
 		s = configure.GetServer(index)
 	}
@@ -1550,108 +1437,70 @@ func clashPluginOpts(m map[string]interface{}) string {
 	return b.String()
 }
 
-// copyServerToGroup 将节点复制到指定分组
+const maxGroupTransferRefs = 1000
+
 func copyServerToGroup(c *gin.Context) {
 	var req struct {
 		Ref     configure.ServerRef `json:"ref"`
 		GroupID string              `json:"groupId"`
-		Clone   *bool               `json:"clone,omitempty"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	groupIndex, group := configure.GetGroupByID(req.GroupID)
-	if groupIndex < 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "group not found"})
-		return
-	}
-	ref := req.Ref
-	clone := req.Clone == nil || *req.Clone
-	if clone {
-		snapshots := loadServerRefSnapshots(append(append([]configure.ServerRef{}, group.Servers...), req.Ref))
-		server, ok := snapshots[req.Ref]
-		if !ok {
-			c.JSON(http.StatusNotFound, gin.H{"error": "server not found"})
-			return
-		}
-		// 检查目标分组内是否已有配置相同的节点（不比较名称）
-		if groupHasServerRaw(group.Servers, server, snapshots) {
-			c.JSON(http.StatusOK, gin.H{"ok": true, "skipped": true, "groupId": group.ID, "groupServerCount": len(group.Servers)})
-			return
-		}
-		// 每次都创建新的独立副本，不复用已有节点
-		localRef, ok := createLocalServerCopy(server)
-		if !ok {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "clone server failed"})
-			return
-		}
-		ref = localRef
-	}
-	if err := configure.AddServerToGroup(groupIndex, ref); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	enrichMissingNodeMetadataAsync([]configure.NodeRef{{Type: ref.Type, Index: ref.Index, Sub: ref.Sub}})
-	c.JSON(http.StatusOK, gin.H{"ok": true, "groupId": group.ID, "groupServerCount": len(configure.GetGroup(groupIndex).Servers)})
+	copyNodeRefsToGroup(c, req.GroupID, []configure.ServerRef{req.Ref})
 }
 
 func batchCopyServersToGroup(c *gin.Context) {
 	var req struct {
 		Refs    []configure.ServerRef `json:"refs"`
 		GroupID string                `json:"groupId"`
-		Clone   *bool                 `json:"clone,omitempty"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	groupIndex, group := configure.GetGroupByID(req.GroupID)
-	if groupIndex < 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "group not found"})
-		return
+	copyNodeRefsToGroup(c, req.GroupID, req.Refs)
+}
+
+func validateGroupTransferRefs(c *gin.Context, refs []configure.ServerRef) bool {
+	if len(refs) > maxGroupTransferRefs {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "too many node references"})
+		return false
 	}
-	clone := req.Clone == nil || *req.Clone
-	refs := make([]configure.ServerRef, 0, len(req.Refs))
-	manualCount := configure.GetLenServers()
-	clones := make([]*configure.ServerRaw, 0, len(req.Refs))
-	pending := make([]configure.ServerRaw, 0, len(req.Refs))
-	allRefs := append(append([]configure.ServerRef{}, group.Servers...), req.Refs...)
-	snapshots := loadServerRefSnapshots(allRefs)
-	for _, sourceRef := range req.Refs {
-		ref := sourceRef
-		if clone {
-			server, ok := snapshots[sourceRef]
-			if !ok {
-				c.JSON(http.StatusNotFound, gin.H{"error": "server not found"})
-				return
-			}
-			if groupHasServerRaw(group.Servers, server, snapshots) || serverListHasConfig(pending, server) {
-				continue
-			}
-			copy := localServerCopy(server)
-			ref = configure.ServerRef{Type: "server", Index: manualCount + len(clones)}
-			clones = append(clones, &copy)
-			pending = append(pending, copy)
-		}
-		refs = append(refs, ref)
-	}
-	if len(clones) > 0 {
-		if err := configure.AppendServers(clones); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "clone server failed"})
-			return
-		}
-	}
-	if err := configure.AddServersToGroup(groupIndex, refs); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	nodeRefs := make([]configure.NodeRef, 0, len(refs))
 	for _, ref := range refs {
-		nodeRefs = append(nodeRefs, configure.NodeRef{Type: ref.Type, Index: ref.Index, Sub: ref.Sub})
+		if ref.Index < 0 || ref.Sub < 0 || (ref.Type != "server" && ref.Type != "sub_server") {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid node reference"})
+			return false
+		}
 	}
-	enrichMissingNodeMetadataAsync(nodeRefs)
-	c.JSON(http.StatusOK, gin.H{"ok": true, "groupId": group.ID, "groupServerCount": len(configure.GetGroup(groupIndex).Servers)})
+	return true
+}
+
+func writeGroupTransferError(c *gin.Context, err error) {
+	status := http.StatusInternalServerError
+	if errors.Is(err, sql.ErrNoRows) {
+		status = http.StatusNotFound
+	}
+	c.JSON(status, gin.H{"error": err.Error()})
+}
+
+func copyNodeRefsToGroup(c *gin.Context, groupID string, refs []configure.ServerRef) {
+	if !validateGroupTransferRefs(c, refs) {
+		return
+	}
+	created, total, err := configure.CloneServersToGroup(groupID, refs)
+	if err != nil {
+		writeGroupTransferError(c, err)
+		return
+	}
+	if len(created) > 0 {
+		enrichMissingNodeMetadataAsync(created)
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"ok": true, "groupId": groupID, "groupServerCount": total,
+		"copied": len(created), "skippedCount": len(refs) - len(created), "skipped": len(created) == 0,
+	})
 }
 
 func batchMoveServersToGroup(c *gin.Context) {
@@ -1664,115 +1513,23 @@ func batchMoveServersToGroup(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	sourceIndex, sourceGroup := configure.GetGroupByID(req.SourceGroupID)
-	targetIndex, targetGroup := configure.GetGroupByID(req.TargetGroupID)
-	if sourceIndex < 0 || targetIndex < 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "group not found"})
+	if !validateGroupTransferRefs(c, req.Refs) {
 		return
 	}
-	if sourceGroup.ID == targetGroup.ID {
-		c.JSON(http.StatusOK, gin.H{"ok": true, "sourceGroupId": sourceGroup.ID, "targetGroupId": targetGroup.ID,
-			"sourceServerCount": len(sourceGroup.Servers), "targetServerCount": len(targetGroup.Servers)})
-		return
-	}
-	if err := configure.AddServersToGroup(targetIndex, req.Refs); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	if err := configure.RemoveServersFromGroup(sourceIndex, req.Refs); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	sourceTotal, targetTotal, moved, err := configure.MoveServersToGroup(req.SourceGroupID, req.TargetGroupID, req.Refs)
+	if err != nil {
+		writeGroupTransferError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"ok":                true,
-		"sourceGroupId":     sourceGroup.ID,
-		"targetGroupId":     targetGroup.ID,
-		"sourceServerCount": len(configure.GetGroup(sourceIndex).Servers),
-		"targetServerCount": len(configure.GetGroup(targetIndex).Servers),
+		"sourceGroupId":     req.SourceGroupID,
+		"targetGroupId":     req.TargetGroupID,
+		"sourceServerCount": sourceTotal,
+		"targetServerCount": targetTotal,
+		"moved":             moved,
+		"skippedCount":      len(req.Refs) - moved,
 	})
-}
-
-func loadServerRefSnapshots(refs []configure.ServerRef) map[configure.ServerRef]configure.ServerRaw {
-	result := make(map[configure.ServerRef]configure.ServerRaw, len(refs))
-	manualIndexes := make([]int, 0)
-	subscriptionIndexes := make([]int, 0)
-	seenManual := make(map[int]struct{})
-	seenSubscription := make(map[int]struct{})
-	for _, ref := range refs {
-		switch ref.Type {
-		case "server":
-			if _, ok := seenManual[ref.Index]; !ok {
-				seenManual[ref.Index] = struct{}{}
-				manualIndexes = append(manualIndexes, ref.Index)
-			}
-		case "sub_server":
-			if _, ok := seenSubscription[ref.Sub]; !ok {
-				seenSubscription[ref.Sub] = struct{}{}
-				subscriptionIndexes = append(subscriptionIndexes, ref.Sub)
-			}
-		}
-	}
-	servers := configure.GetServersByIndexes(manualIndexes)
-	subscriptions := configure.GetSubscriptionsByIndexes(subscriptionIndexes)
-	for _, ref := range refs {
-		switch ref.Type {
-		case "server":
-			if server, ok := servers[ref.Index]; ok {
-				result[ref] = server
-			}
-		case "sub_server":
-			if sub, ok := subscriptions[ref.Sub]; ok && ref.Index >= 0 && ref.Index < len(sub.Servers) {
-				result[ref] = sub.Servers[ref.Index]
-			}
-		}
-	}
-	return result
-}
-
-// createLocalServerCopy 创建节点的新副本（不复用已有节点）
-func createLocalServerCopy(server configure.ServerRaw) (configure.ServerRef, bool) {
-	server = localServerCopy(server)
-	index := configure.GetLenServers()
-	if err := configure.AppendServers([]*configure.ServerRaw{&server}); err != nil {
-		return configure.ServerRef{}, false
-	}
-	return configure.ServerRef{Type: "server", Index: index, Sub: 0}, true
-}
-
-func localServerCopy(server configure.ServerRaw) configure.ServerRaw {
-	server.Source = "manual"
-	return server
-}
-
-// groupHasServerRaw 检查分组内是否已有配置相同的节点（不比较名称）
-func groupHasServerRaw(refs []configure.ServerRef, server configure.ServerRaw, snapshots map[configure.ServerRef]configure.ServerRaw) bool {
-	for _, ref := range refs {
-		if existing, ok := snapshots[ref]; ok && sameServerConfig(existing, server) {
-			return true
-		}
-	}
-	return false
-}
-
-func serverListHasConfig(servers []configure.ServerRaw, server configure.ServerRaw) bool {
-	for _, existing := range servers {
-		if sameServerConfig(existing, server) {
-			return true
-		}
-	}
-	return false
-}
-
-// sameServerConfig 比较两个节点的配置是否相同（不比较名称）
-func sameServerConfig(a, b configure.ServerRaw) bool {
-	// 优先比较链接，如果链接相同则认为是同一节点
-	if strings.TrimSpace(a.Link) != "" && strings.TrimSpace(a.Link) == strings.TrimSpace(b.Link) {
-		return true
-	}
-	// 链接不同或为空时，比较类型、主机、端口（不包括名称）
-	return strings.EqualFold(strings.TrimSpace(a.Type), strings.TrimSpace(b.Type)) &&
-		strings.EqualFold(strings.TrimSpace(a.Host), strings.TrimSpace(b.Host)) &&
-		a.Port == b.Port
 }
 
 // ---- Subscriptions ----
@@ -1852,32 +1609,30 @@ func getSubscriptionServers(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid index"})
 		return
 	}
-	sub := configure.GetSubscription(index)
-	if sub == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "subscription not found"})
-		return
-	}
 	page, _ := strconv.Atoi(c.Query("page"))
 	pageSize, _ := strconv.Atoi(c.Query("pageSize"))
-	start, end := 0, len(sub.Servers)
+	offset := 0
 	if page > 0 && pageSize > 0 {
 		if pageSize > 1000 {
 			pageSize = 1000
 		}
-		start = (page - 1) * pageSize
-		if start > len(sub.Servers) {
-			start = len(sub.Servers)
-		}
-		end = start + pageSize
-		if end > len(sub.Servers) {
-			end = len(sub.Servers)
-		}
+		offset = (page - 1) * pageSize
+	}
+	meta := configure.GetSubscriptionMeta(index)
+	if meta == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "subscription not found"})
+		return
+	}
+	servers, serverCount, err := configure.GetSubscriptionServersPage(index, offset, pageSize)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "subscription not found"})
+		return
 	}
 	c.JSON(http.StatusOK, gin.H{
-		"servers":     serverListItems(sub.Servers[start:end]),
-		"serverCount": len(sub.Servers),
-		"updatedAt":   sub.UpdatedAt,
-		"offset":      start,
+		"servers":     serverListItems(servers),
+		"serverCount": serverCount,
+		"updatedAt":   meta.UpdatedAt,
+		"offset":      offset,
 	})
 }
 
@@ -1962,7 +1717,7 @@ func updateSubscription(c *gin.Context) {
 	if req.ProxyOutbound != nil {
 		sub.ProxyOutbound = strings.TrimSpace(*req.ProxyOutbound)
 	}
-	if err := configure.SetSubscription(index, sub); err != nil {
+	if err := configure.UpdateSubscriptionMeta(index, sub); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -2087,11 +1842,14 @@ func fetchSubscription(index int, sub *configure.SubscriptionRaw) {
 	for i := range servers {
 		servers[i].Source = sub.ID
 	}
-	servers = configure.PreserveActiveSubscriptionServers(index, sub.Servers, servers)
 	sub.Servers = servers
 	sub.UpdatedAt = time.Now()
 
-	_ = configure.SetSubscription(index, sub)
+	if err := configure.RefreshSubscriptionData(index, sub); err != nil {
+		addLog(fmt.Sprintf("⚠️ 订阅更新未提交：%s: %v", sub.Name, err))
+		return
+	}
+	servers = sub.Servers
 	addLog(fmt.Sprintf("✅ 订阅更新成功: %s (%d 个节点)", sub.Name, len(servers)))
 
 	refs := make([]configure.NodeRef, len(servers))
@@ -2102,20 +1860,6 @@ func fetchSubscription(index int, sub *configure.SubscriptionRaw) {
 
 	// 同步更新对应 Group 的节点引用
 	if sub.GroupID != "" {
-		groupIndex, group := configure.GetGroupByID(sub.GroupID)
-		if group != nil {
-			// 重建 Group 的节点引用列表
-			refs := make([]configure.ServerRef, len(servers))
-			for i := range servers {
-				refs[i] = configure.ServerRef{
-					Type:  "sub_server",
-					Index: i,
-					Sub:   index,
-				}
-			}
-			group.Servers = refs
-			_ = configure.SetGroup(groupIndex, group)
-		}
 		observatory.OnGroupUpdated(sub.GroupID)
 	}
 }
@@ -2311,16 +2055,11 @@ func deleteGroup(c *gin.Context) {
 				serverIndexesToDelete = append(serverIndexesToDelete, ref.Index)
 			}
 		}
-		// 从大到小排序，避免删除时索引变化
-		for i := len(serverIndexesToDelete) - 1; i >= 0; i-- {
-			for j := i - 1; j >= 0; j-- {
-				if serverIndexesToDelete[j] > serverIndexesToDelete[i] {
-					serverIndexesToDelete[i], serverIndexesToDelete[j] = serverIndexesToDelete[j], serverIndexesToDelete[i]
-				}
-			}
-		}
 		if len(serverIndexesToDelete) > 0 {
-			configure.RemoveServers(serverIndexesToDelete)
+			if err := configure.RemoveServers(serverIndexesToDelete); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
 		}
 	}
 
@@ -2360,11 +2099,12 @@ func removeServerFromGroup(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if err := configure.RemoveServerFromGroup(index, ref); err != nil {
+	groupID, total, err := configure.RemoveGroupNodeRefs(index, []configure.ServerRef{ref})
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"ok": true})
+	c.JSON(http.StatusOK, gin.H{"ok": true, "groupId": groupID, "groupServerCount": total})
 }
 
 func removeServersFromGroup(c *gin.Context) {
@@ -2380,11 +2120,12 @@ func removeServersFromGroup(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if err := configure.RemoveServersFromGroup(index, req.Refs); err != nil {
+	groupID, total, err := configure.RemoveGroupNodeRefs(index, req.Refs)
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"ok": true, "group": configure.GetGroup(index)})
+	c.JSON(http.StatusOK, gin.H{"ok": true, "groupId": groupID, "groupServerCount": total})
 }
 
 // ---- Outbounds ----
@@ -3055,16 +2796,24 @@ func ipTypeHTTPClient() *http.Client {
 	return &http.Client{Timeout: timeout, Transport: transport}
 }
 
+// directHTTPClient 是不经任何代理的直连客户端，用作辅助查询的兜底出口：
+// 代理链路抖动时直连常常可达，反之亦然，两条路都留着比死磕一条更稳。
+func directHTTPClient(timeout time.Duration) *http.Client {
+	return &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			DialContext:         (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
+			TLSHandshakeTimeout: 10 * time.Second,
+		},
+	}
+}
+
 func serverRawByNodeRef(ref configure.NodeRef) *configure.ServerRaw {
 	switch ref.Type {
 	case "server":
 		return configure.GetServer(ref.Index)
 	case "sub_server":
-		sub := configure.GetSubscription(ref.Sub)
-		if sub == nil || ref.Index < 0 || ref.Index >= len(sub.Servers) {
-			return nil
-		}
-		return &sub.Servers[ref.Index]
+		return configure.GetSubscriptionServer(ref.Sub, ref.Index)
 	default:
 		return nil
 	}
@@ -3178,18 +2927,30 @@ func setSetting(c *gin.Context) {
 		s.GroupSwitchCooldownSec = 600
 	}
 	validGroups := make(map[string]struct{})
+	validCleanupGroups := make(map[string]struct{})
 	for _, group := range configure.GetGroups() {
 		validGroups[group.ID] = struct{}{}
+		if !group.FromSub {
+			validCleanupGroups[group.ID] = struct{}{}
+		}
 	}
 	for i := range s.NodeCleanupRules {
 		rule := &s.NodeCleanupRules[i]
 		switch rule.Mode {
 		case "", "real":
 			rule.Mode = "real"
-		case "fast", "realstrict":
+		case "fast", "realstrict", "transit":
 		default:
 			c.JSON(http.StatusBadRequest, gin.H{"error": "node cleanup mode 非法"})
 			return
+		}
+		if rule.Mode == "transit" {
+			threshold := rule.TransitThreshold()
+			if threshold < 0 || threshold > 100 {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "中转检测评分阈值必须是 0 到 100 的整数"})
+				return
+			}
+			rule.TransitScoreThreshold = &threshold
 		}
 		if rule.IntervalHour <= 0 {
 			rule.IntervalHour = 24
@@ -3197,7 +2958,7 @@ func setSetting(c *gin.Context) {
 		selected := make([]string, 0, len(rule.GroupIDs))
 		seen := make(map[string]struct{}, len(rule.GroupIDs))
 		for _, id := range rule.GroupIDs {
-			if _, ok := validGroups[id]; !ok {
+			if _, ok := validCleanupGroups[id]; !ok {
 				continue
 			}
 			if _, ok := seen[id]; ok {
@@ -4097,42 +3858,7 @@ func EnsureIndependentProxyInbounds() {
 }
 
 func rebuildInboundProxyServers(inbounds []configure.CustomInbound) {
-	cleanupLegacyInboundRefsInGroups()
-	groups := configure.GetGroups()
-	serverGroupIndex := -1
-	for i := range groups {
-		if !groups[i].FromSub && strings.EqualFold(strings.TrimSpace(groups[i].Name), "SERVER") {
-			serverGroupIndex = i
-			break
-		}
-	}
-	if serverGroupIndex < 0 {
-		id, _ := gonanoid.Nanoid()
-		g := &configure.Group{
-			ID:        id,
-			Name:      "SERVER",
-			FromSub:   false,
-			Servers:   []configure.ServerRef{},
-			CreatedAt: time.Now(),
-		}
-		if err := configure.AppendGroup(g); err != nil {
-			return
-		}
-		groups = configure.GetGroups()
-		serverGroupIndex = len(groups) - 1
-	}
-
-	oldServers := configure.GetServers()
-	oldToNewIndex := map[int]int{}
-	newServers := make([]configure.ServerRaw, 0, len(oldServers))
-	serverIndexBySource := map[string]int{}
-	for i, s := range oldServers {
-		if strings.HasPrefix(s.Source, "inbound:") {
-			continue
-		}
-		oldToNewIndex[i] = len(newServers)
-		newServers = append(newServers, s)
-	}
+	generatedServers := make([]configure.ServerRaw, 0)
 	for _, ib := range inbounds {
 		p := strings.ToLower(strings.TrimSpace(ib.Protocol))
 		if p != "cfdo" && p != "cfgoodnet" {
@@ -4154,8 +3880,7 @@ func rebuildInboundProxyServers(inbounds []configure.CustomInbound) {
 				if len(ports) > 1 {
 					serverName = fmt.Sprintf("%s [%d]", name, port)
 				}
-				serverIndexBySource[source] = len(newServers)
-				newServers = append(newServers, configure.ServerRaw{
+				generatedServers = append(generatedServers, configure.ServerRaw{
 					Link:    fmt.Sprintf("socks5://%s:%d#%s", host, port, url.QueryEscape(serverName)),
 					Name:    serverName,
 					Host:    host,
@@ -4174,8 +3899,7 @@ func rebuildInboundProxyServers(inbounds []configure.CustomInbound) {
 				continue
 			}
 			source := "inbound:" + ib.ID
-			serverIndexBySource[source] = len(newServers)
-			newServers = append(newServers, configure.ServerRaw{
+			generatedServers = append(generatedServers, configure.ServerRaw{
 				Link:    fmt.Sprintf("http://%s:%d#%s", host, port, url.QueryEscape(name)),
 				Name:    name,
 				Host:    host,
@@ -4187,105 +3911,8 @@ func rebuildInboundProxyServers(inbounds []configure.CustomInbound) {
 		}
 	}
 
-	if err := configure.SetServers(newServers); err != nil {
-		return
-	}
-
-	for i := range groups {
-		g := groups[i]
-		if len(g.Servers) == 0 {
-			continue
-		}
-		filtered := make([]configure.ServerRef, 0, len(g.Servers))
-		seen := map[string]struct{}{}
-		changed := false
-		for _, ref := range g.Servers {
-			if ref.Type != "server" {
-				key := fmt.Sprintf("%s:%d:%d", ref.Type, ref.Index, ref.Sub)
-				if _, ok := seen[key]; ok {
-					changed = true
-					continue
-				}
-				seen[key] = struct{}{}
-				filtered = append(filtered, ref)
-				continue
-			}
-			if ref.Index < 0 || ref.Index >= len(oldServers) {
-				changed = true
-				continue
-			}
-			oldServer := oldServers[ref.Index]
-			newIndex := -1
-			if strings.HasPrefix(oldServer.Source, "inbound:") {
-				var ok bool
-				newIndex, ok = serverIndexBySource[oldServer.Source]
-				if !ok {
-					changed = true
-					continue
-				}
-			} else {
-				var ok bool
-				newIndex, ok = oldToNewIndex[ref.Index]
-				if !ok {
-					changed = true
-					continue
-				}
-			}
-			if newIndex != ref.Index {
-				changed = true
-			}
-			ref.Index = newIndex
-			key := fmt.Sprintf("%s:%d:%d", ref.Type, ref.Index, ref.Sub)
-			if _, ok := seen[key]; ok {
-				changed = true
-				continue
-			}
-			seen[key] = struct{}{}
-			filtered = append(filtered, ref)
-		}
-		if i == serverGroupIndex {
-			for _, ib := range inbounds {
-				p := strings.ToLower(strings.TrimSpace(ib.Protocol))
-				if p != "cfdo" && p != "cfgoodnet" {
-					continue
-				}
-				if p == "cfdo" {
-					for _, port := range cfdoListenPortsForInbound(ib) {
-						source := fmt.Sprintf("inbound:%s:cfdo:%d", ib.ID, port)
-						serverIndex, ok := serverIndexBySource[source]
-						if !ok {
-							continue
-						}
-						ref := configure.ServerRef{Type: "server", Index: serverIndex, Sub: 0}
-						key := fmt.Sprintf("%s:%d:%d", ref.Type, ref.Index, ref.Sub)
-						if _, exists := seen[key]; exists {
-							continue
-						}
-						seen[key] = struct{}{}
-						filtered = append(filtered, ref)
-						changed = true
-					}
-					continue
-				}
-				source := "inbound:" + ib.ID
-				serverIndex, ok := serverIndexBySource[source]
-				if !ok {
-					continue
-				}
-				ref := configure.ServerRef{Type: "server", Index: serverIndex, Sub: 0}
-				key := fmt.Sprintf("%s:%d:%d", ref.Type, ref.Index, ref.Sub)
-				if _, exists := seen[key]; exists {
-					continue
-				}
-				seen[key] = struct{}{}
-				filtered = append(filtered, ref)
-				changed = true
-			}
-		}
-		if changed {
-			g.Servers = filtered
-			_ = configure.SetGroup(i, &g)
-		}
+	if err := configure.SyncInboundProxyServers(generatedServers); err != nil {
+		addLog(fmt.Sprintf("⚠️ 同步独立入站代理节点失败：%v", err))
 	}
 }
 
@@ -4319,29 +3946,6 @@ func cfdoListenPortsForInbound(ib configure.CustomInbound) []int {
 		return []int{port}
 	}
 	return nil
-}
-
-func cleanupLegacyInboundRefsInGroups() {
-	groups := configure.GetGroups()
-	for i := range groups {
-		g := groups[i]
-		if len(g.Servers) == 0 {
-			continue
-		}
-		filtered := make([]configure.ServerRef, 0, len(g.Servers))
-		changed := false
-		for _, ref := range g.Servers {
-			if strings.EqualFold(strings.TrimSpace(ref.Type), "inbound") {
-				changed = true
-				continue
-			}
-			filtered = append(filtered, ref)
-		}
-		if changed {
-			g.Servers = filtered
-			_ = configure.SetGroup(i, &g)
-		}
-	}
 }
 
 func getRuleSetInfos(c *gin.Context) {

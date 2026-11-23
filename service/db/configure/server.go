@@ -3,8 +3,6 @@ package configure
 import (
 	"encoding/json"
 	"fmt"
-
-	"github.com/ProxyStation/proxystation/db"
 )
 
 // ServerRaw 代表一个代理节点，可以是手动导入的，也可以来自订阅
@@ -59,89 +57,95 @@ func Bytes2ServerRaw(b []byte) (*ServerRaw, error) {
 }
 
 func GetServers() []ServerRaw {
-	result := make([]ServerRaw, 0)
-	raw, err := db.ListGetAll("touch", "servers")
-	if err != nil {
-		return result
-	}
-	for _, b := range raw {
-		s, err := Bytes2ServerRaw(b)
-		if err != nil {
-			continue
-		}
-		result = append(result, *s)
-	}
-	return result
+	return nodeGetAll(nodeBucket, manualServersKey)
 }
 
 func GetServer(index int) *ServerRaw {
-	b, err := db.ListGet("touch", "servers", index)
-	if err != nil {
-		return nil
-	}
-	s, _ := Bytes2ServerRaw(b)
-	return s
+	return nodeGet(nodeBucket, manualServersKey, index)
 }
 
 func GetServersByIndexes(indexes []int) map[int]ServerRaw {
-	result := make(map[int]ServerRaw, len(indexes))
-	rawByIndex, err := db.ListGetMany("touch", "servers", indexes)
-	if err != nil {
+	return nodeGetMany(nodeBucket, manualServersKey, indexes)
+}
+
+// GetNodesByRefs 按引用精确批量读取节点：手动节点读 servers 行，订阅节点只读取该
+// 订阅下被引用的行，不加载整份订阅。
+func GetNodesByRefs(refs []NodeRef) map[NodeRef]ServerRaw {
+	result := make(map[NodeRef]ServerRaw, len(refs))
+	if len(refs) == 0 {
 		return result
 	}
-	for index, raw := range rawByIndex {
-		server, err := Bytes2ServerRaw(raw)
-		if err == nil && server != nil {
-			result[index] = *server
+	manualIndexes := make([]int, 0, len(refs))
+	seenManual := make(map[int]struct{}, len(refs))
+	subIndexes := make(map[int][]int)
+	seenSubIndex := make(map[int]map[int]struct{})
+	for _, ref := range refs {
+		switch ref.Type {
+		case "server":
+			if _, ok := seenManual[ref.Index]; !ok {
+				seenManual[ref.Index] = struct{}{}
+				manualIndexes = append(manualIndexes, ref.Index)
+			}
+		case "sub_server":
+			if seenSubIndex[ref.Sub] == nil {
+				seenSubIndex[ref.Sub] = make(map[int]struct{})
+			}
+			if _, ok := seenSubIndex[ref.Sub][ref.Index]; !ok {
+				seenSubIndex[ref.Sub][ref.Index] = struct{}{}
+				subIndexes[ref.Sub] = append(subIndexes[ref.Sub], ref.Index)
+			}
+		}
+	}
+	manual := GetServersByIndexes(manualIndexes)
+	subServers := make(map[int]map[int]ServerRaw, len(subIndexes))
+	for sub, indexes := range subIndexes {
+		subServers[sub] = GetSubscriptionServersByIndexes(sub, indexes)
+	}
+	for _, ref := range refs {
+		switch ref.Type {
+		case "server":
+			if server, ok := manual[ref.Index]; ok {
+				result[ref] = server
+			}
+		case "sub_server":
+			if server, ok := subServers[ref.Sub][ref.Index]; ok {
+				result[ref] = server
+			}
 		}
 	}
 	return result
 }
 
 func AppendServers(servers []*ServerRaw) error {
-	return db.ListAppend("touch", "servers", servers)
+	values := make([]ServerRaw, len(servers))
+	for i, s := range servers {
+		if s != nil {
+			values[i] = *s
+		}
+	}
+	return nodeAppend(nodeBucket, manualServersKey, values)
 }
 
 func SetServers(servers []ServerRaw) error {
-	return db.Set("touch", "servers", servers)
+	return nodeReplaceAll(nodeBucket, manualServersKey, servers)
 }
 
 func SetServer(index int, server *ServerRaw) error {
-	return db.ListSet("touch", "servers", index, server)
+	return nodeSet(nodeBucket, manualServersKey, index, server)
 }
 
 func UpdateServer(index int, update func(*ServerRaw)) error {
-	return db.ListUpdate("touch", "servers", index, func(raw []byte) ([]byte, error) {
-		server, err := Bytes2ServerRaw(raw)
-		if err != nil {
-			return nil, err
-		}
-		update(server)
-		return json.Marshal(server)
-	})
+	return nodeUpdate(nodeBucket, manualServersKey, index, update)
 }
 
 func UpdateServers(updates map[int]func(*ServerRaw)) error {
-	callbacks := make(map[int]func([]byte) ([]byte, error), len(updates))
-	for index, update := range updates {
-		update := update
-		callbacks[index] = func(raw []byte) ([]byte, error) {
-			server, err := Bytes2ServerRaw(raw)
-			if err != nil {
-				return nil, err
-			}
-			update(server)
-			return json.Marshal(server)
-		}
-	}
-	return db.ListUpdateMany("touch", "servers", callbacks)
+	return nodeUpdateMany(nodeBucket, manualServersKey, updates)
 }
 
 func RemoveServers(indexes []int) error {
-	return db.ListRemove("touch", "servers", indexes)
+	return removeManualServersWithRefs(indexes)
 }
 
 func GetLenServers() int {
-	l, _ := db.ListLen("touch", "servers")
-	return l
+	return nodeLen(nodeBucket, manualServersKey)
 }

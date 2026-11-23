@@ -22,14 +22,15 @@ import (
 type Provider string
 
 const (
-	// ProviderCleanIP cleanip.io，评分口径公开（6 维度加权 × 用途乘子），返回结构化 JSON
-	ProviderCleanIP Provider = "cleanip"
+	// ProviderNetCoffee ip.net.coffee，返回 trust_score 及住宅/机房判定，接口只接受 IP
+	ProviderNetCoffee Provider = "netcoffee"
 	// ProviderCustom 用户自填接口。只配一个 URL，响应字段靠通用规则识别，
 	// 因此适配任何返回"分值越高越干净"的 JSON 接口。
 	ProviderCustom Provider = "custom"
 )
 
-const defaultCleanIPEndpoint = "https://cleanip.io/cli"
+// 内置服务商的固定接口地址。{ip} 会被替换成待查 IP。
+const defaultNetCoffeeEndpoint = "https://ip.net.coffee/api/ip/lookup/{ip}"
 
 // IPPlaceholder 自定义 URL 里代表待查 IP 的占位符。没写占位符时按 ?ip= 拼查询参数。
 const IPPlaceholder = "{ip}"
@@ -72,9 +73,13 @@ const DefaultMinInterval = 1500 * time.Millisecond
 type Client struct {
 	HTTPClient *http.Client
 
-	// cleanIPEndpoint 覆盖内置 cleanip 的接口地址，仅供测试注入。
+	// FallbackHTTPClient 在主请求出现传输层错误（连不上、超时、被重置）时兜底重试一次。
+	// 这些免费服务常经代理访问，代理链路抖动时换个出口往往就能成功。
+	FallbackHTTPClient *http.Client
+
+	// builtinEndpoints 覆盖内置服务商的接口地址，仅供测试注入。
 	// 用户配置里的地址只作用于自定义服务商，不会流到这里。
-	cleanIPEndpoint string
+	builtinEndpoints map[Provider]string
 
 	mu       sync.Mutex
 	lastCall time.Time
@@ -98,8 +103,8 @@ func (c *Client) Lookup(ip string, opt Options) Result {
 	switch opt.Provider {
 	case ProviderCustom:
 		return c.lookupCustom(ip, opt)
-	case ProviderCleanIP, "":
-		return c.lookupCleanIP(ip, opt)
+	case ProviderNetCoffee, "":
+		return c.lookupNetCoffee(ip, opt)
 	default:
 		return Result{Score: -1, Provider: opt.Provider, Err: fmt.Errorf("未知的评分服务商：%s", opt.Provider)}
 	}
@@ -120,58 +125,29 @@ func (c *Client) waitTurn(minInterval time.Duration) {
 	c.lastCall = time.Now()
 }
 
-type cleanIPResponse struct {
-	OK  bool `json:"ok"`
-	Geo struct {
-		Country     string `json:"country"`
-		CountryCode string `json:"country_code"`
-		Region      string `json:"region"`
-		City        string `json:"city"`
-	} `json:"geo"`
-	Purity struct {
-		Score int    `json:"score"`
-		Grade string `json:"grade"`
-	} `json:"purity"`
-	Risk struct {
-		RiskLabel string `json:"risk_label"`
-		RiskLevel string `json:"risk_level"`
-	} `json:"risk"`
-}
-
+// builtinEndpoint 返回内置服务商实际使用的接口地址：默认写死，测试可覆盖注入。
 // Options.Endpoint 只属于 ProviderCustom：内置服务商固定用自己的地址，
 // 这样界面切换服务商时用户填过的自定义地址可以一直留着不被内置服务商误用。
-func (c *Client) lookupCleanIP(ip string, opt Options) Result {
-	endpoint := defaultCleanIPEndpoint
-	if c.cleanIPEndpoint != "" {
-		endpoint = c.cleanIPEndpoint
+func (c *Client) builtinEndpoint(provider Provider, fallback string) string {
+	if ep := strings.TrimSpace(c.builtinEndpoints[provider]); ep != "" {
+		return ep
 	}
-	u, err := buildURL(endpoint, map[string]string{"ip": ip, "json": "1"})
-	if err != nil {
-		return Result{Score: -1, Provider: ProviderCleanIP, Err: err}
-	}
-
-	var resp cleanIPResponse
-	if err := c.getJSON(u, opt.Timeout, &resp); err != nil {
-		return Result{Score: -1, Provider: ProviderCleanIP, Err: err}
-	}
-	if !resp.OK {
-		return Result{Score: -1, Provider: ProviderCleanIP, Err: fmt.Errorf("查询失败")}
-	}
-	risk := firstNonEmpty(resp.Risk.RiskLabel, resp.Risk.RiskLevel)
-	return Result{
-		Score:       clampScore(resp.Purity.Score),
-		Grade:       strings.TrimSpace(resp.Purity.Grade),
-		RiskLevel:   risk,
-		Provider:    ProviderCleanIP,
-		Country:     strings.TrimSpace(resp.Geo.Country),
-		CountryCode: strings.ToUpper(strings.TrimSpace(resp.Geo.CountryCode)),
-		Region:      strings.TrimSpace(resp.Geo.Region),
-		City:        strings.TrimSpace(resp.Geo.City),
-	}
+	return fallback
 }
 
-// scoreFieldNames 自定义接口里可能表示评分的字段名，按优先级排列。
-// 覆盖了常见的几种命名：cleanip 的 purity.score、ip.net.coffee 的 trust_score 等。
+// lookupNetCoffee 用内置的 Net.Coffee 接口查询。该服务只接受 IP（传域名会 400），
+// 因此调用方必须先解析出 IP。响应是平铺 JSON，交给通用字段识别器解析。
+func (c *Client) lookupNetCoffee(ip string, opt Options) Result {
+	endpoint := c.builtinEndpoint(ProviderNetCoffee, defaultNetCoffeeEndpoint)
+	target, err := resolveEndpoint(endpoint, ip)
+	if err != nil {
+		return Result{Score: -1, Provider: ProviderNetCoffee, Err: err}
+	}
+	return c.queryScore(target, ProviderNetCoffee, opt)
+}
+
+// scoreFieldNames 接口里可能表示评分的字段名，按优先级排列。
+// 覆盖了常见的几种命名：net.coffee 的 trust_score、各类 purity_score / score 等。
 var scoreFieldNames = []string{
 	"trust_score", "trustScore",
 	"purity_score", "purityScore",
@@ -193,26 +169,31 @@ func (c *Client) lookupCustom(ip string, opt Options) Result {
 	if endpoint == "" {
 		return Result{Score: -1, Provider: ProviderCustom, Err: fmt.Errorf("未填写自定义评分接口地址")}
 	}
-
-	var target string
-	if strings.Contains(endpoint, IPPlaceholder) {
-		target = strings.ReplaceAll(endpoint, IPPlaceholder, url.PathEscape(ip))
-	} else {
-		u, err := buildURL(endpoint, map[string]string{"ip": ip})
-		if err != nil {
-			return Result{Score: -1, Provider: ProviderCustom, Err: err}
-		}
-		target = u
-	}
-
-	var raw map[string]interface{}
-	if err := c.getJSON(target, opt.Timeout, &raw); err != nil {
+	target, err := resolveEndpoint(endpoint, ip)
+	if err != nil {
 		return Result{Score: -1, Provider: ProviderCustom, Err: err}
 	}
+	return c.queryScore(target, ProviderCustom, opt)
+}
 
+// resolveEndpoint 把待查 IP 填进接口地址：有 {ip} 占位符就替换，否则按 ?ip= 追加。
+func resolveEndpoint(endpoint, ip string) (string, error) {
+	if strings.Contains(endpoint, IPPlaceholder) {
+		return strings.ReplaceAll(endpoint, IPPlaceholder, url.PathEscape(ip)), nil
+	}
+	return buildURL(endpoint, map[string]string{"ip": ip})
+}
+
+// queryScore 请求接口并按通用字段规则解析评分，内置与自定义服务商共用，
+// 这样一个接口只要能返回"分值越高越干净"的 JSON 就能适配。
+func (c *Client) queryScore(target string, provider Provider, opt Options) Result {
+	var raw map[string]interface{}
+	if err := c.getJSON(target, opt.Timeout, &raw); err != nil {
+		return Result{Score: -1, Provider: provider, Err: err}
+	}
 	score, ok := findNumberField(raw, scoreFieldNames)
 	if !ok {
-		return Result{Score: -1, Provider: ProviderCustom,
+		return Result{Score: -1, Provider: provider,
 			Err: fmt.Errorf("响应中找不到评分字段（支持 %s）", strings.Join(scoreFieldNames, " / "))}
 	}
 	grade, _ := findStringField(raw, gradeFieldNames)
@@ -225,7 +206,7 @@ func (c *Client) lookupCustom(ip string, opt Options) Result {
 		Score:       clampScore(int(score)),
 		Grade:       strings.TrimSpace(grade),
 		RiskLevel:   strings.TrimSpace(risk),
-		Provider:    ProviderCustom,
+		Provider:    provider,
 		Country:     strings.TrimSpace(country),
 		CountryCode: strings.ToUpper(strings.TrimSpace(countryCode)),
 		Region:      strings.TrimSpace(region),
@@ -288,16 +269,38 @@ func (c *Client) getJSON(rawURL string, timeout time.Duration, out interface{}) 
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "ProxyStation/1.0 (+node ip purity check)")
 
-	hc := c.HTTPClient
+	resp, err := c.do(c.HTTPClient, req, timeout)
+	if err != nil {
+		if resp != nil {
+			resp.Body.Close()
+			resp = nil
+		}
+		// 只在传输层失败时兜底：换个出口再试一次，HTTP 层错误（限流/5xx）不重试。
+		if c.FallbackHTTPClient != nil {
+			if retryResp, retryErr := c.do(c.FallbackHTTPClient, req, timeout); retryErr == nil {
+				resp, err = retryResp, nil
+			}
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("请求评分服务失败：%w", err)
+	}
+	return decodeScoreResponse(resp, out)
+}
+
+func (c *Client) do(hc *http.Client, req *http.Request, timeout time.Duration) (*http.Response, error) {
+	if hc == nil {
+		hc = c.HTTPClient
+	}
 	if timeout > 0 {
 		clone := *hc
 		clone.Timeout = timeout
 		hc = &clone
 	}
-	resp, err := hc.Do(req)
-	if err != nil {
-		return fmt.Errorf("请求评分服务失败：%w", err)
-	}
+	return hc.Do(req)
+}
+
+func decodeScoreResponse(resp *http.Response, out interface{}) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusTooManyRequests {
@@ -335,20 +338,11 @@ func clampScore(v int) int {
 	return v
 }
 
-func firstNonEmpty(vals ...string) string {
-	for _, v := range vals {
-		if s := strings.TrimSpace(v); s != "" {
-			return s
-		}
-	}
-	return ""
-}
-
 // ValidateProvider 归一化并校验服务商标识
 func ValidateProvider(raw string) (Provider, error) {
 	switch Provider(strings.ToLower(strings.TrimSpace(raw))) {
-	case ProviderCleanIP, "":
-		return ProviderCleanIP, nil
+	case ProviderNetCoffee, "":
+		return ProviderNetCoffee, nil
 	case ProviderCustom:
 		return ProviderCustom, nil
 	default:

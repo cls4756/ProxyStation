@@ -47,8 +47,8 @@ export const api = {
   getServerLink: (type, index, sub = 0, raw = false) => http.get('/server/link', {
     params: { type, index, sub, ...(raw ? { raw: 1 } : {}) },
   }),
-  copyServerToGroup: (ref, groupId, clone = true) => http.post('/server/copy-to-group', { ref, groupId, clone }),
-  batchCopyServersToGroup: (refs, groupId, clone = true) => http.post('/servers/batch-copy-to-group', { refs, groupId, clone }),
+  copyServerToGroup: (ref, groupId) => http.post('/server/copy-to-group', { ref, groupId }),
+  batchCopyServersToGroup: (refs, groupId) => http.post('/servers/batch-copy-to-group', { refs, groupId }),
   batchMoveServersToGroup: (refs, sourceGroupId, targetGroupId) => http.post('/servers/batch-move-to-group', { refs, sourceGroupId, targetGroupId }),
 
   // 订阅

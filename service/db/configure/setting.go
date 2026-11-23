@@ -5,7 +5,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/ProxyStation/proxystation/db"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -76,9 +75,9 @@ type Setting struct {
 	// IP 纯净度评分。默认关闭：评分要把节点地址发给第三方服务，且这些服务都没有
 	// 面向第三方调用的正式授权，是否启用必须由用户自己决定。
 	IPScoreEnabled bool `json:"ipScoreEnabled,omitempty"`
-	// 评分服务商：cleanip | custom
+	// 评分服务商：netcoffee | custom
 	IPScoreProvider string `json:"ipScoreProvider,omitempty"`
-	// 评分接口地址。cleanip 留空用默认地址；custom 必填，可用 {ip} 占位符
+	// 评分接口地址。内置服务商留空用默认地址；custom 必填，可用 {ip} 占位符
 	IPScoreEndpoint string `json:"ipScoreEndpoint,omitempty"`
 	// 两次评分请求的最小间隔（毫秒），防止触发第三方限流
 	IPScoreMinIntervalMs int `json:"ipScoreMinIntervalMs,omitempty"`
@@ -160,10 +159,20 @@ type SubscriptionNodeCopyRule struct {
 }
 
 type NodeCleanupRule struct {
-	GroupIDs       []string `json:"groupIds"`
-	Mode           string   `json:"mode"` // fast | real
-	IntervalHour   int      `json:"intervalHour"`
-	RecycleGroupID string   `json:"recycleGroupId,omitempty"`
+	GroupIDs              []string `json:"groupIds"`
+	Mode                  string   `json:"mode"`
+	IntervalHour          int      `json:"intervalHour"`
+	RecycleGroupID        string   `json:"recycleGroupId,omitempty"`
+	TransitScoreThreshold *int     `json:"transitScoreThreshold,omitempty"`
+}
+
+const DefaultCleanupTransitScoreThreshold = 85
+
+func (rule NodeCleanupRule) TransitThreshold() int {
+	if rule.TransitScoreThreshold == nil {
+		return DefaultCleanupTransitScoreThreshold
+	}
+	return *rule.TransitScoreThreshold
 }
 
 // CopyCount 本规则应复制的节点数，0 表示不限（全部连通）
@@ -224,7 +233,7 @@ func NewSetting() *Setting {
 		NodeCleanupMode:                    "real",
 		NodeCleanupIntervalHour:            24,
 		IPScoreEnabled:                     false,
-		IPScoreProvider:                    "cleanip",
+		IPScoreProvider:                    "netcoffee",
 		IPScoreMinIntervalMs:               1500,
 		WebUsername:                        DefaultWebUsername,
 		WebPassword:                        defaultWebPasswordHash(),
@@ -271,7 +280,18 @@ func GetSettingNotNil() *Setting {
 
 func loadSettingNotNil() *Setting {
 	s := NewSetting()
-	_ = db.Get("system", "setting", s)
+	if row, err := settingGetRow(); err == nil && row != nil {
+		row.apply(s)
+	}
+	if normalizeSetting(s) {
+		_ = settingSet(s)
+	}
+	return s
+}
+
+// normalizeSetting 补齐并规整配置默认值，返回是否有改动。读写分离：只碰内存，
+// 需要落库由调用方决定（loadSettingNotNil / MigrateSettingStorage）。
+func normalizeSetting(s *Setting) bool {
 	changed := false
 	if strings.TrimSpace(s.WebUsername) == "" {
 		s.WebUsername = DefaultWebUsername
@@ -329,8 +349,9 @@ func loadSettingNotNil() *Setting {
 	if migrateNodeCleanupRules(s) {
 		changed = true
 	}
-	if s.IPScoreProvider != "cleanip" && s.IPScoreProvider != "custom" {
-		s.IPScoreProvider = "cleanip"
+	// cleanip 的公开接口已不再支持查询任意 IP（返回 400），旧配置统一迁移到 netcoffee
+	if s.IPScoreProvider != "netcoffee" && s.IPScoreProvider != "custom" {
+		s.IPScoreProvider = "netcoffee"
 		changed = true
 	}
 	// 低于 500ms 的间隔会把第三方免费服务打成洪水，强制抬到安全下限
@@ -352,10 +373,7 @@ func loadSettingNotNil() *Setting {
 		s.HttpSniffEnabled = &v
 		changed = true
 	}
-	if changed {
-		_ = db.Set("system", "setting", s)
-	}
-	return s
+	return changed
 }
 
 func migrateNodeCleanupRules(s *Setting) bool {
@@ -403,7 +421,7 @@ func migrateNodeCopyRules(rules []SubscriptionNodeCopyRule) bool {
 }
 
 func SetSetting(s *Setting) error {
-	if err := db.Set("system", "setting", s); err != nil {
+	if err := settingSet(s); err != nil {
 		return err
 	}
 	normalized := loadSettingNotNil()
@@ -501,7 +519,15 @@ func cloneSetting(s *Setting) *Setting {
 }
 
 func cloneNodeCleanupRules(rules []NodeCleanupRule) []NodeCleanupRule {
-	return append([]NodeCleanupRule(nil), rules...)
+	cloned := append([]NodeCleanupRule(nil), rules...)
+	for index := range cloned {
+		cloned[index].GroupIDs = append([]string(nil), rules[index].GroupIDs...)
+		if rules[index].TransitScoreThreshold != nil {
+			threshold := *rules[index].TransitScoreThreshold
+			cloned[index].TransitScoreThreshold = &threshold
+		}
+	}
+	return cloned
 }
 
 func cloneSubscriptionNodeCopyRules(rules []SubscriptionNodeCopyRule) []SubscriptionNodeCopyRule {

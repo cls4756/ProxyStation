@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ProxyStation/proxystation/db"
+	gonanoid "github.com/matoous/go-nanoid"
 )
 
 // SubscriptionFormat 订阅格式类型
@@ -52,135 +52,250 @@ func Bytes2SubscriptionRaw(b []byte) (*SubscriptionRaw, error) {
 	return &s, nil
 }
 
+// subscriptionServerKeyPrefix 是每个订阅单独存放节点列表的 key 前缀。用订阅的
+// 稳定 ID（不是会因删除而移动的下标）做后缀，这样订阅下标变化不会影响节点数据。
+const subscriptionServerKeyPrefix = "sub_servers."
+
+func subscriptionServerKey(id string) string {
+	return subscriptionServerKeyPrefix + id
+}
+
+// subscriptionDoc 是订阅在存储中的形态：只保存订阅自身的字段，节点单独按行存。
+// 这样更新单个节点时不会重写整份订阅（大订阅可能有数千个节点）。
+type subscriptionDoc struct {
+	ID            string             `json:"id"`
+	Name          string             `json:"name"`
+	URL           string             `json:"url"`
+	Format        SubscriptionFormat `json:"format"`
+	UpdatedAt     time.Time          `json:"updatedAt"`
+	GroupID       string             `json:"groupId"`
+	ProxyOutbound string             `json:"proxyOutbound,omitempty"`
+}
+
+func subscriptionDocFrom(sub *SubscriptionRaw) subscriptionDoc {
+	return subscriptionDoc{
+		ID:            sub.ID,
+		Name:          sub.Name,
+		URL:           sub.URL,
+		Format:        sub.Format,
+		UpdatedAt:     sub.UpdatedAt,
+		GroupID:       sub.GroupID,
+		ProxyOutbound: sub.ProxyOutbound,
+	}
+}
+
+func (d subscriptionDoc) toRaw(servers []ServerRaw) SubscriptionRaw {
+	if servers == nil {
+		servers = []ServerRaw{}
+	}
+	return SubscriptionRaw{
+		ID:            d.ID,
+		Name:          d.Name,
+		URL:           d.URL,
+		Format:        d.Format,
+		Servers:       servers,
+		UpdatedAt:     d.UpdatedAt,
+		GroupID:       d.GroupID,
+		ProxyOutbound: d.ProxyOutbound,
+	}
+}
+
+func ensureSubscriptionID(sub *SubscriptionRaw) {
+	if strings.TrimSpace(sub.ID) != "" {
+		return
+	}
+	if id, err := gonanoid.Nanoid(); err == nil {
+		sub.ID = id
+	}
+}
+
+// getSubscriptionDoc 只读取订阅自身的字段，不加载节点。
+func getSubscriptionDoc(index int) (*subscriptionDoc, error) {
+	return subscriptionDAO.get(index)
+}
+
+func getSubscriptionServersByID(id string) []ServerRaw {
+	if strings.TrimSpace(id) == "" {
+		return []ServerRaw{}
+	}
+	return nodeGetAll(nodeBucket, subscriptionServerKey(id))
+}
+
+func setSubscriptionServersByID(id string, servers []ServerRaw) error {
+	if strings.TrimSpace(id) == "" {
+		return fmt.Errorf("subscription id is empty")
+	}
+	return nodeReplaceAll(nodeBucket, subscriptionServerKey(id), servers)
+}
+
+func deleteSubscriptionServersByID(id string) error {
+	if strings.TrimSpace(id) == "" {
+		return nil
+	}
+	return nodeDeleteAll(nodeBucket, subscriptionServerKey(id))
+}
+
+func subscriptionIDByIndex(index int) (string, error) {
+	doc, err := getSubscriptionDoc(index)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(doc.ID) == "" {
+		return "", fmt.Errorf("subscription %d has no id", index)
+	}
+	return doc.ID, nil
+}
+
 func GetSubscriptions() []SubscriptionRaw {
+	docs, err := subscriptionDAO.getAll()
 	result := make([]SubscriptionRaw, 0)
-	raw, err := db.ListGetAll("touch", "subscriptions")
 	if err != nil {
 		return result
 	}
-	for _, b := range raw {
-		s, err := Bytes2SubscriptionRaw(b)
-		if err != nil {
-			continue
-		}
-		result = append(result, *s)
+	for _, doc := range docs {
+		result = append(result, doc.toRaw(getSubscriptionServersByID(doc.ID)))
 	}
 	return result
 }
 
 func GetSubscriptionSummaries() []SubscriptionSummary {
+	docs, err := subscriptionDAO.getAll()
 	result := make([]SubscriptionSummary, 0)
-	raw, err := db.ListGetAll("touch", "subscriptions")
 	if err != nil {
 		return result
 	}
-	for _, item := range raw {
-		var stored struct {
-			ID            string             `json:"id"`
-			Name          string             `json:"name"`
-			URL           string             `json:"url"`
-			Format        SubscriptionFormat `json:"format"`
-			UpdatedAt     time.Time          `json:"updatedAt"`
-			GroupID       string             `json:"groupId"`
-			ProxyOutbound string             `json:"proxyOutbound,omitempty"`
-			Servers       []json.RawMessage  `json:"servers"`
-		}
-		if err := json.Unmarshal(item, &stored); err != nil {
-			continue
-		}
+	for _, doc := range docs {
+		count := nodeLen(nodeBucket, subscriptionServerKey(doc.ID))
 		result = append(result, SubscriptionSummary{
-			ID: stored.ID, Name: stored.Name, URL: stored.URL, Format: stored.Format,
-			UpdatedAt: stored.UpdatedAt, GroupID: stored.GroupID, ProxyOutbound: stored.ProxyOutbound,
-			ServerCount: len(stored.Servers),
+			ID: doc.ID, Name: doc.Name, URL: doc.URL, Format: doc.Format,
+			UpdatedAt: doc.UpdatedAt, GroupID: doc.GroupID, ProxyOutbound: doc.ProxyOutbound,
+			ServerCount: count,
 		})
 	}
 	return result
 }
 
 func GetSubscription(index int) *SubscriptionRaw {
-	b, err := db.ListGet("touch", "subscriptions", index)
+	doc, err := getSubscriptionDoc(index)
 	if err != nil {
 		return nil
 	}
-	s, _ := Bytes2SubscriptionRaw(b)
-	return s
+	sub := doc.toRaw(getSubscriptionServersByID(doc.ID))
+	return &sub
 }
 
 func GetSubscriptionsByIndexes(indexes []int) map[int]SubscriptionRaw {
 	result := make(map[int]SubscriptionRaw, len(indexes))
-	rawByIndex, err := db.ListGetMany("touch", "subscriptions", indexes)
+	byIndex, err := subscriptionDAO.getMany(indexes)
 	if err != nil {
 		return result
 	}
-	for index, raw := range rawByIndex {
-		subscription, err := Bytes2SubscriptionRaw(raw)
-		if err == nil && subscription != nil {
-			result[index] = *subscription
-		}
+	for index, doc := range byIndex {
+		result[index] = doc.toRaw(getSubscriptionServersByID(doc.ID))
 	}
 	return result
 }
 
+// GetSubscriptionServer 精确读取某个订阅下的单个节点，不加载该订阅的其它节点。
+// 探测、评分、元数据写回等按引用访问单个节点的场景应使用它，避免每次都解析整个订阅。
+func GetSubscriptionServer(subIndex, serverIndex int) *ServerRaw {
+	doc, err := getSubscriptionDoc(subIndex)
+	if err != nil {
+		return nil
+	}
+	return nodeGet(nodeBucket, subscriptionServerKey(doc.ID), serverIndex)
+}
+
+// GetSubscriptionServersByIndexes 批量精确读取某个订阅下的多个节点。
+func GetSubscriptionServersByIndexes(subIndex int, indexes []int) map[int]ServerRaw {
+	doc, err := getSubscriptionDoc(subIndex)
+	if err != nil {
+		return map[int]ServerRaw{}
+	}
+	return nodeGetMany(nodeBucket, subscriptionServerKey(doc.ID), indexes)
+}
+
 func AppendSubscriptions(subs []*SubscriptionRaw) error {
-	return db.ListAppend("touch", "subscriptions", subs)
+	docs := make([]subscriptionDoc, len(subs))
+	for i, sub := range subs {
+		ensureSubscriptionID(sub)
+		// 先写节点列表再写订阅文档：即使文档写入失败，最多留下无引用的孤儿数据，
+		// 不会出现“订阅存在但节点丢失”的情况。
+		if err := setSubscriptionServersByID(sub.ID, sub.Servers); err != nil {
+			return err
+		}
+		docs[i] = subscriptionDocFrom(sub)
+	}
+	return subscriptionDAO.append(docs)
 }
 
 func SetSubscription(index int, sub *SubscriptionRaw) error {
-	return db.ListUpdate("touch", "subscriptions", index, func(raw []byte) ([]byte, error) {
-		current, err := Bytes2SubscriptionRaw(raw)
-		if err != nil {
-			return nil, err
-		}
-		PreserveServerRuntimeResults(current.Servers, sub.Servers)
-		return json.Marshal(sub)
-	})
+	ensureSubscriptionID(sub)
+	return setSubscriptionWithID(index, sub, false)
+}
+
+func RefreshSubscriptionData(index int, sub *SubscriptionRaw) error {
+	ensureSubscriptionID(sub)
+	return setSubscriptionWithID(index, sub, true)
+}
+
+// UpdateSubscriptionMeta 只更新订阅自身的字段，不触碰节点列表。
+func UpdateSubscriptionMeta(index int, sub *SubscriptionRaw) error {
+	ensureSubscriptionID(sub)
+	return subscriptionDAO.set(index, subscriptionDocFrom(sub))
 }
 
 func UpdateSubscriptionServer(subIndex, serverIndex int, update func(*ServerRaw)) error {
-	return db.ListUpdate("touch", "subscriptions", subIndex, func(raw []byte) ([]byte, error) {
-		sub, err := Bytes2SubscriptionRaw(raw)
-		if err != nil {
-			return nil, err
-		}
-		if serverIndex < 0 || serverIndex >= len(sub.Servers) {
-			return nil, fmt.Errorf("server index %d out of range", serverIndex)
-		}
-		update(&sub.Servers[serverIndex])
-		return json.Marshal(sub)
-	})
+	id, err := subscriptionIDByIndex(subIndex)
+	if err != nil {
+		return err
+	}
+	return nodeUpdate(nodeBucket, subscriptionServerKey(id), serverIndex, update)
 }
 
 func UpdateSubscriptionServers(subIndex int, updates map[int]func(*ServerRaw)) error {
-	return db.ListUpdate("touch", "subscriptions", subIndex, func(raw []byte) ([]byte, error) {
-		sub, err := Bytes2SubscriptionRaw(raw)
-		if err != nil {
-			return nil, err
-		}
-		for serverIndex, update := range updates {
-			if serverIndex < 0 || serverIndex >= len(sub.Servers) {
-				return nil, fmt.Errorf("server index %d out of range", serverIndex)
-			}
-			update(&sub.Servers[serverIndex])
-		}
-		return json.Marshal(sub)
-	})
+	id, err := subscriptionIDByIndex(subIndex)
+	if err != nil {
+		return err
+	}
+	return nodeUpdateMany(nodeBucket, subscriptionServerKey(id), updates)
 }
 
 func RemoveSubscriptions(indexes []int) error {
-	return db.ListRemove("touch", "subscriptions", indexes)
+	return removeSubscriptionsWithRefs(indexes)
 }
 
 func GetLenSubscriptions() int {
-	l, _ := db.ListLen("touch", "subscriptions")
-	return l
+	return subscriptionDAO.count()
 }
 
 func GetLenSubscriptionServers(index int) int {
-	sub := GetSubscription(index)
-	if sub == nil {
+	doc, err := getSubscriptionDoc(index)
+	if err != nil {
 		return 0
 	}
-	return len(sub.Servers)
+	return nodeLen(nodeBucket, subscriptionServerKey(doc.ID))
+}
+
+// GetSubscriptionMeta 只返回订阅自身的字段（不含节点）。
+func GetSubscriptionMeta(index int) *SubscriptionRaw {
+	doc, err := getSubscriptionDoc(index)
+	if err != nil {
+		return nil
+	}
+	sub := doc.toRaw(nil)
+	return &sub
+}
+
+// GetSubscriptionServersPage 分页读取订阅节点，返回该页节点与独立总数。
+// limit <= 0 表示返回从 offset 起的全部节点。
+func GetSubscriptionServersPage(subIndex, offset, limit int) ([]ServerRaw, int, error) {
+	doc, err := getSubscriptionDoc(subIndex)
+	if err != nil {
+		return nil, 0, err
+	}
+	key := subscriptionServerKey(doc.ID)
+	return nodeGetRange(nodeBucket, key, offset, limit)
 }
 
 // PreserveServerProbeResults copies fast/real probe metadata from old subscription nodes
